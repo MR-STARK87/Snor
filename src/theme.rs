@@ -5,14 +5,17 @@ use eframe::egui;
 // stroked outlines rather than filled colour blocks.
 pub fn apply_dark(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(0x14, 0x1B, 0x1A);
+    // The editor pane's surface, which is the default for anything that does
+    // not set its own frame. See [`surface_title`] / [`surface_recessed`] for
+    // the other two levels.
+    visuals.panel_fill = surface_body();
     visuals.window_fill = egui::Color32::from_rgb(0x17, 0x20, 0x1E);
     visuals.extreme_bg_color = egui::Color32::from_rgb(0x0F, 0x16, 0x15);
     visuals.code_bg_color = egui::Color32::from_rgb(0x12, 0x19, 0x18);
     visuals.faint_bg_color = egui::Color32::from_rgb(0x1B, 0x25, 0x23);
     visuals.selection.bg_fill = egui::Color32::from_rgb(0x25, 0x38, 0x2E);
     visuals.selection.stroke = egui::Stroke::new(1.0, accent());
-    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(0x14, 0x1B, 0x1A);
+    visuals.widgets.noninteractive.bg_fill = surface_body();
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x1C, 0x25, 0x23);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x23, 0x2E, 0x2B);
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x2A, 0x36, 0x32);
@@ -160,6 +163,45 @@ pub fn hairline() -> egui::Color32 {
 /// part of the product's look, not OS chrome left over from it.
 pub fn window_edge() -> egui::Color32 {
     egui::Color32::from_rgb(0x37, 0x3E, 0x3A)
+}
+
+/// The three surfaces the reference stacks, from the top of the window down.
+///
+/// Sampling the mock row by row shows it is *not* one flat fill. The title bar
+/// reads (22, 30, 28); the editor pane below it (19, 26, 25); the explorer and
+/// the terminal (17, 24, 23). Each step is only two or three luma, but the
+/// steps are consistent down the whole image, and together they are what makes
+/// the panes read as separate slabs rather than one sheet with lines on it.
+/// A flat fill at any one of the three loses that.
+///
+/// The mock also drifts by about one luma down its height — a soft gradient,
+/// not a fourth surface — so these are the mid-range readings rather than the
+/// value at any single row.
+pub fn surface_title() -> egui::Color32 {
+    egui::Color32::from_rgb(0x16, 0x1E, 0x1C)
+}
+
+/// The editor pane: the lightest of the three body surfaces.
+pub fn surface_body() -> egui::Color32 {
+    egui::Color32::from_rgb(0x13, 0x1A, 0x19)
+}
+
+/// The explorer, the terminal and the status bar: recessed a step below the
+/// editor, so the editor reads as the raised sheet you are working on.
+pub fn surface_recessed() -> egui::Color32 {
+    egui::Color32::from_rgb(0x11, 0x18, 0x17)
+}
+
+/// Ink for the three window controls.
+///
+/// The reference draws its own minimise / maximise / close, and they are the
+/// brightest thing in the title bar — measured peaks of (176,175,166),
+/// (196,195,186) and (171,169,162), well above the tagline and well above
+/// [`dim_text`]'s (154,160,155). Only the brightest pixel of a 1.4pt stroke is
+/// a fair reading, so this is the top of that range, taken warm like the rest
+/// of the title bar's ink rather than neutral grey.
+pub fn window_control() -> egui::Color32 {
+    egui::Color32::from_rgb(0xC8, 0xC7, 0xBE)
 }
 
 pub fn danger() -> egui::Color32 {

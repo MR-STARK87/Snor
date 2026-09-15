@@ -26,10 +26,37 @@ const TREE_GRAB: f32 = 5.0;
 //
 // Measured off the reference mock (which renders at 125%) and converted to
 // points: a 57px title bar and a 49px status bar.
-/// Padding above and below the title bar's row. The row itself is ~24pt (the
-/// explorer toggle sets its height), so twice this puts the bar at the
-/// reference's 45.6pt.
-const TITLE_PAD: f32 = 7.0;
+/// Padding above the title bar's row. The row itself is 24pt (the window
+/// controls' hit box sets its height), so the two pads together put the bar at
+/// the reference's 45.6pt.
+const TITLE_PAD: f32 = 9.0;
+/// Padding below the title bar's row.
+///
+/// Deliberately smaller than the pad above. The reference centres its
+/// title-bar content at y=28 of a 57px bar — dead centre — while ours measured
+/// 25.5 of 58, sitting 2pt high. Equal pads cannot fix that: the bar's height
+/// is already right, so the only way to move the row down is to move the split
+/// down with it.
+const TITLE_PAD_BELOW: f32 = 5.0;
+/// Gap between the window controls and the "Stay consistent." mark.
+///
+/// The reference leaves a wide, deliberate stretch of empty bar between the
+/// two: its leaf glyph starts 362px from the right edge and the minimise
+/// control ends at 150, so 212px = 170pt of nothing. Ours had 151px, which
+/// read as the mark being tacked onto the controls rather than parked in the
+/// bar on its own.
+const TITLE_RIGHT_GAP: f32 = 44.8;
+/// Extra inset before the title bar's wordmark.
+///
+/// On top of the panel's 8pt inner margin, taking the wordmark's left edge to
+/// the reference's 22.4pt from the window edge.
+const TITLE_LEFT_PAD: f32 = 13.6;
+/// Diameter of the dot separating "Snor" from its tagline.
+const TITLE_DOT: f32 = 4.0;
+/// Extra space before that dot. The reference's gap from the wordmark to the
+/// dot is 19px = 15.2pt, against 9px after it — so the dot sits closer to the
+/// tagline than to the name.
+const TITLE_DOT_LEAD: f32 = 8.0;
 /// Padding above and below the status bar's row.
 ///
 /// The reference's bar is 50px tall — its top rule sits at y=932 with the
@@ -48,6 +75,29 @@ const STATUS_GAP: f32 = 24.5;
 /// The reference's is 2px at 125% = 1.6pt. See [`theme::window_edge`] for why
 /// it is a different colour from every other divider in the app.
 const WINDOW_EDGE_W: f32 = 1.6;
+
+// --- Custom window chrome ----------------------------------------------
+//
+// `main.rs` turns the OS decorations off, so these three constants plus
+// `window_controls` and `window_resize_bands` are what the OS used to give us.
+//
+// Measured off the mock's title bar: its minimise dash, maximise square and
+// close cross are centred 43.2pt apart, the close cross sits 24pt in from the
+// window's right edge, and all three are centred in the 45.6pt bar.
+/// Hit box of one window control. Larger than the ink it draws.
+const CTRL_BOX: f32 = 24.0;
+/// Centre-to-centre distance between the controls.
+const CTRL_STEP: f32 = 43.2;
+/// Gap between the close control's centre and the window's *content* edge.
+///
+/// The panel holding this row carries egui's default `Frame::side_top_panel`
+/// inner margin of 8pt, so the drawn distance to the window edge is this plus
+/// that margin. The reference puts the close cross 35.5px = 28.4pt from its
+/// right edge, so 20.4 here lands it there — measured back off a live capture
+/// at 35.5px against the reference's 35.5px.
+const CTRL_EDGE: f32 = 20.4;
+/// Thickness of the grab band along each window edge.
+const RESIZE_BAND: f32 = 5.0;
 
 pub struct SnorApp {
     tree: FileTree,
@@ -74,30 +124,70 @@ impl SnorApp {
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("snor_top").show(ui, |ui| {
+        egui::Panel::top("snor_top")
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(theme::surface_title()))
+            .show(ui, |ui| {
+            // Drag-to-move, registered *first* so the controls added below win
+            // the hit test where they overlap it: egui resolves a press to the
+            // most recently registered widget under the pointer, and a drag
+            // band registered last would swallow every click on "close".
+            let drag = ui.interact(
+                ui.max_rect(),
+                egui::Id::new("snor_title_drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.dragged() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            // Double-click the bar to toggle maximise, as every desktop does.
+            if drag.double_clicked() {
+                let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+
             // The reference's title bar is 45.6pt tall with its row centred;
             // the text row itself only comes to ~20pt.
             ui.add_space(TITLE_PAD);
             ui.horizontal(|ui| {
+                // The reference insets its wordmark 28px = 22.4pt from the
+                // window's left edge; the panel's own 8pt inner margin only
+                // gets us to 8.8pt, which left the bar looking like the name
+                // had been shoved into the corner.
+                ui.add_space(TITLE_LEFT_PAD);
                 // No explorer toggle up here. The reference opens straight on
                 // "Snor" with nothing beside it, and a folder glyph sitting on
                 // the product name reads as a logo — which is exactly what the
                 // mock's wordmark is not. Ctrl+B still toggles the panel.
+                // 18.8 rather than 18: the reference's wordmark inks 47px wide
+                // against our 45 at 18pt.
                 ui.label(
                     egui::RichText::new("Snor")
-                        .size(18.0)
+                        .size(18.8)
                         .strong()
                         .color(theme::accent()),
                 );
                 // The reference separates the product name from its tagline
-                // with a raised dot, not a plus.
-                ui.label(egui::RichText::new("\u{2022}").size(11.5).color(theme::faint()));
+                // with a raised dot, not a plus. Drawn rather than typed: the
+                // mock's dot is a solid 4pt disc, and the bullet glyph at any
+                // sensible text size comes out 2.4pt — half the size — while
+                // also moving if the UI font changes.
+                ui.add_space(TITLE_DOT_LEAD);
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(TITLE_DOT, TITLE_DOT), egui::Sense::hover());
+                if ui.is_rect_visible(dot) {
+                    ui.painter()
+                        .circle_filled(dot.center(), TITLE_DOT * 0.5, theme::faint());
+                }
                 ui.label(
                     egui::RichText::new("Calm tools for focused minds.")
                         .size(11.5)
                         .color(theme::tagline()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    Self::window_controls(ui);
+                    ui.add_space(TITLE_RIGHT_GAP);
+
                     // Right-to-left: the label goes in first so the leaf ends
                     // up on its *left*, matching the reference's leaf-then-text
                     // reading order.
@@ -113,12 +203,162 @@ impl SnorApp {
                     }
                 });
             });
-            ui.add_space(TITLE_PAD);
+            ui.add_space(TITLE_PAD_BELOW);
         });
     }
 
+    /// Minimise / maximise-or-restore / close, in the theme.
+    ///
+    /// With `with_decorations(false)` these are the only window controls there
+    /// are, so they carry the real commands rather than being decoration. The
+    /// reference draws its own for the same reason.
+    ///
+    /// The glyph helpers in `icons` each shrink their rect by their own fixed
+    /// fraction (0.4 of the width for the dash and the cross, 0.56 for the
+    /// square) and then stroke the result, so a glyph's *ink* is the shrunk
+    /// rect plus one stroke width. Each control is handed the box that lands
+    /// that ink on the mock's measured size rather than a shared one.
+    ///
+    /// Measured off the reference: cross 12x13px, square 14x14px, dash 14x2px
+    /// — that is 9.6pt of ink for the cross, 11.2pt for the square and the
+    /// dash. Subtracting each glyph's 1.3-1.4pt stroke is where the 8.3 / 9.8
+    /// / 9.9 line lengths below come from. A shared 24pt box draws every glyph
+    /// ~1.6pt oversize, which reads as coarse beside the reference's.
+    fn window_controls(ui: &mut egui::Ui) {
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        let ink = theme::window_control();
+
+        let step = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = CTRL_STEP - CTRL_BOX;
+        ui.add_space(CTRL_EDGE - CTRL_BOX * 0.5);
+
+        if icons::icon_button(ui, CTRL_BOX, "close", |p, r, _| {
+            icons::close_x(
+                p,
+                egui::Rect::from_center_size(r.center(), egui::vec2(8.3 / 0.4, 8.3 / 0.4)),
+                ink,
+            );
+        })
+        .clicked()
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        if icons::icon_button(ui, CTRL_BOX, "maximize", |p, r, _| {
+            icons::maximize(
+                p,
+                egui::Rect::from_center_size(r.center(), egui::vec2(9.8 / 0.56, 9.8 / 0.56)),
+                ink,
+                maximized,
+            );
+        })
+        .clicked()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+
+        if icons::icon_button(ui, CTRL_BOX, "minimize", |p, r, _| {
+            icons::minus(
+                p,
+                egui::Rect::from_center_size(r.center(), egui::vec2(9.9 / 0.4, 9.9 / 0.4)),
+                ink,
+            );
+        })
+        .clicked()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        ui.spacing_mut().item_spacing.x = step;
+    }
+
+    /// Grab bands along the window's edges and corners.
+    ///
+    /// Undecorated windows have no OS frame to grab, so resizing has to be
+    /// requested from here. Registered after every panel — nothing else claims
+    /// the outermost few points — with the corners after the edges, because a
+    /// corner rect overlaps both of its edges and egui gives the press to the
+    /// most recently registered widget under the pointer.
+    fn window_resize_bands(ui: &mut egui::Ui) {
+        use egui::ViewportCommand as Cmd;
+
+        if ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let r = ui.ctx().viewport_rect();
+        let t = RESIZE_BAND;
+        let edges = [
+            (
+                egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + t)),
+                egui::viewport::ResizeDirection::North,
+                egui::CursorIcon::ResizeNorth,
+            ),
+            (
+                egui::Rect::from_min_max(egui::pos2(r.min.x, r.max.y - t), r.max),
+                egui::viewport::ResizeDirection::South,
+                egui::CursorIcon::ResizeSouth,
+            ),
+            (
+                egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + t, r.max.y)),
+                egui::viewport::ResizeDirection::West,
+                egui::CursorIcon::ResizeWest,
+            ),
+            (
+                egui::Rect::from_min_max(egui::pos2(r.max.x - t, r.min.y), r.max),
+                egui::viewport::ResizeDirection::East,
+                egui::CursorIcon::ResizeEast,
+            ),
+        ];
+        let corners = [
+            (
+                egui::Rect::from_min_max(r.min, r.min + egui::vec2(t, t)),
+                egui::viewport::ResizeDirection::NorthWest,
+                egui::CursorIcon::ResizeNorthWest,
+            ),
+            (
+                egui::Rect::from_min_max(
+                    egui::pos2(r.max.x - t, r.min.y),
+                    egui::pos2(r.max.x, r.min.y + t),
+                ),
+                egui::viewport::ResizeDirection::NorthEast,
+                egui::CursorIcon::ResizeNorthEast,
+            ),
+            (
+                egui::Rect::from_min_max(
+                    egui::pos2(r.min.x, r.max.y - t),
+                    egui::pos2(r.min.x + t, r.max.y),
+                ),
+                egui::viewport::ResizeDirection::SouthWest,
+                egui::CursorIcon::ResizeSouthWest,
+            ),
+            (
+                egui::Rect::from_min_max(egui::pos2(r.max.x - t, r.max.y - t), r.max),
+                egui::viewport::ResizeDirection::SouthEast,
+                egui::CursorIcon::ResizeSouthEast,
+            ),
+        ];
+
+        for (i, (rect, dir, cursor)) in edges.into_iter().chain(corners).enumerate() {
+            let resp = ui.interact(
+                rect,
+                egui::Id::new(("snor_resize", i)),
+                egui::Sense::drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(cursor);
+            }
+            if resp.dragged() {
+                ui.ctx().send_viewport_cmd(Cmd::BeginResize(dir));
+            }
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("snor_status").show(ui, |ui| {
+        egui::Panel::bottom("snor_status")
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(theme::surface_recessed()))
+            .show(ui, |ui| {
             // The reference's status bar is 39.2pt tall, so the 16pt row of
             // readouts sits in a lot of air.
             ui.add_space(STATUS_PAD);
@@ -219,10 +459,19 @@ impl SnorApp {
             } else {
                 self.terminal.term_h.clamp(TERM_MIN_H, max_term)
             };
-            let term_rect = egui::Rect::from_min_max(
-                egui::pos2(column.left(), column.bottom() - term_h),
-                column.max,
-            );
+            // Fullscreen means the terminal *takes* the column, not merely that
+            // the editor is hidden. Leaving `term_rect` at `term_h` while
+            // skipping the editor drew the terminal at its usual height with a
+            // dead band of empty panel above it — the maximize button looked
+            // like it did nothing.
+            let term_rect = if full_scr {
+                column
+            } else {
+                egui::Rect::from_min_max(
+                    egui::pos2(column.left(), column.bottom() - term_h),
+                    column.max,
+                )
+            };
             let editor_rect = if show_term {
                 egui::Rect::from_min_max(
                     column.min,
@@ -249,6 +498,11 @@ impl SnorApp {
                 );
             }
             if show_term {
+                // The terminal sits on the recessed surface, one step below the
+                // editor, so the two panes read as separate slabs. Painted
+                // before the scope so it lands behind the header and the grid.
+                ui.painter()
+                    .rect_filled(term_rect, 0.0, theme::surface_recessed());
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(term_rect).layout(top_down),
                     |ui| self.terminal.ui(ui, &self.tree.root),
@@ -377,6 +631,7 @@ impl eframe::App for SnorApp {
             let panel = egui::Panel::left("snor_tree")
                 .exact_size(self.tree_w)
                 .resizable(false)
+                .frame(egui::Frame::side_top_panel(ui.style()).fill(theme::surface_recessed()))
                 .show(ui, |ui| {
                     self.tree.ui(ui);
                 });
@@ -389,10 +644,14 @@ impl eframe::App for SnorApp {
             self.tree_grip(ui, rect);
         }
 
+        // After every panel: the resize bands own the outermost points of the
+        // window, and nothing else may claim them.
+        Self::window_resize_bands(ui);
+
         // The window's own frame. Drawn last, on the foreground layer, so it
         // sits over every panel instead of being clipped by the one under the
-        // pointer. The reference draws its edge as part of the product rather
-        // than leaving the boundary to the OS.
+        // pointer. With the OS decorations off this *is* the window's boundary,
+        // not a line drawn inside someone else's.
         ui.ctx()
             .layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
