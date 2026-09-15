@@ -343,10 +343,12 @@ impl Editor {
         }
 
         if self.tabs.is_empty() {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.monospace("// open a file from Explorer to edit.");
-                ui.monospace("// tabs + keyword highlight + Ctrl+S to save.");
-            });
+            egui::ScrollArea::both()
+                .id_salt("snor_editor_empty")
+                .show(ui, |ui| {
+                    ui.monospace("// open a file from Explorer to edit.");
+                    ui.monospace("// tabs + tree-sitter highlight + Ctrl+S to save.");
+                });
             return;
         }
 
@@ -391,6 +393,7 @@ impl Editor {
         let lang = buf.lang.clone();
         let editable = !buf.too_large;
         egui::ScrollArea::both()
+            .id_salt("snor_editor_text")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
@@ -412,5 +415,29 @@ impl Editor {
                     buf.refresh_lines();
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_edit_save_roundtrip() {
+        let dir = std::env::temp_dir().join("snor_editor_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hello.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        assert_eq!(ed.tabs.len(), 1);
+        assert!(!ed.tabs[0].dirty);
+        ed.tabs[0].text.push_str("// edited\n");
+        ed.tabs[0].dirty = true;
+        ed.save_active();
+        assert!(!ed.tabs[0].dirty);
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert!(back.contains("// edited"), "saved text missing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

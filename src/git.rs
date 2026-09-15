@@ -143,6 +143,7 @@ impl GitPanel {
         }
         ui.separator();
         eframe::egui::ScrollArea::vertical()
+            .id_salt("snor_git_files")
             .max_height(160.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -172,6 +173,7 @@ impl GitPanel {
                 .color(crate::theme::dim_text()),
         );
         eframe::egui::ScrollArea::both()
+            .id_salt("snor_git_diff")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.diff.is_empty() {

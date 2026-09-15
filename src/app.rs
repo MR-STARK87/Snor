@@ -56,8 +56,9 @@ impl eframe::App for SnorApp {
             self.editor.open_file(opened.clone());
             self.status = format!("opened {}", opened.display());
         }
-        if self.editor.saved_tick > 0 && !self.git_loaded {
-            // no-op keep
+        if self.editor.saved_tick > 0 {
+            self.git.refresh(&self.root);
+            self.editor.saved_tick = 0;
         }
 
         egui::Panel::top("snor_top").show(ui, |ui| {
@@ -94,47 +95,56 @@ impl eframe::App for SnorApp {
             .min_size(240.0)
             .resizable(true)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.search.ui(ui, &self.root);
-                    ui.add_space(8.0);
-                    ui.separator();
-                    if !self.git_loaded {
-                        self.git.refresh(&self.root);
-                        self.git_loaded = true;
-                    }
-                    self.git.ui(ui, &self.root);
-                });
+                self.search.ui(ui, &self.root);
+                ui.add_space(8.0);
+                ui.separator();
+                if !self.git_loaded {
+                    self.git.refresh(&self.root);
+                    self.git_loaded = true;
+                }
+                self.git.ui(ui, &self.root);
             });
-
-        egui::Panel::bottom("snor_terminal")
-            .default_size(240.0)
-            .min_size(140.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                self.terminal.ui(ui, &self.root);
-            });
-
-        egui::Panel::bottom("snor_status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&self.status).small());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let sel = self
-                        .editor
-                        .active_path()
-                        .or_else(|| self.tree.selected.clone())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    ui.label(
-                        egui::RichText::new(sel)
-                            .small()
-                            .color(crate::theme::dim_text()),
-                    );
-                });
-            });
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.editor.ui(ui);
+            ui.vertical(|ui| {
+                let avail_w = ui.available_width().max(50.0);
+                let avail_h = ui.available_height().max(50.0);
+                let status_h = 26.0;
+                let term_h = if self.terminal.collapsed { 34.0 } else { 280.0 };
+                let editor_h = (avail_h - status_h - term_h - 16.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, editor_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| self.editor.ui(ui),
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, term_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| self.terminal.ui(ui, &self.root),
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, status_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(egui::RichText::new(&self.status).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let sel = self
+                                .editor
+                                .active_path()
+                                .or_else(|| self.tree.selected.clone())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "-".to_string());
+                            ui.label(
+                                egui::RichText::new(sel)
+                                    .small()
+                                    .color(crate::theme::dim_text()),
+                            );
+                        });
+                    },
+                );
+            });
         });
 
         ui.ctx()

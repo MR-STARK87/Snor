@@ -392,6 +392,7 @@ impl FileTree {
 
         ui.separator();
         eframe::egui::ScrollArea::vertical()
+            .id_salt("snor_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let nodes = self.nodes.clone();
@@ -421,5 +422,23 @@ impl FileTree {
                     });
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lists_project_root() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let nodes = build_nodes(&root, 0);
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"Cargo.toml"), "names: {names:?}");
+        assert!(names.contains(&"src"), "names: {names:?}");
+        assert!(!names.contains(&"target"), "names: {names:?}");
+        assert!(!names.contains(&".git"), "names: {names:?}");
+        let src = nodes.iter().find(|n| n.name == "src").unwrap();
+        assert!(src.is_dir && !src.children.is_empty());
     }
 }

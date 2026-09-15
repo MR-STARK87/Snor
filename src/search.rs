@@ -85,9 +85,10 @@ impl Search {
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, root: &PathBuf) {
         ui.heading("Search");
         ui.horizontal(|ui| {
-            let resp = ui.add(
+            let avail = ui.available_width();
+            let resp = ui.add_sized(
+                [(avail - 44.0).max(60.0), 22.0],
                 eframe::egui::TextEdit::singleline(&mut self.query)
-                    .desired_width(f32::INFINITY)
                     .hint_text("find text (2+ chars)"),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
@@ -112,6 +113,8 @@ impl Search {
         }
         ui.separator();
         eframe::egui::ScrollArea::vertical()
+            .id_salt("snor_search_results")
+            .max_height(220.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for hit in &self.results {
@@ -128,5 +131,24 @@ impl Search {
                     }
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_text_across_files() {
+        let dir = std::env::temp_dir().join("snor_search_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "nothing here\n").unwrap();
+        let mut s = Search::new();
+        s.query = "alpha".to_string();
+        s.run(&dir);
+        assert_eq!(s.results.len(), 1);
+        assert_eq!(s.results[0].line, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -148,6 +148,10 @@ pub struct Terminal {
     input: String,
     pub error: Option<String>,
     pub running: bool,
+    pub collapsed: bool,
+    pub total_bytes: u64,
+    pub total_chunks: u64,
+    inq: Vec<u8>,
     started: bool,
 }
 
@@ -162,6 +166,10 @@ impl Terminal {
             input: String::new(),
             error: None,
             running: false,
+            collapsed: false,
+            total_bytes: 0,
+            total_chunks: 0,
+            inq: Vec::new(),
             started: false,
         }
     }
@@ -189,7 +197,7 @@ impl Terminal {
             }
         };
         let mut cmd = CommandBuilder::new("powershell.exe");
-        cmd.args(["-NoLogo", "-NoExit"]);
+        cmd.args(["-NoLogo", "-NoProfile", "-NoExit"]);
         cmd.cwd(cwd);
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -250,14 +258,82 @@ impl Terminal {
         self.send_bytes(&out);
     }
 
-    pub fn poll(&mut self) {
-        if let Some(rx) = &self.rx {
-            let mut any = false;
-            while let Ok(chunk) = rx.try_recv() {
-                self.parser.process(&chunk);
-                any = true;
+    /// Answer host queries (DSR cursor report, DSR status, DA) so shells
+    /// like PowerShell/PSReadLine don't block waiting for a reply.
+    fn respond_to_queries(&mut self, chunk: &[u8]) {
+        self.inq.extend_from_slice(chunk);
+        if self.inq.len() > 4096 {
+            let excess = self.inq.len() - 4096;
+            self.inq.drain(..excess);
+        }
+        let (replies, consumed_upto) = {
+            let (row, col) = self.parser.screen().cursor_position();
+            let mut replies: Vec<Vec<u8>> = Vec::new();
+            let buf = &self.inq;
+            let mut i = 0;
+            let mut last_complete = 0;
+            while i < buf.len() {
+                if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+                    let mut j = i + 2;
+                    while j < buf.len()
+                        && matches!(
+                            buf[j],
+                            b'0'..=b'9' | b';' | b'?' | b'>' | b'!' | b'$' | b'"' | b' ' | b'\''
+                        )
+                    {
+                        j += 1;
+                    }
+                    if j >= buf.len() {
+                        break; // incomplete sequence, keep as tail
+                    }
+                    let params = &buf[i + 2..j];
+                    match buf[j] {
+                        b'n' if params == b"6" => {
+                            replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+                        }
+                        b'n' if params == b"5" => {
+                            replies.push(b"\x1b[0n".to_vec());
+                        }
+                        b'c' => {
+                            replies.push(b"\x1b[?62;c".to_vec());
+                        }
+                        _ => {}
+                    }
+                    i = j + 1;
+                    last_complete = i;
+                } else {
+                    i += 1;
+                }
             }
-            let _ = any;
+            (replies, last_complete)
+        };
+        let keep_from = consumed_upto.max(self.inq.len().saturating_sub(64));
+        self.inq.drain(..keep_from);
+        for reply in replies {
+            self.send_bytes(&reply);
+        }
+    }
+
+    pub fn poll(&mut self) {
+        let chunks: Vec<Vec<u8>> = if let Some(rx) = &self.rx {
+            let mut out = Vec::new();
+            while let Ok(chunk) = rx.try_recv() {
+                out.push(chunk);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        if chunks.is_empty() {
+            return;
+        }
+        {
+            for chunk in &chunks {
+                self.total_chunks += 1;
+                self.total_bytes += chunk.len() as u64;
+                self.parser.process(chunk);
+                self.respond_to_queries(chunk);
+            }
         }
     }
 
@@ -266,6 +342,12 @@ impl Terminal {
         self.poll();
 
         ui.horizontal(|ui| {
+            if ui
+                .small_button(if self.collapsed { "+" } else { "-" })
+                .clicked()
+            {
+                self.collapsed = !self.collapsed;
+            }
             ui.heading("Terminal");
             ui.label(
                 eframe::egui::RichText::new(if self.running {
@@ -302,12 +384,17 @@ impl Terminal {
             ui.colored_label(eframe::egui::Color32::from_rgb(0xE0, 0x6C, 0x75), err);
         }
 
+        if self.collapsed {
+            return;
+        }
+
         ui.separator();
 
         let job = term_job(self.parser.screen());
         eframe::egui::ScrollArea::vertical()
+            .id_salt("snor_term_grid")
+            .max_height(150.0)
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
             .show(ui, |ui| {
                 ui.add(eframe::egui::Label::new(job).extend());
             });
@@ -315,9 +402,10 @@ impl Terminal {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("$");
-            let resp = ui.add(
+            let avail = ui.available_width();
+            let resp = ui.add_sized(
+                [(avail - 60.0).max(80.0), 22.0],
                 eframe::egui::TextEdit::singleline(&mut self.input)
-                    .desired_width(f32::INFINITY)
                     .hint_text("type command, Enter to send (try: opencode --help)"),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
