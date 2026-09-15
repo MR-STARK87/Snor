@@ -259,11 +259,29 @@ impl OpenBuffer {
     }
 }
 
+pub fn find_line_matches(text: &str, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_lowercase();
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| line.to_lowercase().contains(&q))
+        .map(|(idx, _)| idx)
+        .take(2000)
+        .collect()
+}
+
 pub struct Editor {
     tabs: Vec<OpenBuffer>,
     active: usize,
     pub error: Option<String>,
     pub saved_tick: u64,
+    find_open: bool,
+    find_query: String,
+    find_hits: Vec<usize>,
+    find_pos: usize,
+    find_focus_req: bool,
 }
 
 impl Editor {
@@ -273,6 +291,11 @@ impl Editor {
             active: 0,
             error: None,
             saved_tick: 0,
+            find_open: false,
+            find_query: String::new(),
+            find_hits: Vec::new(),
+            find_pos: 0,
+            find_focus_req: false,
         }
     }
 
@@ -291,8 +314,42 @@ impl Editor {
         }
     }
 
-    pub fn active_path(&self) -> Option<PathBuf> {
-        self.tabs.get(self.active).map(|t| t.path.clone())
+    fn recompute_find(&mut self) {
+        self.find_hits = match self.tabs.get(self.active) {
+            Some(buf) => find_line_matches(&buf.text, self.find_query.trim()),
+            None => Vec::new(),
+        };
+        self.find_pos = 0;
+    }
+
+    fn find_step(&mut self, ui: &egui::Ui, dir: i32) {
+        if self.find_hits.is_empty() {
+            return;
+        }
+        let n = self.find_hits.len() as i32;
+        self.find_pos = (self.find_pos as i32 + dir).rem_euclid(n) as usize;
+        self.jump_to_hit(ui);
+    }
+
+    fn jump_to_hit(&mut self, ui: &egui::Ui) {
+        use eframe::egui::text::{CCursor, CCursorRange};
+        use eframe::egui::widgets::text_edit::TextEditState;
+        let Some(buf) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(&line) = self.find_hits.get(self.find_pos) else {
+            return;
+        };
+        let byte: usize = buf.text.lines().take(line).map(|l| l.len() + 1).sum();
+        let byte = byte.min(buf.text.len());
+        let ch = buf.text[..byte].chars().count();
+        let id = ui.make_persistent_id("snor_editor_text");
+        let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(ch))));
+        state.store(ui.ctx(), id);
+        ui.memory_mut(|m| m.request_focus(id));
     }
 
     fn save_active(&mut self) {
@@ -310,6 +367,7 @@ impl Editor {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let mut close_idx: Option<usize> = None;
+            let mut tab_switched = false;
             for (idx, tab) in self.tabs.iter().enumerate() {
                 let name = tab
                     .path
@@ -319,6 +377,7 @@ impl Editor {
                 let label = if tab.dirty { format!("{name} *") } else { name };
                 if ui.selectable_label(idx == self.active, label).clicked() {
                     self.active = idx;
+                    tab_switched = true;
                 }
                 if ui.small_button("x").clicked() {
                     close_idx = Some(idx);
@@ -334,6 +393,10 @@ impl Editor {
                 if self.active >= self.tabs.len() && !self.tabs.is_empty() {
                     self.active = self.tabs.len() - 1;
                 }
+                tab_switched = true;
+            }
+            if tab_switched {
+                self.recompute_find();
             }
         });
         ui.separator();
@@ -343,6 +406,7 @@ impl Editor {
         }
 
         if self.tabs.is_empty() {
+            self.find_open = false;
             egui::ScrollArea::both()
                 .id_salt("snor_editor_empty")
                 .show(ui, |ui| {
@@ -350,6 +414,76 @@ impl Editor {
                     ui.monospace("// tabs + tree-sitter highlight + Ctrl+S to save.");
                 });
             return;
+        }
+
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL,
+                egui::Key::F,
+            ))
+        }) {
+            self.find_open = !self.find_open;
+            self.find_focus_req = true;
+            self.recompute_find();
+        }
+
+        if self.find_open {
+            let find_id = ui.make_persistent_id("snor_find_query");
+            if self.find_focus_req {
+                ui.memory_mut(|m| m.request_focus(find_id));
+                self.find_focus_req = false;
+            }
+            let mut close_find = false;
+            let mut step = 0;
+            let mut field_focused = false;
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.find_query)
+                        .id(find_id)
+                        .hint_text("find in file")
+                        .desired_width(220.0),
+                );
+                if resp.changed() {
+                    self.recompute_find();
+                }
+                let n = self.find_hits.len();
+                if n > 0 {
+                    ui.label(egui::RichText::new(format!("{}/{}", self.find_pos + 1, n)).small());
+                    if ui.small_button("prev").clicked() {
+                        step = -1;
+                    }
+                    if ui.small_button("next").clicked() {
+                        step = 1;
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("no match")
+                            .small()
+                            .color(crate::theme::dim_text()),
+                    );
+                }
+                if ui.small_button("x").clicked() {
+                    close_find = true;
+                }
+                let ff = ui.memory(|m| m.has_focus(find_id));
+                field_focused = ff;
+                if ff && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    step = if ui.input(|i| i.modifiers.shift) {
+                        -1
+                    } else {
+                        1
+                    };
+                }
+            });
+            if field_focused && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_find = true;
+            }
+            if close_find {
+                self.find_open = false;
+            } else if step != 0 {
+                self.find_step(ui, step);
+            }
+            ui.separator();
         }
 
         let mut want_save = false;
@@ -392,6 +526,8 @@ impl Editor {
         };
         let lang = buf.lang.clone();
         let editable = !buf.too_large;
+        let editor_id = ui.make_persistent_id("snor_editor_text");
+        let mut text_changed = false;
         egui::ScrollArea::both()
             .id_salt("snor_editor_text")
             .auto_shrink([false, false])
@@ -404,6 +540,7 @@ impl Editor {
                 };
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut buf.text)
+                        .id(editor_id)
                         .code_editor()
                         .desired_width(f32::INFINITY)
                         .frame(egui::Frame::NONE)
@@ -413,8 +550,12 @@ impl Editor {
                 if resp.changed() {
                     buf.dirty = true;
                     buf.refresh_lines();
+                    text_changed = true;
                 }
             });
+        if text_changed && self.find_open {
+            self.recompute_find();
+        }
     }
 }
 
@@ -439,5 +580,13 @@ mod tests {
         let back = std::fs::read_to_string(&path).unwrap();
         assert!(back.contains("// edited"), "saved text missing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_matches_lines_case_insensitive() {
+        let text = "fn alpha() {}\nlet beta = 1;\n// ALPHA note\n";
+        assert_eq!(find_line_matches(text, "alpha"), vec![0, 2]);
+        assert_eq!(find_line_matches(text, "zzz"), Vec::<usize>::new());
+        assert_eq!(find_line_matches(text, ""), Vec::<usize>::new());
     }
 }

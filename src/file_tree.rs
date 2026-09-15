@@ -132,6 +132,25 @@ impl FileTree {
 }
 
 impl FileTree {
+    pub fn set_root(&mut self, root: PathBuf) {
+        if let Some(w) = self._watcher.as_mut() {
+            let _ = w.unwatch(&self.root);
+            let _ = w.watch(&root, RecursiveMode::Recursive);
+        }
+        self.create_parent = root.clone();
+        self.root = root.clone();
+        self.selected = None;
+        self.expanded.clear();
+        self.expanded.insert(root);
+        self.create_mode = None;
+        self.create_name.clear();
+        self.rename_target = None;
+        self.delete_target = None;
+        self.error = None;
+        self.opened_file = None;
+        self.refresh();
+    }
+
     pub fn refresh(&mut self) {
         self.nodes = build_nodes(&self.root, 0);
         self.needs_refresh = false;
@@ -157,16 +176,20 @@ impl FileTree {
         }
     }
 
-    fn parent_for_new(&self) -> PathBuf {
-        if let Some(sel) = &self.selected {
-            if sel.is_dir() {
-                return sel.clone();
-            }
-            if let Some(p) = sel.parent() {
-                return p.to_path_buf();
-            }
-        }
-        self.root.clone()
+    fn begin_create(&mut self, parent: PathBuf, mode: CreateMode) {
+        self.create_parent = parent;
+        self.create_mode = Some(mode);
+        self.create_name.clear();
+        self.error = None;
+    }
+
+    fn begin_rename(&mut self, path: PathBuf) {
+        self.rename_buf = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.rename_target = Some(path);
+        self.error = None;
     }
 
     fn do_create(&mut self) {
@@ -281,6 +304,26 @@ impl FileTree {
                 if clicked_select {
                     self.selected = Some(node.path.clone());
                 }
+                resp.header_response.context_menu(|ui| {
+                    if ui.button("new file here").clicked() {
+                        self.begin_create(node.path.clone(), CreateMode::File);
+                        ui.close();
+                    }
+                    if ui.button("new folder here").clicked() {
+                        self.begin_create(node.path.clone(), CreateMode::Dir);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("rename").clicked() {
+                        self.begin_rename(node.path.clone());
+                        ui.close();
+                    }
+                    if ui.button("delete").clicked() {
+                        self.delete_target = Some(node.path.clone());
+                        self.error = None;
+                        ui.close();
+                    }
+                });
             } else {
                 let selected = self.selected.as_ref() == Some(&node.path);
                 let resp = ui.selectable_label(selected, &node.name);
@@ -291,6 +334,17 @@ impl FileTree {
                     self.selected = Some(node.path.clone());
                     self.opened_file = Some(node.path.clone());
                 }
+                resp.context_menu(|ui| {
+                    if ui.button("rename").clicked() {
+                        self.begin_rename(node.path.clone());
+                        ui.close();
+                    }
+                    if ui.button("delete").clicked() {
+                        self.delete_target = Some(node.path.clone());
+                        self.error = None;
+                        ui.close();
+                    }
+                });
             }
         }
     }
@@ -299,49 +353,25 @@ impl FileTree {
         self.poll_watcher();
 
         ui.horizontal(|ui| {
-            ui.heading("Explorer");
+            let head = ui.heading("Explorer");
+            head.context_menu(|ui| {
+                if ui.button("new file here").clicked() {
+                    self.begin_create(self.root.clone(), CreateMode::File);
+                    ui.close();
+                }
+                if ui.button("new folder here").clicked() {
+                    self.begin_create(self.root.clone(), CreateMode::Dir);
+                    ui.close();
+                }
+            });
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
-                    if ui.small_button("refresh").clicked() {
+                    if ui.small_button("↻").clicked() {
                         self.refresh();
                     }
                 },
             );
-        });
-        ui.horizontal(|ui| {
-            if ui.small_button("+ file").clicked() {
-                self.create_parent = self.parent_for_new();
-                self.create_mode = Some(CreateMode::File);
-                self.create_name.clear();
-                self.error = None;
-            }
-            if ui.small_button("+ dir").clicked() {
-                self.create_parent = self.parent_for_new();
-                self.create_mode = Some(CreateMode::Dir);
-                self.create_name.clear();
-                self.error = None;
-            }
-            let can_edit = self.selected.is_some();
-            if ui
-                .add_enabled(can_edit, eframe::egui::Button::new("rename").small())
-                .clicked()
-                && let Some(sel) = self.selected.clone()
-            {
-                self.rename_target = Some(sel.clone());
-                self.rename_buf = sel
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                self.error = None;
-            }
-            if ui
-                .add_enabled(can_edit, eframe::egui::Button::new("delete").small())
-                .clicked()
-            {
-                self.delete_target = self.selected.clone();
-                self.error = None;
-            }
         });
 
         if let Some(mode) = &self.create_mode {
@@ -398,7 +428,10 @@ impl FileTree {
                 let nodes = self.nodes.clone();
                 if nodes.is_empty() {
                     ui.label(
-                        eframe::egui::RichText::new("empty folder").color(crate::theme::dim_text()),
+                        eframe::egui::RichText::new(
+                            "empty folder — right-click Explorer for options",
+                        )
+                        .color(crate::theme::dim_text()),
                     );
                 } else {
                     self.render_nodes(ui, nodes);

@@ -378,6 +378,9 @@ impl Terminal {
         self.ensure_started(cwd);
         self.poll();
 
+        let focus_id = ui.make_persistent_id("snor_term_focus");
+        let is_focused = ui.memory(|m| m.has_focus(focus_id));
+
         ui.horizontal(|ui| {
             if ui
                 .small_button(if self.fullscreen { "unmax" } else { "max" })
@@ -404,6 +407,13 @@ impl Terminal {
                 .small()
                 .color(crate::theme::dim_text()),
             );
+            if is_focused {
+                ui.label(
+                    eframe::egui::RichText::new("●")
+                        .small()
+                        .color(crate::theme::accent()),
+                );
+            }
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
@@ -434,19 +444,9 @@ impl Terminal {
         ui.separator();
 
         let focus_id = ui.make_persistent_id("snor_term_focus");
-        let focused = ui.memory(|m| m.has_focus(focus_id));
-        if !focused {
-            ui.label(
-                eframe::egui::RichText::new(
-                    "click terminal + type directly (Enter, arrows, Tab, Ctrl+C all work)",
-                )
-                .small()
-                .color(crate::theme::dim_text()),
-            );
-        }
 
         let job = term_job(self.parser.screen());
-        let grid_max = (ui.available_height() - 40.0).max(60.0);
+        let grid_max = (ui.available_height() - 12.0).max(60.0);
         eframe::egui::ScrollArea::vertical()
             .id_salt("snor_term_grid")
             .max_height(grid_max)
@@ -491,15 +491,6 @@ impl Terminal {
                 }
             }
         }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            for (label, cmd) in [("dir", "dir\r"), ("opencode --help", "opencode --help\r")] {
-                if ui.small_button(label).clicked() {
-                    self.send_bytes(cmd.as_bytes());
-                }
-            }
-        });
     }
 }
 

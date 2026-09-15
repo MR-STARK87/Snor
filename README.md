@@ -1,10 +1,10 @@
 # Snor — lightweight native IDE in full Rust
 
 Goal: beat Zed's ~980MB RAM with a minimal native IDE.
-Done: file tree, editor tabs + highlight, ConPTY terminal, project search.
+Done: file tree, editor tabs + highlight, ConPTY terminal, find in file.
 Deliberately no git — use your own git client, Snor stays lean.
 
-Stack: `eframe 0.36/egui (glow) + ropey + tree-sitter-highlight + portable-pty (ConPTY) + vt100 + notify + ignore`.
+Stack: `eframe 0.36/egui (glow) + ropey + tree-sitter-highlight + portable-pty (ConPTY) + vt100 + notify + rfd`.
 
 ## Run
 ```powershell
@@ -13,10 +13,10 @@ cargo run --release
 ```
 
 ## Use
-- Explorer (left): browse, `+ file`, `+ dir`, rename, delete, auto-refresh via watcher. Double-click opens in editor.
-- Editor (center): tabs, tree-sitter highlight (rust/json/js/toml, keyword fallback for the rest, 100KB TS cap), Ctrl+S to save, large-file guard 500KB.
-- Terminal: real ConPTY `powershell.exe -NoLogo -NoProfile` with colors + block cursor. Click it and type directly — Enter, arrows, Tab, Backspace, Ctrl+C all go to the shell. Answers DSR/CPR/DA queries so PSReadLine unblocks. `max` fills the center column, `-` collapses. Quick buttons for `dir` and `opencode --help`. Run `opencode` inside to drive your agent.
-- Search (right): text search across repo (ignore rules, 2000-hit cap), click a hit to open.
+- Top bar: current folder + `open folder` to switch projects.
+- Explorer (left): browse, right-click a folder/file for new/rename/delete, `↻` to refresh, auto-refresh via watcher. Double-click opens in editor.
+- Editor (center): tabs, tree-sitter highlight (rust/json/js/toml, keyword fallback for the rest, 100KB TS cap), Ctrl+S to save, Ctrl+F to find in the current file (Enter next, Shift+Enter prev, Esc close), large-file guard 500KB.
+- Terminal: real ConPTY `powershell.exe -NoLogo -NoProfile` with colors + block cursor. Click it and type directly — Enter, arrows, Tab, Backspace, Ctrl+C all go to the shell. Answers DSR/CPR/DA queries so PSReadLine unblocks. `max` fills the center column, `-` collapses. Run `opencode` inside to drive your agent.
 
 ## Memory vs Zed 980MB (Windows 11, WorkingSet64)
 - V1 debug full: ~306-313MB, V1 release: ~331MB, 17MB exe
@@ -25,9 +25,10 @@ cargo run --release
 
 ## Notes
 - Release builds hide the console window (`windows_subsystem`); debug keeps it.
-- Bottom zone (terminal + status) is laid out manually inside the central
-  panel — `Panel::bottom` never painted in this setup, so it was dropped.
-- `cargo test` covers file tree listing, editor open/edit/save, project search, terminal key mapping.
+- Terminal + editor share the central panel (manual split) — `Panel::bottom`
+  never painted in this setup, so it was dropped.
+- `cargo test` covers file tree listing, editor open/edit/save, in-file find,
+  terminal key mapping.
 
 ## Measure
 ```powershell
