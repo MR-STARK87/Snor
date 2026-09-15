@@ -1,6 +1,7 @@
 use eframe::egui;
 
 mod app;
+mod file_tree;
 mod theme;
 
 fn main() -> anyhow::Result<()> {

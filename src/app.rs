@@ -1,42 +1,36 @@
 use eframe::egui;
 use std::path::PathBuf;
 
+use crate::file_tree::FileTree;
+
 pub struct SnorApp {
     root: PathBuf,
+    tree: FileTree,
     status: String,
-    files: Vec<String>,
+    preview_path: Option<PathBuf>,
 }
 
 impl SnorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply_dark(&cc.egui_ctx);
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut app = Self {
+        let tree = FileTree::new(root.clone());
+        Self {
             root,
+            tree,
             status: String::from("ready"),
-            files: Vec::new(),
-        };
-        app.refresh_files();
-        app
-    }
-
-    fn refresh_files(&mut self) {
-        self.files.clear();
-        if let Ok(entries) = std::fs::read_dir(&self.root) {
-            let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .filter(|n| n != "target")
-                .collect();
-            names.sort();
-            self.files = names;
+            preview_path: None,
         }
-        self.status = format!("{} entries", self.files.len());
     }
 }
 
 impl eframe::App for SnorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(opened) = self.tree.opened_file.take() {
+            self.preview_path = Some(opened.clone());
+            self.status = format!("opened {}", opened.display());
+        }
+
         egui::Panel::top("snor_top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(
@@ -55,29 +49,15 @@ impl eframe::App for SnorApp {
                             .small()
                             .color(crate::theme::dim_text()),
                     );
-                    if ui.small_button("refresh").clicked() {
-                        self.refresh_files();
-                    }
                 });
             });
         });
 
         egui::Panel::left("snor_tree")
-            .default_size(240.0)
-            .min_size(180.0)
+            .default_size(260.0)
+            .min_size(200.0)
             .show(ui, |ui| {
-                ui.heading("Explorer");
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for name in &self.files {
-                        let _ = ui.selectable_label(false, name);
-                    }
-                    if self.files.is_empty() {
-                        ui.label(
-                            egui::RichText::new("empty folder").color(crate::theme::dim_text()),
-                        );
-                    }
-                });
+                self.tree.ui(ui);
             });
 
         egui::Panel::bottom("snor_terminal")
@@ -104,8 +84,14 @@ impl eframe::App for SnorApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let sel = self
+                        .tree
+                        .selected
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     ui.label(
-                        egui::RichText::new("UTF-8  Ln 1, Col 1")
+                        egui::RichText::new(format!("sel: {sel}"))
                             .small()
                             .color(crate::theme::dim_text()),
                     );
@@ -115,15 +101,38 @@ impl eframe::App for SnorApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                let _ = ui.selectable_label(true, "welcome.rs");
+                if let Some(p) = &self.preview_path {
+                    let name = p
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let _ = ui.selectable_label(true, name);
+                } else {
+                    let _ = ui.selectable_label(true, "welcome.rs");
+                }
                 let _ = ui.selectable_label(false, "+");
             });
             ui.separator();
             egui::ScrollArea::both().show(ui, |ui| {
-                ui.monospace("// Snor shell up. Editor + highlight lands next milestone.");
-                ui.monospace("// V1 target: <250MB idle vs Zed 980MB.");
-                ui.add_space(12.0);
-                ui.label(format!("root: {}", self.root.display()));
+                if let Some(p) = &self.preview_path {
+                    ui.monospace(format!("// {}", p.display()));
+                    ui.monospace("// editor buffer + highlight lands next milestone.");
+                    match std::fs::read_to_string(p) {
+                        Ok(text) => {
+                            let preview: String =
+                                text.lines().take(80).collect::<Vec<_>>().join("\n");
+                            ui.monospace(preview);
+                        }
+                        Err(e) => {
+                            ui.label(format!("cannot preview: {e}"));
+                        }
+                    }
+                } else {
+                    ui.monospace("// Snor shell up. Double-click a file to preview it.");
+                    ui.monospace("// V1 target: <250MB idle vs Zed 980MB.");
+                    ui.add_space(12.0);
+                    ui.label(format!("root: {}", self.root.display()));
+                }
             });
         });
 

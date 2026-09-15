@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 eframe = "0.36"
+notify = "8.2.0"
+walkdir = "2.5.0"
