@@ -7,6 +7,26 @@ const ROWS: u16 = 24;
 const COLS: u16 = 80;
 const SCROLLBACK: usize = 1000;
 
+/// Width reserved on the right of the terminal header for the shell pill and
+/// the three icon buttons, so the tab strip can be bounded and leave them on
+/// the same line. Measured off a live capture: the pill inks 55pt and the
+/// three 20pt buttons plus their spacing come to about 100pt.
+const TERM_HDR_RIGHT_W: f32 = 190.0;
+
+/// Tab label for the n-th shell ever spawned.
+///
+/// The first is bare "powershell"; later ones are numbered from 2, so a
+/// single tab never reads "powershell 1". Numbering counts shells spawned
+/// rather than tabs currently open, so closing and reopening does not reuse
+/// a label that is still on screen.
+fn shell_title(n: usize) -> String {
+    if n <= 1 {
+        "powershell".to_owned()
+    } else {
+        format!("powershell {n}")
+    }
+}
+
 fn vt_color(c: vt100::Color, is_bg: bool) -> eframe::egui::Color32 {
     use eframe::egui::Color32 as C;
     match c {
@@ -139,18 +159,58 @@ fn term_job(screen: &vt100::Screen) -> eframe::egui::text::LayoutJob {
     job
 }
 
-pub struct Terminal {
+/// One shell: its pty, its reader thread, its scrollback and its screen.
+///
+/// Everything the terminal used to hold directly lives here now, so the panel
+/// can hold several at once and switch between them. The methods that touch
+/// the parser or the pty live in the `impl Session` blocks below, split around
+/// `impl Terminal`; that is why there is more than one of each.
+struct Session {
+    /// Tab label. The first shell is just "powershell"; later ones are
+    /// numbered from 2, so a single tab never reads "powershell 1".
+    title: String,
     parser: vt100::Parser,
     rx: Option<Receiver<Vec<u8>>>,
     writer: Option<Box<dyn Write + Send>>,
     _child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     _master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    pub error: Option<String>,
-    pub running: bool,
+    error: Option<String>,
+    running: bool,
+    total_bytes: u64,
+    total_chunks: u64,
+    inq: Vec<u8>,
+    started: bool,
+}
+
+impl Session {
+    fn new(title: String) -> Self {
+        Self {
+            title,
+            parser: vt100::Parser::new(ROWS, COLS, SCROLLBACK),
+            rx: None,
+            writer: None,
+            _child: None,
+            _master: None,
+            error: None,
+            running: false,
+            total_bytes: 0,
+            total_chunks: 0,
+            inq: Vec::new(),
+            started: false,
+        }
+    }
+}
+
+pub struct Terminal {
+    sessions: Vec<Session>,
+    /// Index into `sessions`. Never out of range: closing the last tab is
+    /// refused, so there is always at least one.
+    active_tab: usize,
+    /// Counts shells ever spawned rather than tabs currently open, so titles
+    /// stay stable as tabs are closed and reopened.
+    spawned: usize,
     pub collapsed: bool,
     pub fullscreen: bool,
-    pub total_bytes: u64,
-    pub total_chunks: u64,
     /// Click-to-type latch: set when the terminal grid is clicked, cleared
     /// the moment any real widget (editor, find box, explorer field) owns
     /// keyboard focus. Keystrokes are forwarded only while `active` holds
@@ -167,40 +227,83 @@ pub struct Terminal {
     /// explicit focus grab (click, Ctrl+F) apart from egui's Tab focus
     /// theft, which must be handed back so shell completion keeps working.
     focus_clear: bool,
-    inq: Vec<u8>,
-    started: bool,
 }
 
 impl Terminal {
     pub fn new() -> Self {
         Self {
-            parser: vt100::Parser::new(ROWS, COLS, SCROLLBACK),
-            rx: None,
-            writer: None,
-            _child: None,
-            _master: None,
-            error: None,
-            running: false,
+            sessions: vec![Session::new(shell_title(1))],
+            active_tab: 0,
+            spawned: 1,
             collapsed: false,
             fullscreen: false,
-            total_bytes: 0,
-            total_chunks: 0,
             active: false,
             hidden: false,
             term_h: 280.0,
             focus_clear: true,
-            inq: Vec::new(),
-            started: false,
         }
     }
 
-    pub fn ensure_started(&mut self, cwd: &PathBuf) {
-        if self.started {
+    /// Open another shell and switch to it.
+    fn new_tab(&mut self, cwd: &PathBuf) {
+        self.spawned += 1;
+        let mut session = Session::new(shell_title(self.spawned));
+        session.started = true;
+        session.spawn(cwd);
+        self.sessions.push(session);
+        self.active_tab = self.sessions.len() - 1;
+        self.active = true;
+        // A new shell you cannot see is not a new shell.
+        self.collapsed = false;
+    }
+
+    /// Append a shell without opening a real pty, so the tab bookkeeping can
+    /// be tested hermetically. Everything except the `spawn` call is the same
+    /// as `new_tab`, and the title comes from the same `shell_title`, so a
+    /// numbering change cannot pass the tests while breaking the app.
+    #[cfg(test)]
+    fn open_stub_tab(&mut self) {
+        self.spawned += 1;
+        self.sessions.push(Session::new(shell_title(self.spawned)));
+        self.active_tab = self.sessions.len() - 1;
+        self.active = true;
+        self.collapsed = false;
+    }
+
+    /// Close a tab.
+    ///
+    /// The last one is refused: an empty terminal panel would need its own
+    /// empty state, and the whole feature is built on there being a shell to
+    /// talk to. Restarting a wedged shell is what the refresh button is for.
+    fn close_tab(&mut self, index: usize) {
+        if self.sessions.len() <= 1 || index >= self.sessions.len() {
             return;
         }
-        self.started = true;
-        self.spawn(cwd);
+        self.sessions.remove(index);
+        self.active_tab = self.active_tab.min(self.sessions.len() - 1);
     }
+
+    pub fn ensure_started(&mut self, cwd: &PathBuf) {
+        let i = self.active_tab;
+        if !self.sessions[i].started {
+            self.sessions[i].started = true;
+            self.sessions[i].spawn(cwd);
+        }
+    }
+
+    /// Drain every session, not just the visible one.
+    ///
+    /// A background shell still answers prompts and still writes to its pty;
+    /// leaving its channel unread would grow it without bound, and the tab
+    /// would come back to the wrong screen when you switched to it.
+    pub fn poll(&mut self) {
+        for session in &mut self.sessions {
+            session.poll();
+        }
+    }
+}
+
+impl Session {
 
     fn spawn(&mut self, cwd: &PathBuf) {
         let pty_system = native_pty_system();
@@ -271,7 +374,26 @@ impl Terminal {
         }
     }
 
+}
+
+impl Terminal {
+    fn session(&self) -> &Session {
+        &self.sessions[self.active_tab]
+    }
+
+    fn session_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.active_tab]
+    }
+
+    /// Forward bytes to the active shell.
+    fn send_bytes(&mut self, bytes: &[u8]) {
+        self.session_mut().send_bytes(bytes);
+    }
+
     /// Send a full shell line (used by the editor Run button).
+    ///
+    /// Goes to the active shell: that is the one whose output the user is
+    /// watching, and the one the Run button's result should land in.
     pub fn send_line(&mut self, line: &str) {
         if self.collapsed {
             self.collapsed = false;
@@ -281,7 +403,7 @@ impl Terminal {
         if !s.ends_with('\r') && !s.ends_with('\n') {
             s.push('\r');
         }
-        self.send_bytes(s.as_bytes());
+        self.session_mut().send_bytes(s.as_bytes());
     }
 
     /// Map a pressed key to pty bytes. Returns None to leave the event alone
@@ -328,6 +450,9 @@ impl Terminal {
         }
     }
 
+}
+
+impl Session {
     /// Answer host queries (DSR cursor report, DSR status, DA) so shells
     /// like PowerShell/PSReadLine don't block waiting for a reply.
     fn respond_to_queries(&mut self, chunk: &[u8]) {
@@ -399,7 +524,8 @@ impl Terminal {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Take whatever this shell's reader thread has produced.
+    fn poll(&mut self) {
         let chunks: Vec<Vec<u8>> = if let Some(rx) = &self.rx {
             let mut out = Vec::new();
             while let Ok(chunk) = rx.try_recv() {
@@ -422,6 +548,9 @@ impl Terminal {
         }
     }
 
+}
+
+impl Terminal {
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, cwd: &PathBuf) {
         self.ensure_started(cwd);
         self.poll();
@@ -429,28 +558,107 @@ impl Terminal {
         let is_active = self.active;
         let accent = crate::theme::accent();
 
+        // Read what the header needs before opening the closure. Borrowing
+        // `self.sessions` for the tab strip while the same closure also wants
+        // `&mut self` for close/new does not work, and cloning a handful of
+        // short titles per frame is cheaper than restructuring around it.
+        let titles: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
+        let active_tab = self.active_tab;
+        let running = self.session().running;
+        let error = self.session().error.clone();
+
+        let mut switch_to: Option<usize> = None;
+        let mut close_tab: Option<usize> = None;
+        let mut open_tab = false;
+
         ui.horizontal(|ui| {
-            // Tab pill, like the reference terminal header.
-            eframe::egui::Frame::NONE
-                .fill(crate::theme::tab_active())
-                .stroke(eframe::egui::Stroke::new(1.0, crate::theme::hairline()))
-                .corner_radius(6.0)
-                .inner_margin(eframe::egui::Margin::symmetric(8, 3))
+            // One pill per shell, in a row that scrolls once there are more
+            // than fit — the same treatment the editor's file tabs get. The
+            // reference has a single tab with a "+" beside it; this is that
+            // row, able to hold more than one.
+            //
+            // The width is bounded rather than left to `available_width`
+            // because the row shares its line with the right-hand controls:
+            // an unbounded scroll area claims the whole line and pushes them
+            // off it.
+            eframe::egui::ScrollArea::horizontal()
+                .id_salt("snor_term_tabs")
+                .max_width((ui.available_width() - TERM_HDR_RIGHT_W).max(140.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            eframe::egui::RichText::new(">_")
-                                .size(12.0)
-                                .family(crate::theme::medium())
-                                .color(accent),
-                        );
-                        ui.label(
-                            eframe::egui::RichText::new("Terminal")
-                                .size(12.5)
-                                .color(crate::theme::text()),
-                        );
+                        for (idx, title) in titles.iter().enumerate() {
+                            let active = idx == active_tab;
+                            eframe::egui::Frame::NONE
+                                .fill(if active {
+                                    crate::theme::tab_active()
+                                } else {
+                                    eframe::egui::Color32::TRANSPARENT
+                                })
+                                .stroke(if active {
+                                    eframe::egui::Stroke::new(1.0, crate::theme::hairline())
+                                } else {
+                                    eframe::egui::Stroke::NONE
+                                })
+                                .corner_radius(6.0)
+                                .inner_margin(eframe::egui::Margin::symmetric(8, 3))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            eframe::egui::RichText::new(">_")
+                                                .size(12.0)
+                                                .family(crate::theme::medium())
+                                                .color(accent),
+                                        );
+                                        let label = eframe::egui::RichText::new(title)
+                                            .size(12.5)
+                                            .color(if active {
+                                                crate::theme::text()
+                                            } else {
+                                                crate::theme::dim_text()
+                                            });
+                                        if ui
+                                            .add(
+                                                eframe::egui::Label::new(label)
+                                                    .sense(eframe::egui::Sense::click()),
+                                            )
+                                            .clicked()
+                                        {
+                                            switch_to = Some(idx);
+                                        }
+                                        if crate::icons::icon_button(
+                                            ui,
+                                            16.0,
+                                            "close terminal",
+                                            crate::icons::close_x,
+                                        )
+                                        .clicked()
+                                        {
+                                            close_tab = Some(idx);
+                                        }
+                                    });
+                                });
+                        }
+                        if crate::icons::icon_button(ui, 20.0, "new terminal", crate::icons::plus)
+                            .clicked()
+                        {
+                            open_tab = true;
+                        }
                     });
                 });
+
+            // Applied after the strip is built, so the list is not mutated
+            // while it is being iterated.
+            if let Some(i) = switch_to {
+                self.active_tab = i;
+                self.active = true;
+            }
+            if let Some(i) = close_tab {
+                self.close_tab(i);
+            }
+            if open_tab {
+                self.new_tab(cwd);
+            }
+
             let collapse = if self.collapsed {
                 crate::icons::icon_button(ui, 20.0, "expand", |p, r, c| {
                     crate::icons::plus(p, r, c)
@@ -464,7 +672,7 @@ impl Terminal {
                 self.collapsed = !self.collapsed;
             }
             ui.label(
-                eframe::egui::RichText::new(if self.running {
+                eframe::egui::RichText::new(if running {
                     "powershell.exe"
                 } else {
                     "stopped"
@@ -489,7 +697,7 @@ impl Terminal {
                     })
                     .clicked()
                     {
-                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                        self.session_mut().parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                     }
                     let fullscreen = self.fullscreen;
                     if crate::icons::icon_button(
@@ -516,12 +724,16 @@ impl Terminal {
                     })
                     .clicked()
                     {
-                        self.started = false;
-                        self.rx = None;
-                        self.writer = None;
-                        self._child = None;
-                        self._master = None;
-                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                        // Restart this shell only. The other tabs keep their
+                        // own ptys and their own scrollback.
+                        let session = self.session_mut();
+                        session.started = false;
+                        session.rx = None;
+                        session.writer = None;
+                        session._child = None;
+                        session._master = None;
+                        session.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                        session.error = None;
                         self.ensure_started(cwd);
                     }
                     // Shell picker look, like the reference (single shell).
@@ -541,7 +753,7 @@ impl Terminal {
             );
         });
 
-        if let Some(err) = &self.error {
+        if let Some(err) = &error {
             ui.colored_label(crate::theme::danger(), err);
         }
 
@@ -551,7 +763,7 @@ impl Terminal {
 
         ui.separator();
 
-        let job = term_job(self.parser.screen());
+        let job = term_job(self.session().parser.screen());
         // No input widget at all: the grid itself is the click-to-type area.
         // `active` latches on grid click. Forwarding is additionally gated on
         // no other widget holding keyboard focus, so keystrokes never leak
@@ -657,8 +869,12 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some(child) = self._child.as_mut() {
-            let _ = child.kill();
+        // Every shell, not just the visible one: a background tab's
+        // powershell would otherwise outlive the app that spawned it.
+        for session in &mut self.sessions {
+            if let Some(child) = session._child.as_mut() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -718,13 +934,84 @@ mod tests {
     #[test]
     fn query_responder_handles_split_sequences() {
         let mut t = Terminal::new();
-        t.respond_to_queries(b"\x1b[");
-        assert!(!t.inq.is_empty(), "partial sequence must be kept");
-        t.respond_to_queries(b"6n");
-        t.respond_to_queries(b"\x1b[?2026$p");
-        t.respond_to_queries(b"\x1b[c");
-        t.respond_to_queries(b"plain text without escapes");
-        assert!(t.inq.len() <= 64);
+        t.session_mut().respond_to_queries(b"\x1b[");
+        assert!(
+            !t.session().inq.is_empty(),
+            "partial sequence must be kept"
+        );
+        t.session_mut().respond_to_queries(b"6n");
+        t.session_mut().respond_to_queries(b"\x1b[?2026$p");
+        t.session_mut().respond_to_queries(b"\x1b[c");
+        t.session_mut()
+            .respond_to_queries(b"plain text without escapes");
+        assert!(t.session().inq.len() <= 64);
+    }
+
+    /// The whole point of the refactor: tabs are independent, and the last
+    /// one cannot be closed out from under the panel.
+    #[test]
+    fn tabs_spawn_switch_and_refuse_to_empty_the_panel() {
+        let mut t = Terminal::new();
+        assert_eq!(t.sessions.len(), 1);
+        assert_eq!(t.active_tab, 0);
+        assert_eq!(t.session().title, "powershell");
+
+        // A second tab is titled "powershell 2", not "powershell 1", and
+        // becomes active on creation.
+        t.open_stub_tab();
+        assert_eq!(t.sessions.len(), 2);
+        assert_eq!(t.active_tab, 1);
+        assert_eq!(t.session().title, "powershell 2");
+
+        // Switching back reads the first shell's own screen.
+        t.active_tab = 0;
+        assert_eq!(t.session().title, "powershell");
+
+        // Closing the active tab clamps the index back into range.
+        t.close_tab(1);
+        assert_eq!(t.sessions.len(), 1);
+        assert_eq!(t.active_tab, 0);
+
+        // The last tab survives a close attempt.
+        t.close_tab(0);
+        assert_eq!(t.sessions.len(), 1, "the last shell must not be closable");
+        assert_eq!(t.active_tab, 0);
+
+        // An out-of-range index is a no-op rather than a panic.
+        t.close_tab(9);
+        assert_eq!(t.sessions.len(), 1);
+    }
+
+    /// Closing a tab *before* the active one must not shift the selection
+    /// onto a different shell than the user was looking at.
+    #[test]
+    fn closing_an_earlier_tab_keeps_the_same_shell_selected() {
+        let mut t = Terminal::new();
+        t.open_stub_tab();
+        t.open_stub_tab();
+        t.active_tab = 2;
+        assert_eq!(t.session().title, "powershell 3");
+        t.close_tab(0);
+        // Index 2 clamped to the new last index — the same shell, now at 1.
+        assert_eq!(t.sessions.len(), 2);
+        assert_eq!(t.session().title, "powershell 3");
+    }
+
+    /// Numbering counts shells spawned, not tabs open: reopening after a
+    /// close must not reissue a label that is still on screen.
+    #[test]
+    fn tab_numbers_are_not_reused() {
+        let mut t = Terminal::new();
+        t.open_stub_tab();
+        t.open_stub_tab();
+        t.close_tab(1);
+        t.open_stub_tab();
+        let titles: Vec<&str> = t.sessions.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["powershell", "powershell 3", "powershell 4"]);
+        let mut sorted = titles.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), titles.len(), "tab labels must stay unique");
     }
 
     fn headless_raw() -> eframe::egui::RawInput {
@@ -798,14 +1085,20 @@ mod tests {
         let mut t = Terminal::new();
         t.ensure_started(&std::env::temp_dir());
         let t0 = Instant::now();
-        while t.total_bytes == 0 && t.error.is_none() && t0.elapsed() < Duration::from_secs(10)
+        while t.session().total_bytes == 0
+            && t.session().error.is_none()
+            && t0.elapsed() < Duration::from_secs(10)
         {
             std::thread::sleep(Duration::from_millis(50));
             t.poll();
         }
-        assert!(t.error.is_none(), "pty spawn failed: {:?}", t.error);
         assert!(
-            t.total_bytes > 0,
+            t.session().error.is_none(),
+            "pty spawn failed: {:?}",
+            t.session().error
+        );
+        assert!(
+            t.session().total_bytes > 0,
             "powershell printed nothing in 10s; cannot verify input path"
         );
         t.send_bytes(b"echo SNORPTYOK123\r");
@@ -814,7 +1107,7 @@ mod tests {
         while t1.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(50));
             t.poll();
-            if t.parser.screen().contents().contains("SNORPTYOK123") {
+            if t.session().parser.screen().contents().contains("SNORPTYOK123") {
                 seen = true;
                 break;
             }

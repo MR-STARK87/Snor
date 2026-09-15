@@ -28,12 +28,13 @@ otherwise `cargo build` fails with `os error 5`.
 | File | Owns |
 |---|---|
 | `main.rs` | `eframe::run_native`, window setup. |
-| `app.rs` | Shell: title bar, left panel, status bar, center split (editor + terminal + quote rail), global shortcuts (Ctrl+Tab terminal, Ctrl+B explorer), Run-button wiring (`editor.want_run` -> `terminal.send_line("cargo run")`). Editor renders before terminal every frame — terminal reads input events after the editor. |
+| `fonts.rs` | Vendors Space Grotesk (three static weights under `assets/fonts/`) and registers it as the *proportional* family, with egui's built-ins kept as fallbacks. Monospace is deliberately untouched — the gutter and the terminal grid depend on a fixed advance width. `MEDIUM`/`BOLD` are exposed as named families because `RichText::strong()` only swaps colour in egui, never the face. |
+| `app.rs` | Shell: title bar, left panel, status bar, center split (editor + terminal), global shortcuts (Ctrl+Tab terminal, Ctrl+B explorer), Run-button wiring (`editor.want_run` -> `terminal.send_line("cargo run")`). Owns `show_explorer` (the status-bar sidebar toggle). Editor renders before terminal every frame — terminal reads input events after the editor. |
 | `editor.rs` | Tabs (`OpenBuffer`), keyword-fallback highlighter, find (Ctrl+F), gutter, cursor readout (`cursor_line/col`), `want_run` flag. `ui(&mut self, ui, workdir)` — workdir seeds the `+` file picker. |
 | `file_tree.rs` | Explorer tree (depth cap 8, skips `target/.git/node_modules/.idea`, 2000-entry cap), create/rename/delete + confirm modal, `notify` watcher with 300ms debounce, `opened_file` handoff to the editor. |
-| `terminal.rs` | ConPTY `powershell.exe -NoLogo -NoProfile`, reader thread -> mpsc -> `vt100::Parser`, DSR/CPR/DA query responder, input forwarding, collapse/fullscreen/hide + drag height. |
+| `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback and query-responder buffer. Tab strip spawns/switches/closes shells; `collapsed`/`fullscreen`/`hidden` + drag height. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
-| `theme.rs` | Calm dark-green palette, `file_badge()` (letter + colors per extension). |
+| `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
 
 ## Terminal input — read this before touching it
 
@@ -65,6 +66,34 @@ Current design (do not regress):
   `Event::Text` is suppressed for Ctrl combos by egui-winit, so no doubling.
 - `send_line()` is the entry point for scripted input (Run button).
 
+## Terminal tabs (multi-session)
+
+`Terminal` is a container; every shell is a `Session` holding its own pty,
+reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
+
+- **`poll()` drains every session, not just the visible one.** A background
+  shell still answers prompts and still writes to its pty; leaving its channel
+  unread grows it without bound. This is verified live: `ping -n 8` started in
+  one tab, switched away from, then revisited, shows all eight replies.
+- **The last tab cannot be closed** (`close_tab` refuses at `len() <= 1`). An
+  empty terminal panel would need its own empty state, and the whole input
+  design assumes there is a shell to talk to. Restarting a wedged shell is what
+  the refresh button is for.
+- **`close_tab` clamps `active_tab`** rather than recomputing it, so closing a
+  tab *before* the active one keeps the same shell selected. Guarded by test
+  `closing_an_earlier_tab_keeps_the_same_shell_selected`.
+- **Tab labels count shells ever spawned, not tabs open** (`shell_title(n)`,
+  numbering from 2 so a lone tab never reads "powershell 1"). Reusing a number
+  would put two identical labels on screen at once. Guarded by test
+  `tab_numbers_are_not_reused`.
+- **The tab strip is a bounded `ScrollArea`** (`max_width` less
+  `TERM_HDR_RIGHT_W`), because it shares its line with the right-hand controls:
+  an unbounded scroll area claims the whole line and pushes them off it.
+- **Mutations are deferred.** The strip's closure cannot hold `&mut self` while
+  iterating `self.sessions`, so clicks record `switch_to` / `close_tab` /
+  `open_tab` locals that are applied after the closure returns.
+- `new_tab` clears `collapsed` — a new shell you cannot see is not a new shell.
+
 ## Editor gotchas
 
 - **The fallback highlighter MUST stay char-boundary safe.** Byte-wise
@@ -92,16 +121,44 @@ Current design (do not regress):
   clears if that id holds focus; default `SurrenderFocusOn::Clicks`.
 - `pointer.any_click()` for click-vs-keyboard disambiguation.
 - `Response::on_hover_cursor(CursorIcon::ResizeVertical)` for splitters.
+- **`Ui::horizontal` inherits the parent's direction.**
+  `horizontal_with_main_wrap_dyn` reads `self.placer.prefer_right_to_left()`,
+  so a `horizontal` nested inside a `right_to_left` row is *also* right-to-left
+  and draws its children in reverse. To force left-to-right inside a
+  right-to-left row, use `ui.with_layout(Layout::left_to_right(Align::Center), ..)`.
+  This silently reordered the explorer header and squeezed its folder glyph to
+  nothing at narrow widths.
+- `Layout::advance_cursor` does `RightToLeft => region.cursor.max.x -= amount`,
+  so `ui.add_space(n)` moves the cursor *left* in a right-to-left layout.
+- `Label::truncate()` sets `TextWrapMode::Truncate`; without it an over-long
+  label overflows its slot instead of shrinking to fit.
+- `RichText::strong()` only swaps the colour for `strong_text_color()` — it
+  does not change the face. Real weight needs a named `FontFamily`.
+- `Frame::side_top_panel(style)` is `inner_margin(Margin::symmetric(8, 2))`
+  plus `panel_fill`, so an absolute inset is measured from the panel's
+  *content* edge, not the window edge. `Panel::frame(..)` replaces it entirely.
 
 ## Tests
 
-- `cargo test` must stay green: editor roundtrip, find, unicode highlight,
-  key mapping, query responder, file listing, both focus-mechanism tests,
+- `cargo test` must stay green (21 tests): editor roundtrip, find, unicode
+  highlight, key mapping, query responder, file listing, both focus-mechanism
+  tests, the four terminal-tab tests (`tabs_spawn_switch_and_refuse_to_empty_the_panel`,
+  `closing_an_earlier_tab_keeps_the_same_shell_selected`, `tab_numbers_are_not_reused`),
   and `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
+- Tab bookkeeping is tested through `Terminal::open_stub_tab` (a `#[cfg(test)]`
+  twin of `new_tab` minus the pty) so the tests stay hermetic. It shares
+  `shell_title` with the real path, so a numbering change cannot pass the
+  tests while breaking the app.
 - GUI behavior itself (clicks, drags, pixels) cannot be verified headlessly:
   after UI changes, rebuild, relaunch, and have a human confirm with a
   screenshot. Never claim a visual fix works without that.
+- `.workbuddy-ai/tools/snor_ui_probe.py` drives the real window through
+  user32: `info`, `shot`, `click`, `move`, `drag`, `place`, `maximize`, `type`,
+  `key`. Coordinates are egui points relative to the client area.
+  `.workbuddy-ai/tools/tab_bbox.py` reports the tab strip's ink bounding boxes
+  in points, which is how click targets are aimed instead of guessed — a click
+  that misses by a few points reads as "the feature is broken".
 
 ## Conventions
 
