@@ -4,7 +4,83 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use eframe::egui;
+
+use crate::icons;
+use crate::theme;
+
 const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", ".idea"];
+
+/// Height of one tree row. The reference's rows are noticeably taller than
+/// egui's default label height, which is what makes the glyphs breathe.
+const ROW_H: f32 = 20.0;
+/// Left padding before the first glyph column.
+const PAD: f32 = 6.0;
+/// Horizontal offset per tree level.
+///
+/// Must exceed [`CHEVRON_COL`]: a file's badge starts one chevron-column in, so
+/// a child would otherwise land *left* of its parent's glyph.
+const INDENT: f32 = 15.0;
+/// Width of the disclosure-chevron column that folders get and files skip, so
+/// that a folder's glyph and a sibling file's glyph line up.
+const CHEVRON_COL: f32 = 13.0;
+/// Width of the file/folder glyph column.
+const GLYPH_COL: f32 = 21.0;
+
+// --- Footer geometry ---------------------------------------------------
+//
+// Expressed as fractions of the explorer's width, measured off the reference
+// mock, so the block keeps the same proportions whether the panel is at its
+// 260pt default or dragged out to 520. In the reference the mascot's ink is
+// inset 50/332 of the panel and spans 124/332 of it, the caption shares the
+// mascot's left edge, and the caption's baseline sits 20/332 above the
+// status bar.
+//
+// The fractions were then calibrated against a screenshot of this app: the
+// reference is a raster mock, so its figures are ink extents, while ours are
+// layout boxes, and the two differ by the mascot's empty bottom band and the
+// caption font's descender space.
+/// Left inset of both the mascot and its caption.
+const FOOTER_PAD: f32 = 0.150;
+/// Width of the mascot block (the glyph fills it edge to edge).
+const FOOTER_MASCOT: f32 = 0.400;
+/// Gap below the caption, before the status bar. Larger than the reference's
+/// 6% because it is measured from the caption's *row* bottom rather than its
+/// ink, and the row carries the font's descender space.
+const FOOTER_BOTTOM_GAP: f32 = 0.094;
+/// Caption text size in points. Deliberately fixed rather than proportional:
+/// scaling it with the panel would look shouty, and at the default width this
+/// reproduces the reference's caption width almost exactly.
+const FOOTER_CAPTION_SIZE: f32 = 11.0;
+
+/// Height the footer will claim at the bottom of the panel.
+///
+/// The caller needs this *before* the footer is laid out, because the
+/// scrolling tree above it is sized against the remaining space and the
+/// footer is pinned to the bottom. The caption's row height comes from the
+/// live font metrics rather than a guessed multiplier, so the reservation
+/// stays exact if the font ever changes.
+fn footer_height(ui: &egui::Ui, panel_w: f32) -> f32 {
+    let caption = ui
+        .ctx()
+        .fonts_mut(|f| f.row_height(&egui::FontId::proportional(FOOTER_CAPTION_SIZE)));
+    FOOTER_BOTTOM_GAP * panel_w + caption + crate::mascot::height_for(FOOTER_MASCOT * panel_w)
+}
+
+/// Left edge of a node's chevron slot, relative to the row's left edge.
+/// Folders only; files skip this column.
+fn chevron_left(depth: usize) -> f32 {
+    PAD + depth as f32 * INDENT
+}
+
+/// Left edge of a node's glyph slot, relative to the row's left edge.
+///
+/// Every node — folder or file — puts its glyph one chevron-column in, so a
+/// folder and a sibling file line up, and each level indents past the level
+/// above it.
+fn glyph_left(depth: usize) -> f32 {
+    chevron_left(depth) + CHEVRON_COL
+}
 
 fn should_skip(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
@@ -85,6 +161,11 @@ pub struct FileTree {
     rename_target: Option<PathBuf>,
     rename_buf: String,
     delete_target: Option<PathBuf>,
+    /// Set by the header's "open folder" button. The shell polls this with
+    /// [`FileTree::take_open_request`] rather than the tree opening the picker
+    /// itself, because switching roots also re-seeds the editor and terminal
+    /// working directory, which the tree does not own.
+    open_requested: bool,
     pub error: Option<String>,
     pub opened_file: Option<PathBuf>,
 }
@@ -125,14 +206,32 @@ impl FileTree {
             rename_target: None,
             rename_buf: String::new(),
             delete_target: None,
+            open_requested: false,
             error: None,
             opened_file: None,
         }
     }
-}
 
-impl FileTree {
-    pub fn set_root(&mut self, root: PathBuf) {        if let Some(w) = self._watcher.as_mut() {
+    /// Take a pending "open folder" click, clearing the flag.
+    pub fn take_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.open_requested)
+    }
+
+    /// Whether `path` is currently shown expanded. Only meaningful for folders.
+    pub fn is_expanded(&self, path: &Path) -> bool {
+        self.expanded.contains(path)
+    }
+
+    /// Flip a folder open/closed. Split out of the click handler so the
+    /// behaviour is testable without a live `Ui`.
+    pub fn toggle_expanded(&mut self, path: &Path) {
+        if !self.expanded.remove(path) {
+            self.expanded.insert(path.to_path_buf());
+        }
+    }
+
+    pub fn set_root(&mut self, root: PathBuf) {
+        if let Some(w) = self._watcher.as_mut() {
             let _ = w.unwatch(&self.root);
             let _ = w.watch(&root, RecursiveMode::Recursive);
         }
@@ -283,112 +382,135 @@ impl FileTree {
         }
     }
 
-    fn render_nodes(&mut self, ui: &mut eframe::egui::Ui, nodes: Vec<FileNode>) {
+    fn render_nodes(&mut self, ui: &mut egui::Ui, nodes: Vec<FileNode>, depth: usize) {
         for node in nodes {
-            if node.is_dir {
-                let is_open = self.expanded.contains(&node.path);
-                let header = eframe::egui::CollapsingHeader::new(&node.name)
-                    .id_salt(node.path.display().to_string())
-                    .open(Some(is_open));
-                let mut toggle: Option<bool> = None;
-                let mut clicked_select = false;
-                let resp = header.show(ui, |ui| {
-                    let kids = node.children.clone();
-                    self.render_nodes(ui, kids);
-                });
-                if resp.header_response.clicked() {
-                    clicked_select = true;
+            let base = ui.cursor().left();
+            let row_w = ui.available_width().max(80.0);
+            let (row, resp) =
+                ui.allocate_exact_size(egui::vec2(row_w, ROW_H), egui::Sense::click());
+
+            let is_open = node.is_dir && self.is_expanded(&node.path);
+            let selected = self.selected.as_ref() == Some(&node.path);
+
+            if ui.is_rect_visible(row) {
+                let painter = ui.painter_at(row);
+                if selected {
+                    painter.rect_filled(row, 5.0, theme::tab_active());
+                } else if resp.hovered() {
+                    painter.rect_filled(row, 5.0, egui::Color32::from_rgb(0x19, 0x21, 0x1F));
                 }
-                // Detect open-state change by comparing after show
-                if resp.openness > 0.5 && !is_open {
-                    toggle = Some(true);
-                } else if resp.openness < 0.5 && is_open {
-                    toggle = Some(false);
+                // Selected rows get the accent; everything else stays in the
+                // muted outline grey, as in the reference.
+                let glyph = if selected {
+                    theme::accent()
+                } else {
+                    theme::outline()
+                };
+                if node.is_dir {
+                    icons::chevron(
+                        &painter,
+                        egui::Rect::from_center_size(
+                            egui::pos2(base + chevron_left(depth) + CHEVRON_COL * 0.5, row.center().y),
+                            egui::vec2(12.0, 12.0),
+                        ),
+                        if is_open { 1.0 } else { 0.0 },
+                        glyph,
+                    );
                 }
-                if let Some(open) = toggle {
-                    if open {
-                        self.expanded.insert(node.path.clone());
-                    } else {
-                        self.expanded.remove(&node.path);
+                let slot = egui::Rect::from_min_size(
+                    egui::pos2(base + glyph_left(depth), row.center().y - 7.0),
+                    egui::vec2(14.0, 14.0),
+                );
+                if node.is_dir {
+                    icons::folder(&painter, slot, glyph);
+                } else {
+                    match theme::file_letter(&node.name) {
+                        Some(letter) => icons::badge_outlined(&painter, slot, letter, glyph),
+                        None => icons::doc(&painter, slot, glyph),
                     }
                 }
-                if clicked_select {
-                    self.selected = Some(node.path.clone());
+                let text_x = base + glyph_left(depth) + GLYPH_COL;
+                let font = egui::FontId::proportional(12.5);
+                let label =
+                    icons::truncate(&painter, &node.name, font.clone(), (row.right() - text_x).max(8.0));
+                painter.text(
+                    egui::pos2(text_x, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    font,
+                    if selected {
+                        theme::text()
+                    } else {
+                        theme::dim_text()
+                    },
+                );
+            }
+
+            if resp.clicked() {
+                self.selected = Some(node.path.clone());
+                if node.is_dir {
+                    self.toggle_expanded(&node.path);
+                } else {
+                    self.opened_file = Some(node.path.clone());
                 }
-                resp.header_response.context_menu(|ui| {
+            }
+            let menu_path = node.path.clone();
+            let is_dir = node.is_dir;
+            resp.context_menu(|ui| {
+                if is_dir {
                     if ui.button("new file here").clicked() {
-                        self.begin_create(node.path.clone(), CreateMode::File);
+                        self.begin_create(menu_path.clone(), CreateMode::File);
                         ui.close();
                     }
                     if ui.button("new folder here").clicked() {
-                        self.begin_create(node.path.clone(), CreateMode::Dir);
+                        self.begin_create(menu_path.clone(), CreateMode::Dir);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("rename").clicked() {
-                        self.begin_rename(node.path.clone());
-                        ui.close();
-                    }
-                    if ui.button("delete").clicked() {
-                        self.delete_target = Some(node.path.clone());
-                        self.error = None;
-                        ui.close();
-                    }
-                });
-            } else {
-                let selected = self.selected.as_ref() == Some(&node.path);
-                // Badge pill + name row, like the reference explorer.
-                let pill = if selected {
-                    crate::theme::tab_active()
-                } else {
-                    eframe::egui::Color32::TRANSPARENT
-                };
-                eframe::egui::Frame::NONE
-                    .fill(pill)
-                    .corner_radius(6.0)
-                    .inner_margin(eframe::egui::Margin::symmetric(4, 1))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (letter, bg, fg) = crate::theme::file_badge(&node.name);
-                            eframe::egui::Frame::NONE
-                                .fill(bg)
-                                .corner_radius(4.0)
-                                .inner_margin(eframe::egui::Margin::symmetric(5, 1))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        eframe::egui::RichText::new(letter)
-                                            .small()
-                                            .strong()
-                                            .color(fg),
-                                    );
-                                });
-                            let resp = ui.selectable_label(selected, &node.name);
-                            if resp.clicked() {
-                                self.selected = Some(node.path.clone());
-                                self.opened_file = Some(node.path.clone());
-                            }
-                            resp.context_menu(|ui| {
-                                if ui.button("rename").clicked() {
-                                    self.begin_rename(node.path.clone());
-                                    ui.close();
-                                }
-                                if ui.button("delete").clicked() {
-                                    self.delete_target = Some(node.path.clone());
-                                    self.error = None;
-                                    ui.close();
-                                }
-                            });
-                        });
-                    });
+                }
+                if ui.button("rename").clicked() {
+                    self.begin_rename(menu_path.clone());
+                    ui.close();
+                }
+                if ui.button("delete").clicked() {
+                    self.delete_target = Some(menu_path.clone());
+                    self.error = None;
+                    ui.close();
+                }
+            });
+
+            if is_open {
+                let kids = node.children.clone();
+                let top = ui.cursor().top();
+                self.render_nodes(ui, kids, depth + 1);
+                let bottom = ui.cursor().top();
+                // Elbow guide running down the children, as in the reference.
+                ui.painter().vline(
+                    base + chevron_left(depth) + CHEVRON_COL * 0.5,
+                    egui::Rangef::new(top, bottom),
+                    egui::Stroke::new(1.0, theme::hairline()),
+                );
             }
         }
     }
 
-    pub fn ui(&mut self, ui: &mut eframe::egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.poll_watcher();
 
         ui.horizontal(|ui| {
-            let head = ui.heading("Explorer");
+            let (slot, _) = ui.allocate_exact_size(egui::vec2(16.0, 18.0), egui::Sense::hover());
+            if ui.is_rect_visible(slot) {
+                icons::folder(
+                    &ui.painter_at(slot),
+                    egui::Rect::from_center_size(slot.center(), egui::vec2(15.0, 14.0)),
+                    theme::text(),
+                );
+            }
+            let head = ui.label(
+                egui::RichText::new("Explorer")
+                    .size(13.0)
+                    .color(theme::text()),
+            );
             head.context_menu(|ui| {
                 if ui.button("new file here").clicked() {
                     self.begin_create(self.root.clone(), CreateMode::File);
@@ -399,21 +521,20 @@ impl FileTree {
                     ui.close();
                 }
             });
-            ui.with_layout(
-                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
-                |ui| {
-                    if ui
-                        .small_button("↻")
-                        .on_hover_text("refresh")
-                        .clicked()
-                    {
-                        self.refresh();
-                    }
-                    if ui.small_button("+").on_hover_text("new file").clicked() {
-                        self.begin_create_at_root(false);
-                    }
-                },
-            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-to-left, so this reads "open folder | rescan | new file"
+                // across the header: the action that swaps the whole tree sits
+                // furthest from the edge, away from the frequent ones.
+                if icons::icon_button(ui, 20.0, "new file", icons::plus).clicked() {
+                    self.begin_create_at_root(false);
+                }
+                if icons::icon_button(ui, 20.0, "rescan", icons::refresh).clicked() {
+                    self.refresh();
+                }
+                if icons::icon_button(ui, 20.0, "open folder", icons::folder_open).clicked() {
+                    self.open_requested = true;
+                }
+            });
         });
 
         if let Some(mode) = &self.create_mode {
@@ -429,7 +550,7 @@ impl FileTree {
             ));
             ui.horizontal(|ui| {
                 let resp = ui.text_edit_singleline(&mut self.create_name);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.do_create();
                 }
                 if ui.small_button("create").clicked() {
@@ -446,7 +567,7 @@ impl FileTree {
             ui.label("rename to:");
             ui.horizontal(|ui| {
                 let resp = ui.text_edit_singleline(&mut self.rename_buf);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.do_rename();
                 }
                 if ui.small_button("apply").clicked() {
@@ -459,14 +580,15 @@ impl FileTree {
         }
 
         if let Some(err) = &self.error {
-            ui.colored_label(eframe::egui::Color32::from_rgb(0xE0, 0x6C, 0x75), err);
+            ui.colored_label(theme::danger(), err);
         }
 
         ui.separator();
-        // Reserve the footer so it stays pinned at the bottom.
-        let footer_h = 52.0;
-        let tree_h = (ui.available_height() - footer_h).max(60.0);
-        eframe::egui::ScrollArea::vertical()
+        // The footer is pinned to the bottom of the panel, so reserve its
+        // height before sizing the scrolling tree above it.
+        let panel_w = ui.available_width();
+        let tree_h = (ui.available_height() - footer_height(ui, panel_w)).max(60.0);
+        egui::ScrollArea::vertical()
             .id_salt("snor_tree_scroll")
             .max_height(tree_h)
             .auto_shrink([false, false])
@@ -474,35 +596,41 @@ impl FileTree {
                 let nodes = self.nodes.clone();
                 if nodes.is_empty() {
                     ui.label(
-                        eframe::egui::RichText::new(
-                            "empty folder — right-click Explorer for options",
-                        )
-                        .color(crate::theme::dim_text()),
+                        egui::RichText::new("empty folder — right-click Explorer for options")
+                            .color(theme::dim_text()),
                     );
                 } else {
-                    self.render_nodes(ui, nodes);
+                    self.render_nodes(ui, nodes, 0);
                 }
             });
 
-        // Calm footer borrowed from the reference.
-        ui.separator();
-        ui.vertical_centered(|ui| {
+        // Footer, matched to the reference: left-aligned rather than centred,
+        // sized as a fraction of the panel, caption under the mascot, and a
+        // gap before the status bar. No rule above it — in the reference the
+        // only lines down here are the status bar's own top edge.
+        //
+        // There is no space added between the mascot and the caption: the
+        // mascot's blobs stop short of the bottom of the block they are given,
+        // and that empty band *is* the gap the reference shows between the
+        // feet and the text. Adding more on top of it doubled the gap.
+        ui.horizontal(|ui| {
+            ui.add_space(FOOTER_PAD * panel_w);
+            crate::mascot::snorlax(ui, FOOTER_MASCOT * panel_w)
+                .on_hover_text("Rest. Then build again.");
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(FOOTER_PAD * panel_w);
             ui.label(
-                eframe::egui::RichText::new("z   Z")
-                    .small()
-                    .color(crate::theme::faint()),
-            );
-            ui.label(
-                eframe::egui::RichText::new("Rest. Then build again.")
-                    .small()
-                    .italics()
-                    .color(crate::theme::dim_text()),
+                egui::RichText::new("Rest. Then build again.")
+                    .size(FOOTER_CAPTION_SIZE)
+                    .color(theme::moss()),
             );
         });
+        ui.add_space(FOOTER_BOTTOM_GAP * panel_w);
 
         // Delete confirm modal
         if let Some(target) = self.delete_target.clone() {
-            eframe::egui::Window::new("confirm delete")
+            egui::Window::new("confirm delete")
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
@@ -524,6 +652,28 @@ impl FileTree {
 mod tests {
     use super::*;
 
+    /// Regression: files used to skip the chevron column in the wrong place, so
+    /// a child row's badge landed *left* of its parent's folder glyph.
+    #[test]
+    fn child_rows_indent_past_their_parents_glyph() {
+        for d in 0..6 {
+            assert!(
+                chevron_left(d) + CHEVRON_COL <= glyph_left(d),
+                "level {d}: chevron overlaps its own glyph"
+            );
+            assert!(
+                glyph_left(d + 1) > glyph_left(d),
+                "level {} does not indent past level {d}",
+                d + 1
+            );
+            assert!(
+                chevron_left(d + 1) > chevron_left(d),
+                "level {} chevron does not indent",
+                d + 1
+            );
+        }
+    }
+
     #[test]
     fn lists_project_root() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -535,5 +685,27 @@ mod tests {
         assert!(!names.contains(&".git"), "names: {names:?}");
         let src = nodes.iter().find(|n| n.name == "src").unwrap();
         assert!(src.is_dir && !src.children.is_empty());
+    }
+
+    /// Regression: the tree used to drive `CollapsingHeader::open(Some(..))`
+    /// every frame, which takes egui's click-to-toggle branch out of the
+    /// picture (`if let Some(open) = open { .. } else if clicked`), so no
+    /// folder could ever be expanded.
+    #[test]
+    fn folders_toggle_open_and_closed() {
+        let dir = std::env::temp_dir().join("snor_tree_toggle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner").join("a.txt"), "x").unwrap();
+
+        let mut tree = FileTree::new(dir.clone());
+        let inner = dir.join("inner");
+        assert!(!tree.is_expanded(&inner));
+        tree.toggle_expanded(&inner);
+        assert!(tree.is_expanded(&inner), "folder did not open");
+        tree.toggle_expanded(&inner);
+        assert!(!tree.is_expanded(&inner), "folder did not close");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

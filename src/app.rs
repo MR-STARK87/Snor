@@ -3,70 +3,89 @@ use std::path::PathBuf;
 
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
+use crate::icons;
 use crate::terminal::Terminal;
+use crate::theme;
+
+/// Height of the editor/terminal divider's grab band.
+const SPLIT_GRAB: f32 = 7.0;
+/// Neither pane may be squeezed below these, so the split can't be dragged
+/// into a state the user can't drag back out of.
+const EDITOR_MIN_H: f32 = 140.0;
+const TERM_MIN_H: f32 = 120.0;
+/// Height of the terminal when collapsed down to its header strip.
+const TERM_COLLAPSED_H: f32 = 34.0;
+
+const TREE_DEFAULT_W: f32 = 260.0;
+const TREE_MIN_W: f32 = 180.0;
+const TREE_MAX_W: f32 = 520.0;
+/// Half-width of the explorer's resize grip.
+const TREE_GRAB: f32 = 5.0;
 
 pub struct SnorApp {
-    root: PathBuf,
     tree: FileTree,
     editor: Editor,
     terminal: Terminal,
     show_explorer: bool,
+    /// Explorer width, driven by our own grip rather than egui's built-in
+    /// panel resize. See [`SnorApp::tree_grip`] for why.
+    tree_w: f32,
 }
 
 impl SnorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply_dark(&cc.egui_ctx);
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let tree = FileTree::new(root.clone());
+        let tree = FileTree::new(root);
         Self {
-            root,
             tree,
             editor: Editor::new(),
             terminal: Terminal::new(),
             show_explorer: true,
+            tree_w: TREE_DEFAULT_W,
         }
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("snor_top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui
-                    .small_button("≡")
-                    .on_hover_text("toggle explorer (Ctrl+B)")
-                    .clicked()
+                if icons::icon_button(ui, 22.0, "toggle explorer (Ctrl+B)", icons::folder).clicked()
                 {
                     self.show_explorer = !self.show_explorer;
                 }
                 ui.label(
                     egui::RichText::new("Snor")
-                        .color(crate::theme::accent())
-                        .strong(),
+                        .size(13.5)
+                        .strong()
+                        .color(theme::accent()),
                 );
+                // The reference separates the product name from its tagline
+                // with a raised dot, not a plus.
+                ui.label(egui::RichText::new("\u{2022}").size(12.0).color(theme::faint()));
                 ui.label(
                     egui::RichText::new("Calm tools for focused minds.")
-                        .color(crate::theme::dim_text())
-                        .small(),
+                        .size(12.0)
+                        .color(theme::tagline()),
                 );
                 ui.label(
-                    egui::RichText::new(self.root.display().to_string())
-                        .color(crate::theme::faint())
-                        .small(),
+                    egui::RichText::new(self.tree.root.display().to_string())
+                        .size(11.5)
+                        .color(theme::faint()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("open folder").clicked()
-                        && let Some(dir) = rfd::FileDialog::new()
-                            .set_directory(&self.root)
-                            .pick_folder()
-                    {
-                        self.root = dir.clone();
-                        self.tree.set_root(dir);
-                    }
+                    // Right-to-left: the label goes in first so the leaf ends
+                    // up on its *left*, matching the reference's leaf-then-text
+                    // reading order.
                     ui.label(
                         egui::RichText::new("Stay consistent.")
-                            .color(crate::theme::dim_text())
-                            .small()
-                            .italics(),
+                            .size(12.0)
+                            .color(theme::dim_text()),
                     );
+                    let (slot, _) =
+                        ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                    if ui.is_rect_visible(slot) {
+                        icons::leaf(&ui.painter_at(slot), slot, theme::accent());
+                    }
                 });
             });
         });
@@ -75,16 +94,38 @@ impl SnorApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("snor_status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("main").small().color(crate::theme::dim_text()));
+                let (branch, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                if ui.is_rect_visible(branch) {
+                    icons::branch(&ui.painter_at(branch), branch, theme::dim_text());
+                }
                 ui.label(
-                    egui::RichText::new("●")
-                        .small()
-                        .color(crate::theme::accent()),
+                    egui::RichText::new("main")
+                        .size(12.0)
+                        .color(theme::dim_text()),
                 );
+                // Sync indicator: a filled accent dot with a knocked-out centre.
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                if ui.is_rect_visible(dot) {
+                    let p = ui.painter_at(dot);
+                    p.circle_filled(dot.center(), 4.6, theme::accent());
+                    p.circle_filled(dot.center(), 1.6, theme::on_accent());
+                }
                 ui.label(
-                    egui::RichText::new("0 / 0")
-                        .small()
-                        .color(crate::theme::dim_text()),
+                    egui::RichText::new("0")
+                        .size(12.0)
+                        .color(theme::dim_text()),
+                );
+                let (tri, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                if ui.is_rect_visible(tri) {
+                    icons::triangle_outline(&ui.painter_at(tri), tri, theme::dim_text());
+                }
+                ui.label(
+                    egui::RichText::new("0")
+                        .size(12.0)
+                        .color(theme::dim_text()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for item in [
@@ -94,7 +135,7 @@ impl SnorApp {
                         "Spaces: 4".to_string(),
                         format!("Ln {}, Col {}", self.editor.cursor_line, self.editor.cursor_col),
                     ] {
-                        ui.label(egui::RichText::new(item).small().color(crate::theme::dim_text()));
+                        ui.label(egui::RichText::new(item).size(12.0).color(theme::dim_text()));
                     }
                     if ui
                         .small_button(if self.terminal.hidden {
@@ -113,24 +154,171 @@ impl SnorApp {
     }
 
     fn quote_rail(ui: &mut egui::Ui) {
+        let h = ui.available_height();
         ui.vertical(|ui| {
-            ui.add_space(60.0);
+            ui.add_space(h * 0.34);
             ui.label(
                 egui::RichText::new("Good software takes time, but it makes time for you.")
-                    .small()
+                    .size(13.0)
                     .italics()
-                    .color(crate::theme::faint()),
+                    .color(theme::faint()),
             );
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(60.0);
+                ui.add_space(14.0);
                 ui.label(
                     egui::RichText::new("Small steps build big things.")
-                        .small()
+                        .size(12.5)
                         .italics()
-                        .color(crate::theme::faint()),
+                        .color(theme::faint()),
                 );
             });
         });
+    }
+
+    /// Editor + terminal column, split at an explicit divider.
+    ///
+    /// The panes are laid out against rects computed up front rather than by
+    /// asking the parent `Ui` to reserve space for them. `Ui::scope` advances
+    /// the parent cursor to the child's *content* rect, not the size that was
+    /// requested, so a short editor used to collapse the column and leave the
+    /// divider stranded at the top — dragging it changed the terminal height
+    /// while the divider itself never moved.
+    fn workspace(&mut self, ui: &mut egui::Ui) {
+        let mut split: Option<(egui::Rect, f32)> = None;
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            let full = ui.available_rect_before_wrap();
+            // The reference keeps the quote rail visible on an ordinary
+            // maximised window; only drop it when the editor would be cramped.
+            let rail_w = if full.width() > 860.0 { 150.0 } else { 0.0 };
+            let main_w = (full.width() - rail_w - 8.0).max(50.0);
+            let column = egui::Rect::from_min_size(full.min, egui::vec2(main_w, full.height()));
+
+            let show_term = !self.terminal.hidden;
+            let full_scr = show_term && self.terminal.fullscreen;
+            let collapsed = show_term && self.terminal.collapsed;
+            let max_term = (column.height() - EDITOR_MIN_H - SPLIT_GRAB).max(TERM_MIN_H);
+
+            let term_h = if collapsed {
+                TERM_COLLAPSED_H
+            } else {
+                self.terminal.term_h.clamp(TERM_MIN_H, max_term)
+            };
+            let term_rect = egui::Rect::from_min_max(
+                egui::pos2(column.left(), column.bottom() - term_h),
+                column.max,
+            );
+            let editor_rect = if show_term {
+                egui::Rect::from_min_max(
+                    column.min,
+                    egui::pos2(column.right(), term_rect.top() - SPLIT_GRAB),
+                )
+            } else {
+                column
+            };
+            if show_term && !full_scr {
+                split = Some((
+                    egui::Rect::from_min_max(
+                        egui::pos2(column.left(), term_rect.top() - SPLIT_GRAB),
+                        egui::pos2(column.right(), term_rect.top()),
+                    ),
+                    max_term,
+                ));
+            }
+
+            let top_down = egui::Layout::top_down(egui::Align::LEFT);
+            if !full_scr {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(editor_rect).layout(top_down),
+                    |ui| self.editor.ui(ui, &self.tree.root),
+                );
+            }
+            if show_term {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(term_rect).layout(top_down),
+                    |ui| self.terminal.ui(ui, &self.tree.root),
+                );
+            }
+            if rail_w > 0.0 {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(full.right() - rail_w, full.top()),
+                            egui::vec2(rail_w, full.height()),
+                        ))
+                        .layout(top_down),
+                    Self::quote_rail,
+                );
+            }
+        });
+
+        // Registered after both panes on purpose: egui resolves a press to the
+        // most recently registered widget under the pointer, so a divider
+        // registered with the editor would lose its outer half to the editor's
+        // scroll area.
+        if let Some((rect, max_term)) = split {
+            let resp = ui.interact(rect, egui::Id::new("snor_split"), egui::Sense::drag());
+            if resp.dragged() {
+                self.terminal.term_h =
+                    (self.terminal.term_h - resp.drag_delta().y).clamp(TERM_MIN_H, max_term);
+            }
+            let (color, width) = if resp.dragged() {
+                (theme::accent(), 2.0)
+            } else if resp.hovered() {
+                (theme::text(), 2.0)
+            } else {
+                (theme::hairline(), 1.0)
+            };
+            ui.painter().hline(
+                rect.x_range(),
+                rect.center().y,
+                egui::Stroke::new(width, color),
+            );
+            if resp.hovered() || resp.dragged() {
+                // Dotted grip: the idle hairline is deliberately faint, so the
+                // hover state has to say "this is draggable" out loud.
+                let c = rect.center();
+                for i in -1..=1 {
+                    ui.painter()
+                        .circle_filled(egui::pos2(c.x + i as f32 * 8.0, c.y), 1.7, theme::accent());
+                }
+            }
+            resp.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        }
+    }
+
+    /// Explorer resize grip.
+    ///
+    /// egui's own panel resize handle is a `resize_grab_radius_side`-wide band
+    /// centred on the panel edge, so half of it lies over the editor and is
+    /// claimed by whatever the central panel registers later. Grabbing just
+    /// past the edge therefore did nothing. Registering our own grip *after*
+    /// every other widget, and driving the width ourselves via
+    /// `Panel::exact_size`, gives the whole band to the grip.
+    fn tree_grip(&mut self, ui: &mut egui::Ui, panel: egui::Rect) {
+        let edge = panel.max.x;
+        let grip = egui::Rect::from_min_max(
+            egui::pos2(edge - TREE_GRAB, panel.top()),
+            egui::pos2(edge + TREE_GRAB, panel.bottom()),
+        );
+        let resp = ui.interact(grip, egui::Id::new("snor_tree_grip"), egui::Sense::drag());
+        if resp.dragged() {
+            let max_w = (ui.available_width() - 400.0).clamp(TREE_MIN_W, TREE_MAX_W);
+            self.tree_w = (self.tree_w + resp.drag_delta().x).clamp(TREE_MIN_W, max_w);
+        }
+        if resp.hovered() || resp.dragged() {
+            ui.painter().vline(
+                edge,
+                panel.y_range(),
+                egui::Stroke::new(2.0, theme::accent()),
+            );
+            let c = egui::pos2(edge, panel.center().y);
+            for i in -1..=1 {
+                ui.painter()
+                    .circle_filled(egui::pos2(c.x, c.y + i as f32 * 8.0), 1.7, theme::accent());
+            }
+        }
+        resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
     }
 }
 
@@ -166,111 +354,38 @@ impl eframe::App for SnorApp {
         }
 
         self.title_bar(ui);
+        // Shown before the explorer on purpose: in the reference the panel
+        // divider stops at the status bar and the bar runs the full window
+        // width. Reversing these two puts the bar back on the right of the
+        // explorer, which is what the divider crossing it would look like.
+        self.status_bar(ui);
 
+        if self.tree.take_open_request()
+            && let Some(dir) = rfd::FileDialog::new()
+                .set_directory(&self.tree.root)
+                .pick_folder()
+        {
+            self.tree.set_root(dir);
+        }
+
+        let mut panel_rect = None;
         if self.show_explorer {
-            egui::Panel::left("snor_tree")
-                .default_size(260.0)
-                .min_size(200.0)
-                .resizable(true)
+            let panel = egui::Panel::left("snor_tree")
+                .exact_size(self.tree_w)
+                .resizable(false)
                 .show(ui, |ui| {
                     self.tree.ui(ui);
                 });
+            panel_rect = Some(panel.response.rect);
         }
 
-        self.status_bar(ui);
+        self.workspace(ui);
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                let rail_w = if ui.available_width() > 1020.0 {
-                    150.0
-                } else {
-                    0.0
-                };
-                let main_w = (ui.available_width() - rail_w - 8.0).max(50.0);
-                let main_h = ui.available_height().max(50.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(main_w, main_h),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.vertical(|ui| {
-                            let avail_w = ui.available_width().max(50.0);
-                            let avail_h = ui.available_height().max(50.0);
-                            let show_term = !self.terminal.hidden;
-                            let full = show_term && self.terminal.fullscreen;
-                            let resizable =
-                                show_term && !full && !self.terminal.collapsed;
-                            let term_h = if !show_term {
-                                0.0
-                            } else if full {
-                                (avail_h - 8.0).max(80.0)
-                            } else if self.terminal.collapsed {
-                                34.0
-                            } else {
-                                self.terminal.term_h.clamp(120.0, (avail_h - 220.0).max(140.0))
-                            };
-                            let chrome =
-                                if show_term && !full && resizable { 14.0 } else { 8.0 };
-                            let editor_h = (avail_h - term_h - chrome).max(80.0);
-                            if !full {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(avail_w, editor_h),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| self.editor.ui(ui, &self.root),
-                                );
-                            }
-                            if resizable {
-                                // Draggable divider: pull up for more terminal,
-                                // down for more editor.
-                                let div = ui
-                                    .allocate_response(
-                                        egui::vec2(avail_w, 6.0),
-                                        egui::Sense::drag(),
-                                    )
-                                    .on_hover_cursor(egui::CursorIcon::ResizeVertical);
-                                if div.dragged() {
-                                    let max_h = (avail_h - 220.0).max(140.0);
-                                    self.terminal.term_h =
-                                        (self.terminal.term_h - div.drag_delta().y)
-                                            .clamp(120.0, max_h);
-                                }
-                                let c = if div.dragged() || div.hovered() {
-                                    crate::theme::accent()
-                                } else {
-                                    crate::theme::faint()
-                                };
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(div.rect.left(), div.rect.center().y),
-                                        egui::pos2(div.rect.right(), div.rect.center().y),
-                                    ],
-                                    egui::Stroke::new(1.0, c),
-                                );
-                            } else if show_term {
-                                ui.separator();
-                            }
-                            if show_term {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(avail_w, term_h),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| self.terminal.ui(ui, &self.root),
-                                );
-                            }
-                        });
-                    },
-                );
-                if rail_w > 0.0 {
-                    ui.separator();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(rail_w, main_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        Self::quote_rail,
-                    );
-                }
-            });
-        });
+        if let Some(rect) = panel_rect {
+            self.tree_grip(ui, rect);
+        }
 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(150));
     }
 }
-
