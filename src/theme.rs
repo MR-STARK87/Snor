@@ -151,6 +151,17 @@ pub fn hairline() -> egui::Color32 {
     egui::Color32::from_rgb(0x22, 0x2B, 0x29)
 }
 
+/// The window's own edge, drawn as a frame around the whole client area.
+///
+/// The reference's outer frame is a 2px band at 125% — 1.6pt — reading
+/// (53, 61, 56) on the top and bottom edges and (58, 64, 61) on the right.
+/// That is roughly three times the luma of [`hairline`], so it registers as
+/// the *window's* boundary rather than another panel divider: the frame is
+/// part of the product's look, not OS chrome left over from it.
+pub fn window_edge() -> egui::Color32 {
+    egui::Color32::from_rgb(0x37, 0x3E, 0x3A)
+}
+
 pub fn danger() -> egui::Color32 {
     egui::Color32::from_rgb(0xE0, 0x6C, 0x75)
 }

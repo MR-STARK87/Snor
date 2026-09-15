@@ -131,6 +131,90 @@ const FOOTER_BOTTOM_GAP: f32 = 0.094;
 /// reproduces the reference's caption width almost exactly.
 const FOOTER_CAPTION_SIZE: f32 = 11.0;
 
+/// What the user did with an inline name field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineOutcome {
+    /// Still typing. Leave the row up.
+    Open,
+    /// Enter, or the commit button.
+    Commit,
+    /// Escape, the cancel button, or focus leaving the row.
+    Cancel,
+}
+
+/// A one-line name field with its commit/cancel buttons.
+///
+/// Focus is the whole reason this is a function rather than six lines inline.
+/// The field is opened by a button elsewhere in the panel, and egui's
+/// `text_edit_singleline` does not take focus on its own — so the row used to
+/// appear with nothing focused, `lost_focus()` could never fire, and clicking
+/// away left it sitting there until the user found "cancel". Asking for focus
+/// once (not every frame, which would make it impossible to give away) fixes
+/// both halves.
+fn inline_name_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    focus_pending: &mut bool,
+    commit_label: &str,
+) -> InlineOutcome {
+    let mut commit = false;
+    let mut cancel = false;
+    let mut lost = false;
+
+    let rect = ui
+        .horizontal(|ui| {
+            // Right-to-left so the buttons claim their width *first* and the
+            // field is sized against what is left. Laid out the other way the
+            // field asks for `spacing().text_edit_width` (280pt) against a
+            // ~244pt panel, takes every point of it, and pushes both buttons
+            // past the panel's edge where they are clipped away entirely.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.small_button(commit_label).clicked() {
+                    commit = true;
+                }
+                let resp = ui.text_edit_singleline(value);
+                if std::mem::take(focus_pending) {
+                    resp.request_focus();
+                }
+                if resp.lost_focus() {
+                    lost = true;
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        commit = true;
+                    }
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        })
+        .response
+        .rect;
+
+    if commit {
+        return InlineOutcome::Commit;
+    }
+    if cancel {
+        return InlineOutcome::Cancel;
+    }
+    if lost {
+        // Focus went elsewhere — but a press on this row's *own* buttons also
+        // steals focus, and a button only reports `clicked()` on release. So
+        // the pointer still being over the row has to count as "not yet gone",
+        // otherwise the row would be torn down before the button ever fired.
+        let over_row = ui
+            .ctx()
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|p| rect.expand(2.0).contains(p));
+        if !over_row {
+            return InlineOutcome::Cancel;
+        }
+    }
+    InlineOutcome::Open
+}
+
 /// Height the footer will claim at the bottom of the panel.
 ///
 /// The caller needs this *before* the footer is laid out, because the
@@ -245,7 +329,7 @@ fn build_nodes(dir: &Path, depth: usize) -> Vec<FileNode> {
     dirs
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateMode {
     File,
     Dir,
@@ -263,6 +347,13 @@ pub struct FileTree {
     create_mode: Option<CreateMode>,
     create_parent: PathBuf,
     create_name: String,
+    /// Ask the create/rename field for focus on its first frame.
+    ///
+    /// One-shot on purpose: the inline row is opened by a button, and a text
+    /// edit that is never focused reports `lost_focus()` never, so clicking
+    /// away could not close it. Requesting focus every frame would instead
+    /// make it impossible to *give* focus away, which is the same bug.
+    inline_focus_pending: bool,
     rename_target: Option<PathBuf>,
     rename_buf: String,
     delete_target: Option<PathBuf>,
@@ -308,6 +399,7 @@ impl FileTree {
             create_mode: None,
             create_parent: root,
             create_name: String::new(),
+            inline_focus_pending: false,
             rename_target: None,
             rename_buf: String::new(),
             delete_target: None,
@@ -395,6 +487,7 @@ impl FileTree {
         self.create_parent = parent;
         self.create_mode = Some(mode);
         self.create_name.clear();
+        self.inline_focus_pending = true;
         self.error = None;
     }
 
@@ -404,6 +497,7 @@ impl FileTree {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         self.rename_target = Some(path);
+        self.inline_focus_pending = true;
         self.error = None;
     }
 
@@ -768,46 +862,45 @@ impl FileTree {
             });
         });
 
-        if let Some(mode) = &self.create_mode {
+        if let Some(mode) = self.create_mode {
             ui.separator();
             ui.label(format!(
                 "new {} in {}",
-                if *mode == CreateMode::Dir {
+                if mode == CreateMode::Dir {
                     "folder"
                 } else {
                     "file"
                 },
                 self.create_parent.display()
             ));
-            ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.create_name);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.do_create();
-                }
-                if ui.small_button("create").clicked() {
-                    self.do_create();
-                }
-                if ui.small_button("cancel").clicked() {
+            match inline_name_field(
+                ui,
+                &mut self.create_name,
+                &mut self.inline_focus_pending,
+                "create",
+            ) {
+                InlineOutcome::Commit => self.do_create(),
+                InlineOutcome::Cancel => {
                     self.create_mode = None;
+                    self.create_name.clear();
                 }
-            });
+                InlineOutcome::Open => {}
+            }
         }
 
         if self.rename_target.is_some() {
             ui.separator();
             ui.label("rename to:");
-            ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.rename_buf);
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.do_rename();
-                }
-                if ui.small_button("apply").clicked() {
-                    self.do_rename();
-                }
-                if ui.small_button("cancel").clicked() {
-                    self.rename_target = None;
-                }
-            });
+            match inline_name_field(
+                ui,
+                &mut self.rename_buf,
+                &mut self.inline_focus_pending,
+                "apply",
+            ) {
+                InlineOutcome::Commit => self.do_rename(),
+                InlineOutcome::Cancel => self.rename_target = None,
+                InlineOutcome::Open => {}
+            }
         }
 
         if let Some(err) = &self.error {

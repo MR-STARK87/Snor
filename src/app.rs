@@ -43,6 +43,11 @@ const STATUS_PAD: f32 = 6.7;
 /// 29.6–33.6pt apart, measured edge to edge. This is the added space on top of
 /// egui's own 6pt `item_spacing.x`, which already separates the labels.
 const STATUS_GAP: f32 = 24.5;
+/// Width of the frame drawn around the whole client area.
+///
+/// The reference's is 2px at 125% = 1.6pt. See [`theme::window_edge`] for why
+/// it is a different colour from every other divider in the app.
+const WINDOW_EDGE_W: f32 = 1.6;
 
 pub struct SnorApp {
     tree: FileTree,
@@ -74,22 +79,10 @@ impl SnorApp {
             // the text row itself only comes to ~20pt.
             ui.add_space(TITLE_PAD);
             ui.horizontal(|ui| {
-                // The reference has no icon here — it opens straight on "Snor".
-                // This is our own control (the panel has to be togglable), so
-                // it is drawn at the *panel header's* folder weight rather than
-                // filling its 24pt hit box, which made it the heaviest thing in
-                // the title bar.
-                if icons::icon_button(ui, 24.0, "toggle explorer (Ctrl+B)", |p, r, c| {
-                    icons::folder(
-                        p,
-                        egui::Rect::from_center_size(r.center(), egui::vec2(17.6, 15.0)),
-                        c,
-                    )
-                })
-                .clicked()
-                {
-                    self.show_explorer = !self.show_explorer;
-                }
+                // No explorer toggle up here. The reference opens straight on
+                // "Snor" with nothing beside it, and a folder glyph sitting on
+                // the product name reads as a logo — which is exactly what the
+                // mock's wordmark is not. Ctrl+B still toggles the panel.
                 ui.label(
                     egui::RichText::new("Snor")
                         .size(18.0)
@@ -198,28 +191,6 @@ impl SnorApp {
         });
     }
 
-    fn quote_rail(ui: &mut egui::Ui) {
-        let h = ui.available_height();
-        ui.vertical(|ui| {
-            ui.add_space(h * 0.34);
-            ui.label(
-                egui::RichText::new("Good software takes time, but it makes time for you.")
-                    .size(13.0)
-                    .italics()
-                    .color(theme::faint()),
-            );
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new("Small steps build big things.")
-                        .size(12.5)
-                        .italics()
-                        .color(theme::faint()),
-                );
-            });
-        });
-    }
-
     /// Editor + terminal column, split at an explicit divider.
     ///
     /// The panes are laid out against rects computed up front rather than by
@@ -232,12 +203,11 @@ impl SnorApp {
         let mut split: Option<(egui::Rect, f32)> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let full = ui.available_rect_before_wrap();
-            // The reference keeps the quote rail visible on an ordinary
-            // maximised window; only drop it when the editor would be cramped.
-            let rail_w = if full.width() > 860.0 { 150.0 } else { 0.0 };
-            let main_w = (full.width() - rail_w - 8.0).max(50.0);
-            let column = egui::Rect::from_min_size(full.min, egui::vec2(main_w, full.height()));
+            let column = ui.available_rect_before_wrap();
+            // No quote rail. The reference parks two aphorisms in a 147pt
+            // column down the right-hand edge, but a whole column of chrome
+            // for decoration is not worth the horizontal space an editor
+            // actually wants, so the editor and terminal get the full width.
 
             let show_term = !self.terminal.hidden;
             let full_scr = show_term && self.terminal.fullscreen;
@@ -282,17 +252,6 @@ impl SnorApp {
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(term_rect).layout(top_down),
                     |ui| self.terminal.ui(ui, &self.tree.root),
-                );
-            }
-            if rail_w > 0.0 {
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(egui::Rect::from_min_size(
-                            egui::pos2(full.right() - rail_w, full.top()),
-                            egui::vec2(rail_w, full.height()),
-                        ))
-                        .layout(top_down),
-                    Self::quote_rail,
                 );
             }
         });
@@ -429,6 +388,22 @@ impl eframe::App for SnorApp {
         if let Some(rect) = panel_rect {
             self.tree_grip(ui, rect);
         }
+
+        // The window's own frame. Drawn last, on the foreground layer, so it
+        // sits over every panel instead of being clipped by the one under the
+        // pointer. The reference draws its edge as part of the product rather
+        // than leaving the boundary to the OS.
+        ui.ctx()
+            .layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("snor_window_edge"),
+            ))
+            .rect_stroke(
+                ui.ctx().viewport_rect(),
+                0.0,
+                egui::Stroke::new(WINDOW_EDGE_W, theme::window_edge()),
+                egui::StrokeKind::Inside,
+            );
 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(150));
