@@ -13,10 +13,10 @@ cargo run --release
 ```
 
 ## Use
-- Top bar: current folder + `open folder` to switch projects.
+- Top bar: current folder + `open folder` to switch projects. `≡` (or Ctrl+B) hides/shows the Explorer, which is also resizable by dragging its edge.
 - Explorer (left): browse, right-click a folder/file for new/rename/delete, `↻` to refresh, auto-refresh via watcher. Double-click opens in editor.
-- Editor (center): tabs, tree-sitter highlight (rust/json/js/toml, keyword fallback for the rest, 100KB TS cap), Ctrl+S to save, Ctrl+F to find in the current file (Enter next, Shift+Enter prev, Esc close), large-file guard 500KB.
-- Terminal: real ConPTY `powershell.exe -NoLogo -NoProfile` with colors + block cursor. Click it and type directly — Enter, arrows, Tab, Backspace, Ctrl+C all go to the shell. Answers DSR/CPR/DA queries so PSReadLine unblocks. `max` fills the center column, `-` collapses. Run `opencode` inside to drive your agent.
+- Editor (center): badge tabs, line-number gutter, tree-sitter highlight (rust/json/js/toml, keyword fallback for the rest, 100KB TS cap), Ctrl+S to save, Ctrl+F to find in the current file (Enter next, Shift+Enter prev, Esc close), Run button sends `cargo run` to the terminal, large-file guard 500KB.
+- Terminal: real ConPTY `powershell.exe -NoLogo -NoProfile` with colors + block cursor. Click it and type directly — Enter, arrows, Tab, Backspace, Ctrl+C all go to the shell. Answers DSR/CPR/DA queries so PSReadLine unblocks. Drag the divider to resize, `-` collapses, `max` fills the center column, Ctrl+Tab hides/shows it entirely. Run `opencode` inside to drive your agent.
 
 ## Memory vs Zed 980MB (Windows 11, WorkingSet64)
 - V1 debug full: ~306-313MB, V1 release: ~331MB, 17MB exe

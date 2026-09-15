@@ -132,8 +132,7 @@ impl FileTree {
 }
 
 impl FileTree {
-    pub fn set_root(&mut self, root: PathBuf) {
-        if let Some(w) = self._watcher.as_mut() {
+    pub fn set_root(&mut self, root: PathBuf) {        if let Some(w) = self._watcher.as_mut() {
             let _ = w.unwatch(&self.root);
             let _ = w.watch(&root, RecursiveMode::Recursive);
         }
@@ -149,6 +148,18 @@ impl FileTree {
         self.error = None;
         self.opened_file = None;
         self.refresh();
+    }
+
+    pub fn begin_create_at_root(&mut self, dir: bool) {
+        let root = self.root.clone();
+        self.begin_create(
+            root,
+            if dir {
+                CreateMode::Dir
+            } else {
+                CreateMode::File
+            },
+        );
     }
 
     pub fn refresh(&mut self) {
@@ -326,22 +337,49 @@ impl FileTree {
                 });
             } else {
                 let selected = self.selected.as_ref() == Some(&node.path);
-                let resp = ui.selectable_label(selected, &node.name);
-                if resp.clicked() {
-                    self.selected = Some(node.path.clone());
-                    self.opened_file = Some(node.path.clone());
-                }
-                resp.context_menu(|ui| {
-                    if ui.button("rename").clicked() {
-                        self.begin_rename(node.path.clone());
-                        ui.close();
-                    }
-                    if ui.button("delete").clicked() {
-                        self.delete_target = Some(node.path.clone());
-                        self.error = None;
-                        ui.close();
-                    }
-                });
+                // Badge pill + name row, like the reference explorer.
+                let pill = if selected {
+                    crate::theme::tab_active()
+                } else {
+                    eframe::egui::Color32::TRANSPARENT
+                };
+                eframe::egui::Frame::NONE
+                    .fill(pill)
+                    .corner_radius(6.0)
+                    .inner_margin(eframe::egui::Margin::symmetric(4, 1))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (letter, bg, fg) = crate::theme::file_badge(&node.name);
+                            eframe::egui::Frame::NONE
+                                .fill(bg)
+                                .corner_radius(4.0)
+                                .inner_margin(eframe::egui::Margin::symmetric(5, 1))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        eframe::egui::RichText::new(letter)
+                                            .small()
+                                            .strong()
+                                            .color(fg),
+                                    );
+                                });
+                            let resp = ui.selectable_label(selected, &node.name);
+                            if resp.clicked() {
+                                self.selected = Some(node.path.clone());
+                                self.opened_file = Some(node.path.clone());
+                            }
+                            resp.context_menu(|ui| {
+                                if ui.button("rename").clicked() {
+                                    self.begin_rename(node.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("delete").clicked() {
+                                    self.delete_target = Some(node.path.clone());
+                                    self.error = None;
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
             }
         }
     }
@@ -364,8 +402,15 @@ impl FileTree {
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
-                    if ui.small_button("↻").clicked() {
+                    if ui
+                        .small_button("↻")
+                        .on_hover_text("refresh")
+                        .clicked()
+                    {
                         self.refresh();
+                    }
+                    if ui.small_button("+").on_hover_text("new file").clicked() {
+                        self.begin_create_at_root(false);
                     }
                 },
             );
@@ -418,8 +463,12 @@ impl FileTree {
         }
 
         ui.separator();
+        // Reserve the footer so it stays pinned at the bottom.
+        let footer_h = 52.0;
+        let tree_h = (ui.available_height() - footer_h).max(60.0);
         eframe::egui::ScrollArea::vertical()
             .id_salt("snor_tree_scroll")
+            .max_height(tree_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let nodes = self.nodes.clone();
@@ -434,6 +483,22 @@ impl FileTree {
                     self.render_nodes(ui, nodes);
                 }
             });
+
+        // Calm footer borrowed from the reference.
+        ui.separator();
+        ui.vertical_centered(|ui| {
+            ui.label(
+                eframe::egui::RichText::new("z   Z")
+                    .small()
+                    .color(crate::theme::faint()),
+            );
+            ui.label(
+                eframe::egui::RichText::new("Rest. Then build again.")
+                    .small()
+                    .italics()
+                    .color(crate::theme::dim_text()),
+            );
+        });
 
         // Delete confirm modal
         if let Some(target) = self.delete_target.clone() {

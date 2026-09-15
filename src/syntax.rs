@@ -36,12 +36,12 @@ const NAMES: &[&str] = &[
 fn color_for(name: &str) -> (egui::Color32, bool) {
     let c = |r, g, b| egui::Color32::from_rgb(r, g, b);
     match name {
-        "keyword" => (c(0x7D, 0xD3, 0xA8), false),
-        "string" | "string.special" => (c(0xD9, 0xA8, 0x6C), false),
-        "comment" => (c(0x8B, 0x94, 0xA3), true),
-        "number" | "constant" | "constant.builtin" => (c(0x7A, 0xA2, 0xF7), false),
+        "keyword" => (c(0x7A, 0xA2, 0xF7), false),
+        "string" | "string.special" => (c(0x98, 0xC3, 0x79), false),
+        "comment" => (c(0x7A, 0x85, 0x77), true),
+        "number" | "constant" | "constant.builtin" => (c(0xFF, 0x9E, 0x64), false),
         "function" | "function.builtin" | "constructor" => (c(0xE5, 0xC0, 0x7B), false),
-        "type" | "type.builtin" | "module" | "tag" => (c(0x56, 0xB6, 0xC2), false),
+        "type" | "type.builtin" | "module" | "tag" => (c(0xC6, 0x78, 0xDD), false),
         "attribute" => (c(0xC6, 0x78, 0xDD), false),
         "operator" => (c(0x89, 0xDC, 0xFF), false),
         _ => (c(0xD5, 0xDA, 0xE2), false),
@@ -135,8 +135,11 @@ pub fn ts_job(text: &str, lang: &str) -> Option<egui::text::LayoutJob> {
                 match event.ok()? {
                     HighlightEvent::Source { start, end } => {
                         let (color, italics) = stack.last().copied().unwrap_or(normal);
+                        // Tree-sitter gives byte offsets; guard against any
+                        // non-boundary slice so a weird file can't crash us.
+                        let slice = text.get(start..end).unwrap_or("");
                         job.append(
-                            &text[start..end],
+                            slice,
                             0.0,
                             TextFormat {
                                 color,

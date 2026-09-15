@@ -151,7 +151,22 @@ pub struct Terminal {
     pub fullscreen: bool,
     pub total_bytes: u64,
     pub total_chunks: u64,
-    key_catcher: String,
+    /// Click-to-type latch: set when the terminal grid is clicked, cleared
+    /// the moment any real widget (editor, find box, explorer field) owns
+    /// keyboard focus. Keystrokes are forwarded only while `active` holds
+    /// and nothing else is focused, so typing code can never leak into the
+    /// shell and vice versa.
+    pub active: bool,
+    /// Hidden entirely (Ctrl+Tab): no terminal UI at all, the editor takes
+    /// the full column. Distinct from `collapsed` (header strip).
+    pub hidden: bool,
+    /// Terminal height in px, adjusted by dragging the editor/terminal
+    /// divider. Persisted across frames.
+    pub term_h: f32,
+    /// Focus state seen at the end of the last frame; used to tell an
+    /// explicit focus grab (click, Ctrl+F) apart from egui's Tab focus
+    /// theft, which must be handed back so shell completion keeps working.
+    focus_clear: bool,
     inq: Vec<u8>,
     started: bool,
 }
@@ -170,7 +185,10 @@ impl Terminal {
             fullscreen: false,
             total_bytes: 0,
             total_chunks: 0,
-            key_catcher: String::new(),
+            active: false,
+            hidden: false,
+            term_h: 280.0,
+            focus_clear: true,
             inq: Vec::new(),
             started: false,
         }
@@ -251,6 +269,19 @@ impl Terminal {
         {
             self.error = Some(format!("pty write failed: {e}"));
         }
+    }
+
+    /// Send a full shell line (used by the editor Run button).
+    pub fn send_line(&mut self, line: &str) {
+        if self.collapsed {
+            self.collapsed = false;
+        }
+        self.active = true;
+        let mut s = line.to_string();
+        if !s.ends_with('\r') && !s.ends_with('\n') {
+            s.push('\r');
+        }
+        self.send_bytes(s.as_bytes());
     }
 
     /// Map a pressed key to pty bytes. Returns None to leave the event alone
@@ -430,31 +461,32 @@ impl Terminal {
         self.ensure_started(cwd);
         self.poll();
 
-        let catcher_id = ui.make_persistent_id("snor_term_catcher");
-        let is_focused = ui.memory(|m| m.has_focus(catcher_id));
+        let is_active = self.active;
 
         ui.horizontal(|ui| {
-            let max_resp = Self::maximize_icon(ui, self.fullscreen);
-            if max_resp
-                .on_hover_text(if self.fullscreen {
-                    "restore terminal"
-                } else {
-                    "maximize terminal"
-                })
-                .clicked()
-            {
-                self.fullscreen = !self.fullscreen;
-                if self.fullscreen {
-                    self.collapsed = false;
-                }
-            }
+            // Tab pill, like the reference terminal header.
+            eframe::egui::Frame::NONE
+                .fill(crate::theme::tab_active())
+                .corner_radius(6.0)
+                .inner_margin(eframe::egui::Margin::symmetric(6, 2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            eframe::egui::RichText::new(">_")
+                                .small()
+                                .strong()
+                                .color(crate::theme::accent()),
+                        );
+                        ui.label("Terminal");
+                    });
+                });
             if ui
                 .small_button(if self.collapsed { "+" } else { "-" })
+                .on_hover_text("collapse / expand")
                 .clicked()
             {
                 self.collapsed = !self.collapsed;
             }
-            ui.heading("Terminal");
             ui.label(
                 eframe::egui::RichText::new(if self.running {
                     "powershell.exe"
@@ -464,20 +496,27 @@ impl Terminal {
                 .small()
                 .color(crate::theme::dim_text()),
             );
-            if is_focused {
+            if is_active {
                 ui.label(
                     eframe::egui::RichText::new("●")
                         .small()
                         .color(crate::theme::accent()),
                 );
+            } else {
+                ui.label(
+                    eframe::egui::RichText::new("click to type")
+                        .small()
+                        .color(crate::theme::dim_text()),
+                );
             }
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
-                    if ui.small_button("clear").clicked() {
-                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
-                    }
-                    if ui.small_button("restart").clicked() {
+                    if ui
+                        .small_button("restart")
+                        .on_hover_text("restart powershell")
+                        .clicked()
+                    {
                         self.started = false;
                         self.rx = None;
                         self.writer = None;
@@ -485,6 +524,39 @@ impl Terminal {
                         self._master = None;
                         self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                         self.ensure_started(cwd);
+                    }
+                    if ui
+                        .small_button("clear")
+                        .on_hover_text("clear screen")
+                        .clicked()
+                    {
+                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                    }
+                    // Shell picker look, like the reference (single shell).
+                    eframe::egui::Frame::NONE
+                        .fill(crate::theme::tab_active())
+                        .corner_radius(6.0)
+                        .inner_margin(eframe::egui::Margin::symmetric(8, 2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                eframe::egui::RichText::new("powershell")
+                                    .small()
+                                    .color(crate::theme::dim_text()),
+                            );
+                        });
+                    let max_resp = Self::maximize_icon(ui, self.fullscreen);
+                    if max_resp
+                        .on_hover_text(if self.fullscreen {
+                            "restore terminal"
+                        } else {
+                            "maximize terminal"
+                        })
+                        .clicked()
+                    {
+                        self.fullscreen = !self.fullscreen;
+                        if self.fullscreen {
+                            self.collapsed = false;
+                        }
                     }
                 },
             );
@@ -501,62 +573,106 @@ impl Terminal {
         ui.separator();
 
         let job = term_job(self.parser.screen());
-        let grid_max = (ui.available_height() - 34.0).max(60.0);
+        // No input widget at all: the grid itself is the click-to-type area.
+        // `active` latches on grid click. Forwarding is additionally gated on
+        // no other widget holding keyboard focus, so keystrokes never leak
+        // between the shell and the editor in either direction.
+        //
+        // Why not a plain egui focus id? Two verified egui 0.36 behaviors
+        // forbid it: (1) a requested-but-never-interacted id is dropped by
+        // the dead-man's switch in `Memory::end_pass`, so a dummy id loses
+        // "focus" ~1 frame after the click; (2) the focus-lock filter type
+        // (`EventFilter`) is crate-private, so Tab/arrows/Escape can't be
+        // locked to a custom widget the way `egui_tty` does on newer egui.
+        let grid_max = (ui.available_height() - 4.0).max(60.0);
+        let mut grid_clicked = false;
         eframe::egui::ScrollArea::vertical()
             .id_salt("snor_term_grid")
             .max_height(grid_max)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let resp = ui.add(
-                    eframe::egui::Label::new(job)
-                        .extend()
-                        .sense(eframe::egui::Sense::click()),
-                );
-                if resp.clicked() {
-                    ui.memory_mut(|m| m.request_focus(catcher_id));
-                }
+                ui.push_id("snor_term_grid_label", |ui| {
+                    let resp = ui.add(
+                        eframe::egui::Label::new(job)
+                            .extend()
+                            .sense(eframe::egui::Sense::click()),
+                    );
+                    grid_clicked = resp.clicked();
+                });
             });
+        if grid_clicked {
+            self.active = true;
+        }
 
-        // Special keys go straight to the pty (pre-consumed so the catcher
-        // TextEdit below never sees them). Printable text + paste arrive
-        // through the catcher, which uses TextEdit's proven input path.
-        if ui.memory(|m| m.has_focus(catcher_id)) {
-            use eframe::egui::{Event, Key};
-            let events = ui.input(|i| i.events.clone());
-            for ev in &events {
-                if let Event::Key {
-                    key,
+        // Type-directly-in-terminal: while latched active and no real widget
+        // (editor, find box, explorer field) owns the keyboard, printable
+        // text + paste + special keys go straight to the pty.
+        use eframe::egui::{Event, Key};
+        let events = ui.input(|i| i.events.clone());
+        let pointer_busy = ui.input(|i| i.pointer.any_click());
+        let focused_none = ui.memory(|m| m.focused().is_none());
+
+        // Tab/Shift+Tab from an unfocused state is grabbed by the first
+        // widget that wants focus (`Memory::interested_in_focus`), which
+        // would yank keystrokes into the editor and break shell completion.
+        // Hand it back when no click was involved; the Tab byte itself is
+        // still forwarded below.
+        let tab_pressed = events.iter().any(|e| {
+            matches!(
+                e,
+                Event::Key {
+                    key: Key::Tab,
                     pressed: true,
-                    modifiers,
                     ..
-                } = ev
-                {
-                    // Never steal editor save / find.
-                    if matches!(key, Key::S | Key::F) && (modifiers.ctrl || modifiers.command) {
-                        continue;
+                }
+            )
+        });
+        if self.active
+            && !focused_none
+            && self.focus_clear
+            && tab_pressed
+            && !pointer_busy
+            && let Some(id) = ui.memory(|m| m.focused())
+        {
+            ui.memory_mut(|m| m.surrender_focus(id));
+        }
+        let clear_now = ui.memory(|m| m.focused().is_none());
+        if self.active && clear_now {
+            for ev in &events {
+                match ev {
+                    Event::Text(text) => {
+                        self.send_bytes(text.as_bytes());
                     }
-                    if let Some(bytes) = Self::key_to_bytes(*key, *modifiers) {
-                        self.send_bytes(bytes);
-                        ui.input_mut(|i| {
-                            i.consume_key(*modifiers, *key);
-                        });
+                    Event::Paste(text) => {
+                        self.send_bytes(text.as_bytes());
                     }
+                    Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        // Never steal editor save / find.
+                        if matches!(key, Key::S | Key::F) && (modifiers.ctrl || modifiers.command)
+                        {
+                            continue;
+                        }
+                        if let Some(bytes) = Self::key_to_bytes(*key, *modifiers) {
+                            self.send_bytes(bytes);
+                            ui.input_mut(|i| {
+                                i.consume_key(*modifiers, *key);
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
+        } else if !clear_now {
+            // A real widget owns the keyboard: drop the latch so the next
+            // keystroke can't leak into the shell.
+            self.active = false;
         }
-
-        // Invisible-ish input catcher: collects printable chars (and paste)
-        // via TextEdit, flushes them to the pty every frame.
-        ui.add(
-            eframe::egui::TextEdit::singleline(&mut self.key_catcher)
-                .id(catcher_id)
-                .frame(eframe::egui::Frame::NONE)
-                .desired_width(1.0),
-        );
-        if !self.key_catcher.is_empty() {
-            let pending = std::mem::take(&mut self.key_catcher);
-            self.send_bytes(pending.as_bytes());
-        }
+        self.focus_clear = clear_now;
     }
 }
 
@@ -616,7 +732,7 @@ mod tests {
             Terminal::key_to_bytes(Key::C, ctrl),
             Some([0x03].as_slice())
         );
-        // Plain letters travel via the catcher TextEdit, not keys.
+        // Plain letters travel via Text events, not keys.
         assert_eq!(Terminal::key_to_bytes(Key::A, Modifiers::NONE), None);
     }
 
@@ -631,4 +747,103 @@ mod tests {
         t.respond_to_queries(b"plain text without escapes");
         assert!(t.inq.len() <= 64);
     }
+
+    fn headless_raw() -> eframe::egui::RawInput {
+        eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Proves the previous bug: a focus id that is requested but never
+    /// attached to an interacted widget is dropped by egui's dead-man's
+    /// switch (`Memory::end_pass`), so it can NOT gate terminal input.
+    #[test]
+    fn uninteracted_focus_id_does_not_survive() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let dummy = egui::Id::new("snor_dummy_focus_probe");
+        ctx.run_ui(headless_raw(), |ui| {
+            ui.label("idle");
+            ui.memory_mut(|m| m.request_focus(dummy));
+        })
+        .drop_without_applying_deltas();
+        assert!(ctx.memory(|m| m.has_focus(dummy)));
+        // Two plain frames with no interact of `dummy`.
+        for _ in 0..2 {
+            ctx.run_ui(headless_raw(), |ui| {
+                ui.label("idle");
+            })
+            .drop_without_applying_deltas();
+        }
+        assert!(
+            !ctx.memory(|m| m.has_focus(dummy)),
+            "dummy focus must be dropped; gating terminal input on it loses keystrokes"
+        );
+    }
+
+    /// Proves the fixed mechanism: an interacted widget's own response id
+    /// (the pattern the terminal grid now relies on via its latched
+    /// `active` flag + real-focus gate) keeps requested focus across frames.
+    #[test]
+    fn interacted_label_keeps_requested_focus() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let mut grid_id: Option<egui::Id> = None;
+        for frame in 0..5 {
+            ctx.run_ui(headless_raw(), |ui| {
+                let resp = ui.add(egui::Label::new("grid").sense(egui::Sense::click()));
+                if frame == 0 {
+                    resp.request_focus();
+                }
+                grid_id = Some(resp.id);
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                ctx.memory(|m| m.has_focus(grid_id.unwrap())),
+                "interacted label must retain focus on frame {frame}"
+            );
+        }
+    }
+
+    /// End-to-end through the real ConPTY powershell: a typed line must be
+    /// echoed back on the vt100 screen. Covers spawn, write, read, poll and
+    /// the DSR/CPR query responder — everything except the OS key event.
+    #[cfg(windows)]
+    #[test]
+    fn pty_powershell_echo_roundtrip() {
+        use std::time::{Duration, Instant};
+        let mut t = Terminal::new();
+        t.ensure_started(&std::env::temp_dir());
+        let t0 = Instant::now();
+        while t.total_bytes == 0 && t.error.is_none() && t0.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            t.poll();
+        }
+        assert!(t.error.is_none(), "pty spawn failed: {:?}", t.error);
+        assert!(
+            t.total_bytes > 0,
+            "powershell printed nothing in 10s; cannot verify input path"
+        );
+        t.send_bytes(b"echo SNORPTYOK123\r");
+        let t1 = Instant::now();
+        let mut seen = false;
+        while t1.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+            t.poll();
+            if t.parser.screen().contents().contains("SNORPTYOK123") {
+                seen = true;
+                break;
+            }
+        }
+        assert!(
+            seen,
+            "typed line never echoed — shell not responding to pty input"
+        );
+    }
 }
+

@@ -65,16 +65,16 @@ fn keywords(lang: &str) -> &'static [&'static str] {
 }
 
 fn color_keyword() -> egui::Color32 {
-    egui::Color32::from_rgb(0x7D, 0xD3, 0xA8)
+    egui::Color32::from_rgb(0x7A, 0xA2, 0xF7)
 }
 fn color_string() -> egui::Color32 {
-    egui::Color32::from_rgb(0xD9, 0xA8, 0x6C)
+    egui::Color32::from_rgb(0x98, 0xC3, 0x79)
 }
 fn color_comment() -> egui::Color32 {
-    egui::Color32::from_rgb(0x8B, 0x94, 0xA3)
+    egui::Color32::from_rgb(0x7A, 0x85, 0x77)
 }
 fn color_number() -> egui::Color32 {
-    egui::Color32::from_rgb(0x7A, 0xA2, 0xF7)
+    egui::Color32::from_rgb(0xFF, 0x9E, 0x64)
 }
 fn color_normal() -> egui::Color32 {
     egui::Color32::from_rgb(0xD5, 0xDA, 0xE2)
@@ -82,6 +82,17 @@ fn color_normal() -> egui::Color32 {
 
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+fn tab_badge(ui: &mut egui::Ui, filename: &str) {
+    let (letter, bg, fg) = crate::theme::file_badge(filename);
+    egui::Frame::NONE
+        .fill(bg)
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(letter).small().strong().color(fg));
+        });
 }
 
 pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
@@ -128,7 +139,7 @@ pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
         ..Default::default()
     };
 
-    let bytes = text.as_bytes();
+    let text_len = text.len();
     let mut i = 0;
     let mut word = String::new();
     let flush_word = |word: &mut String, job: &mut LayoutJob| {
@@ -148,71 +159,99 @@ pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
         word.clear();
     };
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    while i < text_len {
+        // SAFETY: `i` is always advanced by full `char` lengths below (or over
+        // ASCII bytes like '\n'), so it stays on a char boundary and this
+        // `chars().next()` never panics on multi-byte text (e.g. em-dash in .md).
+        let c: char = match text[i..].chars().next() {
+            Some(ch) => ch,
+            None => break,
+        };
+        let clen = c.len_utf8();
         // line comments: // for most, # for toml/py/ps1/md
         let hash_comment = matches!(lang, "toml" | "py" | "ps1" | "md");
-        if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' && !hash_comment {
+        if c == '/' && text[i..].starts_with("//") && !hash_comment {
             flush_word(&mut word, &mut job);
             let start = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
+            while i < text_len && text.as_bytes()[i] != b'\n' {
+                // '\n' is 1 byte; scan char-wise so `i` stays on a boundary.
+                let ch = text[i..].chars().next().unwrap();
+                i += ch.len_utf8();
             }
-            job.append(&text[start..i], 0.0, fmt_com.clone());
+            if let Some(slice) = text.get(start..i) {
+                job.append(slice, 0.0, fmt_com.clone());
+            }
             continue;
         }
         if c == '#' && hash_comment {
             flush_word(&mut word, &mut job);
             let start = i;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
+            while i < text_len && text.as_bytes()[i] != b'\n' {
+                let ch = text[i..].chars().next().unwrap();
+                i += ch.len_utf8();
             }
-            job.append(&text[start..i], 0.0, fmt_com.clone());
+            if let Some(slice) = text.get(start..i) {
+                job.append(slice, 0.0, fmt_com.clone());
+            }
             continue;
         }
         if c == '"' || c == '\'' {
             flush_word(&mut word, &mut job);
             let quote = c;
             let start = i;
-            i += 1;
-            while i < bytes.len() {
-                let d = bytes[i] as char;
+            i += clen;
+            while i < text_len {
+                let d: char = match text[i..].chars().next() {
+                    Some(ch) => ch,
+                    None => break,
+                };
                 if d == '\\' {
-                    i += 2;
+                    // escape: skip backslash + next char (whatever its width)
+                    i += d.len_utf8();
+                    if let Some(next) = text[i..].chars().next() {
+                        i += next.len_utf8();
+                    }
                     continue;
                 }
-                i += 1;
+                i += d.len_utf8();
                 if d == quote {
                     break;
                 }
-                if quote == '\'' && (d == '\n') {
+                if quote == '\'' && d == '\n' {
                     break;
                 }
             }
-            let end = i.min(text.len());
-            job.append(&text[start..end], 0.0, fmt_str.clone());
+            let end = i.min(text_len);
+            if let Some(slice) = text.get(start..end) {
+                job.append(slice, 0.0, fmt_str.clone());
+            }
             continue;
         }
         if c.is_ascii_digit() && word.is_empty() {
             let start = i;
-            while i < bytes.len()
-                && ((bytes[i] as char).is_ascii_alphanumeric()
-                    || bytes[i] == b'.'
-                    || bytes[i] == b'_')
-            {
-                i += 1;
+            while i < text_len {
+                let b = text.as_bytes()[i];
+                if b.is_ascii_alphanumeric() || b == b'.' || b == b'_' {
+                    i += 1;
+                } else {
+                    break;
+                }
             }
-            job.append(&text[start..i], 0.0, fmt_num.clone());
+            if let Some(slice) = text.get(start..i) {
+                job.append(slice, 0.0, fmt_num.clone());
+            }
             continue;
         }
         if is_word_char(c) {
             word.push(c);
-            i += 1;
+            i += clen;
             continue;
         }
         flush_word(&mut word, &mut job);
-        job.append(&text[i..i + 1], 0.0, fmt_normal.clone());
-        i += 1;
+        if let Some(slice) = text.get(i..i + clen) {
+            job.append(slice, 0.0, fmt_normal.clone());
+        }
+        i += clen;
     }
     flush_word(&mut word, &mut job);
     job
@@ -282,6 +321,11 @@ pub struct Editor {
     find_hits: Vec<usize>,
     find_pos: usize,
     find_focus_req: bool,
+    pub cursor_line: usize,
+    pub cursor_col: usize,
+    /// Set by the Run button; the app shell consumes it to send
+    /// `cargo run` to the terminal.
+    pub want_run: bool,
 }
 
 impl Editor {
@@ -296,6 +340,9 @@ impl Editor {
             find_hits: Vec::new(),
             find_pos: 0,
             find_focus_req: false,
+            cursor_line: 1,
+            cursor_col: 1,
+            want_run: false,
         }
     }
 
@@ -312,6 +359,23 @@ impl Editor {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+    }
+
+    pub fn active_lang(&self) -> String {
+        self.tabs
+            .get(self.active)
+            .map(|b| match b.lang.as_str() {
+                "rust" => "Rust".to_string(),
+                "toml" => "TOML".to_string(),
+                "json" => "JSON".to_string(),
+                "js" => "JavaScript".to_string(),
+                "ts" => "TypeScript".to_string(),
+                "py" => "Python".to_string(),
+                "ps1" => "PowerShell".to_string(),
+                "md" => "Markdown".to_string(),
+                _ => "Text".to_string(),
+            })
+            .unwrap_or_else(|| "—".to_string())
     }
 
     fn recompute_find(&mut self) {
@@ -340,9 +404,12 @@ impl Editor {
         let Some(&line) = self.find_hits.get(self.find_pos) else {
             return;
         };
-        let byte: usize = buf.text.lines().take(line).map(|l| l.len() + 1).sum();
-        let byte = byte.min(buf.text.len());
-        let ch = buf.text[..byte].chars().count();
+        let mut byte: usize = buf.text.lines().take(line).map(|l| l.len() + 1).sum();
+        byte = byte.min(buf.text.len());
+        while byte > 0 && !buf.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        let ch = buf.text.get(..byte).map(|s| s.chars().count()).unwrap_or(0);
         let id = ui.make_persistent_id("snor_editor_text");
         let mut state = TextEditState::load(ui.ctx(), id).unwrap_or_default();
         state
@@ -364,30 +431,70 @@ impl Editor {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, workdir: &std::path::Path) {
+        // Tab bar: lang badge + name pills, file picker, Run button.
         ui.horizontal(|ui| {
             let mut close_idx: Option<usize> = None;
             let mut tab_switched = false;
-            for (idx, tab) in self.tabs.iter().enumerate() {
-                let name = tab
-                    .path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let label = if tab.dirty { format!("{name} *") } else { name };
-                if ui.selectable_label(idx == self.active, label).clicked() {
-                    self.active = idx;
-                    tab_switched = true;
+            egui::ScrollArea::horizontal()
+                .id_salt("snor_tabs")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (idx, tab) in self.tabs.iter().enumerate() {
+                            let name = tab
+                                .path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let label =
+                                if tab.dirty { format!("{name} *") } else { name.clone() };
+                            let pill = if idx == self.active {
+                                crate::theme::tab_active()
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            egui::Frame::NONE
+                                .fill(pill)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::symmetric(6, 2))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        tab_badge(ui, &name);
+                                        if ui
+                                            .selectable_label(idx == self.active, label)
+                                            .clicked()
+                                        {
+                                            self.active = idx;
+                                            tab_switched = true;
+                                        }
+                                        if ui.small_button("x").clicked() {
+                                            close_idx = Some(idx);
+                                        }
+                                    });
+                                });
+                        }
+                        if self.tabs.is_empty() {
+                            let _ =
+                                ui.selectable_label(true, "no file — open one in Explorer");
+                        } else if ui.small_button("+").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_directory(workdir)
+                                .pick_file()
+                        {
+                            self.open_file(path);
+                            tab_switched = true;
+                        }
+                    });
+                });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(egui::RichText::new("Run").color(crate::theme::accent()).strong())
+                    .on_hover_text("send `cargo run` to the terminal")
+                    .clicked()
+                {
+                    self.want_run = true;
                 }
-                if ui.small_button("x").clicked() {
-                    close_idx = Some(idx);
-                }
-            }
-            if self.tabs.is_empty() {
-                let _ = ui.selectable_label(true, "no file — double-click in Explorer");
-            } else if ui.small_button("+").clicked() {
-                // no-op: open via explorer
-            }
+            });
             if let Some(idx) = close_idx {
                 self.tabs.remove(idx);
                 if self.active >= self.tabs.len() && !self.tabs.is_empty() {
@@ -526,36 +633,88 @@ impl Editor {
         };
         let lang = buf.lang.clone();
         let editable = !buf.too_large;
+        let line_count = buf.line_count();
         let editor_id = ui.make_persistent_id("snor_editor_text");
         let mut text_changed = false;
-        egui::ScrollArea::both()
-            .id_salt("snor_editor_text")
+        // Gutter + code share one vertical scroll so numbers stay glued to
+        // rows; the code scrolls horizontally on its own. Wrapping is off
+        // (one buffer line == one visual row) so the gutter can't drift.
+        egui::ScrollArea::vertical()
+            .id_salt("snor_editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let mut job = crate::syntax::ts_job(text.as_str(), &lang)
-                        .unwrap_or_else(|| highlight_job(text.as_str(), &lang));
-                    job.wrap.max_width = wrap_width;
-                    ui.fonts_mut(|f| f.layout_job(job))
-                };
-                let resp = ui.add(
-                    egui::TextEdit::multiline(&mut buf.text)
-                        .id(editor_id)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .frame(egui::Frame::NONE)
-                        .layouter(&mut layouter)
-                        .interactive(editable),
-                );
-                if resp.changed() {
-                    buf.dirty = true;
-                    buf.refresh_lines();
-                    text_changed = true;
-                }
+                ui.horizontal_top(|ui| {
+                    if line_count <= 6000 {
+                        ui.scope(|ui| {
+                            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+                            let mono = egui::FontId::monospace(13.0);
+                            for n in 1..=line_count {
+                                ui.label(
+                                    egui::RichText::new(format!("{n:>4} "))
+                                        .font(mono.clone())
+                                        .color(crate::theme::faint()),
+                                );
+                            }
+                        });
+                        ui.separator();
+                    }
+                    egui::ScrollArea::horizontal()
+                        .id_salt("snor_editor_hscroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut layouter =
+                                |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
+                                    let mut job = crate::syntax::ts_job(text.as_str(), &lang)
+                                        .unwrap_or_else(|| {
+                                            highlight_job(text.as_str(), &lang)
+                                        });
+                                    job.wrap.max_width = f32::INFINITY;
+                                    ui.fonts_mut(|f| f.layout_job(job))
+                                };
+                            let resp = ui.add(
+                                egui::TextEdit::multiline(&mut buf.text)
+                                    .id(editor_id)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::ZERO)
+                                    .layouter(&mut layouter)
+                                    .interactive(editable),
+                            );
+                            if resp.changed() {
+                                buf.dirty = true;
+                                buf.refresh_lines();
+                                text_changed = true;
+                            }
+                        });
+                });
             });
+        // Cursor readout for the status bar (char offset -> line/col).
+        let target = egui::widgets::text_edit::TextEditState::load(ui.ctx(), editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| range.primary.index.0)
+            .unwrap_or(0);
+        let (line, col) = {
+            let mut line = 1;
+            let mut col = 1;
+            for (n, ch) in buf.text.chars().enumerate() {
+                if n >= target {
+                    break;
+                }
+                if ch == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            (line, col)
+        };
         if text_changed && self.find_open {
             self.recompute_find();
         }
+        self.cursor_line = line;
+        self.cursor_col = col;
     }
 }
 
@@ -588,5 +747,27 @@ mod tests {
         assert_eq!(find_line_matches(text, "alpha"), vec![0, 2]);
         assert_eq!(find_line_matches(text, "zzz"), Vec::<usize>::new());
         assert_eq!(find_line_matches(text, ""), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn highlight_unicode_does_not_panic() {
+        // Regression: old byte-wise highlighter sliced mid-char and panicked
+        // on .md files (README has an em-dash). Must survive multi-byte text.
+        let text = "# title — with em-dash\ncafé \"naïve 🎉\" '#hash' // cömment\nlet x = 123;\nemoji 🎉 test — ok\n";
+        for lang in ["md", "rust", "toml", "txt", "py", "js"] {
+            let job = highlight_job(text, lang);
+            assert!(!job.sections.is_empty(), "empty job for {lang}");
+        }
+        // The real project README previously crashed the app on click.
+        let readme = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        if let Ok(contents) = std::fs::read_to_string(&readme) {
+            let _ = highlight_job(&contents, "md");
+            let _ = crate::syntax::ts_job(&contents, "md")
+                .unwrap_or_else(|| highlight_job(&contents, "md"));
+        }
+        // Opening it as a buffer must not error either.
+        let mut ed = Editor::new();
+        ed.open_file(readme);
+        assert!(ed.error.is_none(), "open README failed: {:?}", ed.error);
     }
 }
