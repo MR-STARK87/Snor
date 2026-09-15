@@ -363,6 +363,20 @@ impl SnorApp {
             // readouts sits in a lot of air.
             ui.add_space(STATUS_PAD);
             ui.horizontal(|ui| {
+                // Far left, mirroring the terminal's toggle at the far right,
+                // so the two panel toggles read as a pair. This is the only
+                // control that survives hiding the panel — the explorer header
+                // goes with it — so unlike the terminal's it has to read both
+                // ways rather than only offering to close what is already up.
+                let sidebar = self.show_explorer;
+                if icons::icon_button(ui, 20.0, "toggle sidebar (Ctrl+B)", |p, r, c| {
+                    icons::panel_left(p, r.shrink(4.0), c, sidebar)
+                })
+                .clicked()
+                {
+                    self.show_explorer = !self.show_explorer;
+                }
+                ui.add_space(STATUS_GAP);
                 let (branch, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 if ui.is_rect_visible(branch) {

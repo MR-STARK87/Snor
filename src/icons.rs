@@ -287,6 +287,27 @@ pub fn panel_bottom(painter: &Painter, rect: Rect, color: Color32, open: bool) {
     }
 }
 
+/// Sidebar-panel toggle for the status bar: [`panel_bottom`] turned on its
+/// side, with the band down the left edge instead of across the bottom.
+///
+/// It sits at the far left of the status bar, mirroring the terminal's toggle
+/// at the far right, so the two panel toggles read as a pair. Unlike the
+/// terminal's, this one has to work in both directions from the same place:
+/// the explorer header disappears with the panel, so the status bar is the
+/// only control left once it is hidden.
+pub fn panel_left(painter: &Painter, rect: Rect, color: Color32, open: bool) {
+    painter.rect_stroke(rect, 2.0, Stroke::new(1.2, color), StrokeKind::Middle);
+    let band = Rect::from_min_max(
+        pos2(rect.left() + 1.5, rect.top() + 1.5),
+        pos2(rect.left() + rect.width() * 0.38, rect.bottom() - 1.5),
+    );
+    if open {
+        painter.rect_filled(band, 1.0, color);
+    } else {
+        painter.rect_stroke(band, 1.0, Stroke::new(1.0, color), StrokeKind::Middle);
+    }
+}
+
 /// Play triangle for the Run button.
 pub fn play(painter: &Painter, rect: Rect, color: Color32) {
     let c = rect.center();

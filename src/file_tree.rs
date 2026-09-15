@@ -811,30 +811,12 @@ impl FileTree {
         // centre sits 21.6pt below the panel's top edge.
         ui.add_space(8.0);
 
+        // One right-to-left row, so the buttons claim their width *first* and
+        // the label is what gives way when the panel is squeezed. Laid out
+        // left-to-right the label took its full width before the buttons were
+        // placed, and past roughly 150pt of panel the two overlapped — the
+        // heading ran straight under the icons.
         ui.horizontal(|ui| {
-            let (slot, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-            if ui.is_rect_visible(slot) {
-                icons::folder(
-                    &ui.painter_at(slot),
-                    egui::Rect::from_center_size(slot.center(), egui::vec2(17.6, 15.0)),
-                    theme::text(),
-                );
-            }
-            let head = ui.label(
-                egui::RichText::new("Explorer")
-                    .size(14.0)
-                    .color(theme::text()),
-            );
-            head.context_menu(|ui| {
-                if ui.button("new file here").clicked() {
-                    self.begin_create(self.root.clone(), CreateMode::File);
-                    ui.close();
-                }
-                if ui.button("new folder here").clicked() {
-                    self.begin_create(self.root.clone(), CreateMode::Dir);
-                    ui.close();
-                }
-            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // The reference's two header glyphs sit 17.6pt in from the
                 // panel's right edge and 32pt apart. Right-to-left, so this
@@ -859,6 +841,47 @@ impl FileTree {
                 {
                     self.open_requested = true;
                 }
+                // The glyph and the title go in a *nested left-to-right* row.
+                // Two things are load-bearing here. First, the nesting: in the
+                // right-to-left flow above, the label was added before the
+                // glyph and took the space the glyph needed, so at narrow
+                // widths the glyph was squeezed to nothing and disappeared.
+                // Left-to-right the glyph claims its 18pt first and the label
+                // truncates into whatever is left.
+                //
+                // Second, `with_layout` rather than `horizontal`: `Ui::horizontal`
+                // *inherits* the parent's direction — `horizontal_with_main_wrap_dyn`
+                // reads `self.placer.prefer_right_to_left()` and picks the layout
+                // from it — so a nested `horizontal` here is right-to-left too
+                // and draws the title before its own folder. This has to say
+                // which way it means.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let (slot, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    if ui.is_rect_visible(slot) {
+                        icons::folder(
+                            &ui.painter_at(slot),
+                            egui::Rect::from_center_size(slot.center(), egui::vec2(17.6, 15.0)),
+                            theme::text(),
+                        );
+                    }
+                    let head = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("Workspace").size(14.0).color(theme::text()),
+                        )
+                        .truncate(),
+                    );
+                    head.context_menu(|ui| {
+                        if ui.button("new file here").clicked() {
+                            self.begin_create(self.root.clone(), CreateMode::File);
+                            ui.close();
+                        }
+                        if ui.button("new folder here").clicked() {
+                            self.begin_create(self.root.clone(), CreateMode::Dir);
+                            ui.close();
+                        }
+                    });
+                });
             });
         });
 
@@ -932,7 +955,7 @@ impl FileTree {
                 if self.render_root_row(ui) {
                     if nodes.is_empty() {
                         ui.label(
-                            egui::RichText::new("empty folder — right-click Explorer for options")
+                            egui::RichText::new("empty folder — right-click Workspace for options")
                                 .color(theme::dim_text()),
                         );
                     } else {

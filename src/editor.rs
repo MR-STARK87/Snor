@@ -564,7 +564,7 @@ impl Editor {
                         }
                         if self.tabs.is_empty() {
                             ui.label(
-                                egui::RichText::new("no file — open one in Explorer")
+                                egui::RichText::new("no file — open one in Workspace")
                                     .size(12.5)
                                     .color(crate::theme::faint()),
                             );
@@ -611,7 +611,7 @@ impl Editor {
                 .id_salt("snor_editor_empty")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.monospace("// open a file from Explorer to edit.");
+                    ui.monospace("// open a file from Workspace to edit.");
                     ui.monospace("// tabs + tree-sitter highlight + Ctrl+S to save.");
                 });
             return;
