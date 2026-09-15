@@ -3,11 +3,13 @@ use std::path::PathBuf;
 
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
+use crate::terminal::Terminal;
 
 pub struct SnorApp {
     root: PathBuf,
     tree: FileTree,
     editor: Editor,
+    terminal: Terminal,
     status: String,
 }
 
@@ -20,6 +22,7 @@ impl SnorApp {
             root,
             tree,
             editor: Editor::new(),
+            terminal: Terminal::new(),
             status: String::from("ready"),
         }
     }
@@ -66,23 +69,11 @@ impl eframe::App for SnorApp {
             });
 
         egui::Panel::bottom("snor_terminal")
-            .default_size(200.0)
-            .min_size(120.0)
+            .default_size(260.0)
+            .min_size(140.0)
             .resizable(true)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Terminal");
-                    ui.label(
-                        egui::RichText::new("ConPTY powershell lands here (next)")
-                            .small()
-                            .color(crate::theme::dim_text()),
-                    );
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.monospace("$ powershell.exe");
-                    ui.monospace("# run: opencode  (wired in terminal milestone)");
-                });
+                self.terminal.ui(ui, &self.root);
             });
 
         egui::Panel::bottom("snor_status").show(ui, |ui| {
@@ -109,6 +100,6 @@ impl eframe::App for SnorApp {
         });
 
         ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(500));
+            .request_repaint_after(std::time::Duration::from_millis(150));
     }
 }

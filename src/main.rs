@@ -3,6 +3,7 @@ use eframe::egui;
 mod app;
 mod editor;
 mod file_tree;
+mod terminal;
 mod theme;
 
 fn main() -> anyhow::Result<()> {
