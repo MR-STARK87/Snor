@@ -30,10 +30,8 @@ fn build_nodes(dir: &Path, depth: usize) -> Vec<FileNode> {
     let mut files = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != ".gitignore" && name != ".env" {
-            if name == ".git" {
-                continue;
-            }
+        if name == ".git" {
+            continue;
         }
         if should_skip(&name) {
             continue;
@@ -60,8 +58,8 @@ fn build_nodes(dir: &Path, depth: usize) -> Vec<FileNode> {
             break;
         }
     }
-    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    dirs.sort_by_key(|a| a.name.to_lowercase());
+    files.sort_by_key(|a| a.name.to_lowercase());
     dirs.extend(files);
     dirs
 }
@@ -328,15 +326,14 @@ impl FileTree {
             if ui
                 .add_enabled(can_edit, eframe::egui::Button::new("rename").small())
                 .clicked()
+                && let Some(sel) = self.selected.clone()
             {
-                if let Some(sel) = self.selected.clone() {
-                    self.rename_target = Some(sel.clone());
-                    self.rename_buf = sel
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    self.error = None;
-                }
+                self.rename_target = Some(sel.clone());
+                self.rename_buf = sel
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.error = None;
             }
             if ui
                 .add_enabled(can_edit, eframe::egui::Button::new("delete").small())
