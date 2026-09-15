@@ -208,7 +208,6 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(child) = self._child.as_mut() {
-            use portable_pty::ChildKiller;
             let _ = child.kill();
         }
     }
