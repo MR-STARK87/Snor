@@ -3,6 +3,8 @@ use eframe::egui;
 mod app;
 mod editor;
 mod file_tree;
+mod git;
+mod search;
 mod terminal;
 mod theme;
 
