@@ -140,8 +140,12 @@ pub fn folder_open(painter: &Painter, rect: Rect, color: Color32) {
 }
 
 /// Outlined document with a folded corner and text rules.
+///
+/// Stroked at 1.0 rather than the folder's 1.2: the reference draws the page
+/// noticeably finer than the folder beside it, and at a 17px-wide glyph the
+/// heavier weight closes the interior up into a solid block.
 pub fn doc(painter: &Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
+    let stroke = Stroke::new(1.0, color);
     let (x0, y0, x1, y1) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let fold = rect.width() * 0.34;
     let pts = vec![
@@ -167,32 +171,28 @@ pub fn doc(painter: &Painter, rect: Rect, color: Color32) {
     }
 }
 
-/// Filled letter badge, as used by the editor tabs.
-pub fn badge_filled(painter: &Painter, rect: Rect, letter: &str, fill: Color32, fg: Color32) {
+/// Filled letter badge: the editor tabs, and the *selected* explorer row,
+/// where the reference swaps the outlined badge for a solid accent one with
+/// the letter knocked out.
+///
+/// `font_size` is explicit rather than derived from `rect` because the two
+/// callers draw the same glyph in noticeably different boxes (16pt tabs,
+/// 13.6pt tree rows) and each was sized against its own reference ink.
+pub fn badge_filled(
+    painter: &Painter,
+    rect: Rect,
+    letter: &str,
+    font_size: f32,
+    fill: Color32,
+    fg: Color32,
+) {
     painter.rect_filled(rect, 3.0, fill);
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         letter,
-        FontId::monospace(9.5),
+        FontId::monospace(font_size),
         fg,
-    );
-}
-
-/// Outlined letter badge, as used by the explorer rows.
-pub fn badge_outlined(painter: &Painter, rect: Rect, letter: &str, color: Color32) {
-    painter.rect_stroke(
-        rect,
-        3.0,
-        Stroke::new(1.2, color),
-        StrokeKind::Middle,
-    );
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        letter,
-        FontId::monospace(8.5),
-        color,
     );
 }
 
@@ -264,6 +264,26 @@ pub fn maximize(painter: &Painter, rect: Rect, color: Color32, fullscreen: bool)
         ));
     } else {
         painter.rect_stroke(inner, 1.0, stroke, StrokeKind::Middle);
+    }
+}
+
+/// Terminal-panel toggle for the status bar: a rounded rectangle whose bottom
+/// band is filled while the panel is open, hollow while it is hidden.
+///
+/// The reference puts a single icon at the far right of its status bar (a
+/// settings gear, for a panel we do not have). This fills that slot with the
+/// one control ours actually has, rather than leaving a default-chrome text
+/// button sitting among the readouts.
+pub fn panel_bottom(painter: &Painter, rect: Rect, color: Color32, open: bool) {
+    painter.rect_stroke(rect, 2.0, Stroke::new(1.2, color), StrokeKind::Middle);
+    let band = Rect::from_min_max(
+        pos2(rect.left() + 1.5, rect.bottom() - rect.height() * 0.38),
+        pos2(rect.right() - 1.5, rect.bottom() - 1.5),
+    );
+    if open {
+        painter.rect_filled(band, 1.0, color);
+    } else {
+        painter.rect_stroke(band, 1.0, Stroke::new(1.0, color), StrokeKind::Middle);
     }
 }
 

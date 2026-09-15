@@ -508,10 +508,13 @@ impl Terminal {
                             self.collapsed = false;
                         }
                     }
-                    if ui
-                        .small_button("restart")
-                        .on_hover_text("restart powershell")
-                        .clicked()
+                    // An icon, not a `small_button`: the reference's terminal
+                    // header is icons only, and a default-chrome text button
+                    // between two flat glyphs read as bolted on.
+                    if crate::icons::icon_button(ui, 20.0, "restart powershell", |p, r, c| {
+                        crate::icons::refresh(p, r.shrink(2.0), c)
+                    })
+                    .clicked()
                     {
                         self.started = false;
                         self.rx = None;

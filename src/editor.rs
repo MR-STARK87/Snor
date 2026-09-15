@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 const LARGE_FILE_BYTES: usize = 500_000;
 const PLAIN_HIGHLIGHT_BYTES: usize = 200_000;
 
+/// Distance between code lines, and therefore between gutter numbers.
+///
+/// The reference mock sets 27.5px between lines against a 17px ink height —
+/// a leading of roughly 1.6x. At 125% that is 22pt. egui's own default is
+/// close to 1.2x, which is why our code looked cramped beside the mock.
+const CODE_LINE_H: f32 = 22.0;
+
 fn language_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -97,6 +104,7 @@ fn tab_badge(ui: &mut egui::Ui, filename: &str) {
             &painter,
             slot,
             letter,
+            9.5,
             crate::theme::accent(),
             crate::theme::on_accent(),
         ),
@@ -740,8 +748,14 @@ impl Editor {
                                 egui::Align::LEFT,
                             )),
                             |ui| {
-                                ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
                                 let mono = egui::FontId::monospace(13.0);
+                                // The gutter has to advance in step with the
+                                // code, whose rows are forced to CODE_LINE_H.
+                                // A label's own height comes from the font, so
+                                // the difference goes into the item spacing.
+                                let row = ui.ctx().fonts_mut(|f| f.row_height(&mono));
+                                ui.style_mut().spacing.item_spacing =
+                                    egui::vec2(0.0, (CODE_LINE_H - row).max(0.0));
                                 for n in 1..=line_count {
                                     ui.label(
                                         egui::RichText::new(format!("{n:>4} "))
@@ -764,6 +778,15 @@ impl Editor {
                                             highlight_job(text.as_str(), &lang)
                                         });
                                     job.wrap.max_width = f32::INFINITY;
+                                    // The reference sets 27.5px between code
+                                    // lines against a 17px ink height, i.e. a
+                                    // leading of about 1.6x. egui's default is
+                                    // nearer 1.2x, which reads cramped beside
+                                    // it. Set per section because that is where
+                                    // the layout actually reads it from.
+                                    for section in &mut job.sections {
+                                        section.format.line_height = Some(CODE_LINE_H);
+                                    }
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
                             let resp = ui.add(

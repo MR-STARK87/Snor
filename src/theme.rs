@@ -43,7 +43,10 @@ pub fn accent() -> egui::Color32 {
     egui::Color32::from_rgb(0xBC, 0xDF, 0x9C)
 }
 
-/// Text on top of [`accent`] fills.
+/// Ink on top of a filled badge or an [`accent`] fill: the reference knocks
+/// the letter out of the fill rather than drawing it on the panel, so this is
+/// the *absence* of ink, not a highlight. Measured at (0, 1, 2) inside an
+/// unselected badge and (6, 19, 15) inside a selected one.
 pub fn on_accent() -> egui::Color32 {
     egui::Color32::from_rgb(0x12, 0x19, 0x17)
 }
@@ -51,6 +54,21 @@ pub fn on_accent() -> egui::Color32 {
 /// Primary body text.
 pub fn text() -> egui::Color32 {
     egui::Color32::from_rgb(0xC0, 0xC4, 0xC1)
+}
+
+/// The selected explorer row's label. Brighter than [`text`] — that lift is
+/// what makes a selected row read as selected; the pill alone does not carry
+/// it. Measured at (220, 221, 219) against (182, 186, 184) for an unselected
+/// file label one row down.
+pub fn text_strong() -> egui::Color32 {
+    egui::Color32::from_rgb(0xDC, 0xDD, 0xDB)
+}
+
+/// The explorer root row's label: the brightest text in the panel, measured at
+/// (245, 246, 244). The root is set as a heading, so it outranks both
+/// [`text`] and [`text_strong`].
+pub fn text_bright() -> egui::Color32 {
+    egui::Color32::from_rgb(0xF5, 0xF6, 0xF4)
 }
 
 /// Secondary text: tree labels, terminal status, panel headings.
@@ -87,6 +105,34 @@ pub fn sleep_mark() -> egui::Color32 {
 /// Stroke colour for line-art icons and the mascot.
 pub fn outline() -> egui::Color32 {
     egui::Color32::from_rgb(0x5B, 0x6A, 0x59)
+}
+
+/// Ink for the explorer tree's glyphs: the folder, document and badge
+/// outlines, and the disclosure chevrons.
+///
+/// Sampled from the reference at (208, 203, 189) on the folder's horizontal
+/// top edge, which is fully covered and therefore reports the true stroke
+/// colour. Diagonal strokes read ~16% dimmer than this in the mock
+/// ((175, 178, 171) on a chevron, (175, 171, 166) on a badge corner) — that
+/// is antialiasing spread over two pixels, not a second, darker ink, so
+/// everything in the tree uses this one colour.
+///
+/// Deliberately *not* [`outline`]: that green-grey is right for the mascot,
+/// but the reference's tree is pale warm line art. Painting it in `outline`
+/// left the glyphs at (89, 104, 88) — far too dim, and the wrong hue.
+pub fn glyph() -> egui::Color32 {
+    egui::Color32::from_rgb(0xD0, 0xCB, 0xBD)
+}
+
+/// Fill of the explorer's letter badges.
+///
+/// The reference draws *every* badge as a solid rounded square with the letter
+/// knocked out — the outlined badge this replaced was simply wrong. The fill
+/// is a light warm grey, measured at (188, 185, 179): a touch dimmer than
+/// [`glyph`]'s strokes, which is what a flat fill reports next to a
+/// thin stroke's brightest pixel.
+pub fn badge_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(0xBC, 0xB9, 0xB3)
 }
 
 /// Fill behind the mascot's outlines: a hair lighter than the panel so the

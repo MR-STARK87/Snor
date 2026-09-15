@@ -22,6 +22,28 @@ const TREE_MAX_W: f32 = 520.0;
 /// Half-width of the explorer's resize grip.
 const TREE_GRAB: f32 = 5.0;
 
+// --- Chrome heights ----------------------------------------------------
+//
+// Measured off the reference mock (which renders at 125%) and converted to
+// points: a 57px title bar and a 49px status bar.
+/// Padding above and below the title bar's row. The row itself is ~24pt (the
+/// explorer toggle sets its height), so twice this puts the bar at the
+/// reference's 45.6pt.
+const TITLE_PAD: f32 = 7.0;
+/// Padding above and below the status bar's row.
+///
+/// The reference's bar is 50px tall — its top rule sits at y=932 with the
+/// window's interior ending at y=981 — which is 40.0pt. The row itself
+/// measures 26.6pt live (the 14pt branch glyph is not the tallest thing in it;
+/// the "show terminal" button is), leaving this split either side.
+const STATUS_PAD: f32 = 6.7;
+/// Gap between the status bar's right-hand readouts.
+///
+/// The reference spreads them much further than egui would: its readouts sit
+/// 29.6–33.6pt apart, measured edge to edge. This is the added space on top of
+/// egui's own 6pt `item_spacing.x`, which already separates the labels.
+const STATUS_GAP: f32 = 24.5;
+
 pub struct SnorApp {
     tree: FileTree,
     editor: Editor,
@@ -48,29 +70,39 @@ impl SnorApp {
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("snor_top").show(ui, |ui| {
+            // The reference's title bar is 45.6pt tall with its row centred;
+            // the text row itself only comes to ~20pt.
+            ui.add_space(TITLE_PAD);
             ui.horizontal(|ui| {
-                if icons::icon_button(ui, 22.0, "toggle explorer (Ctrl+B)", icons::folder).clicked()
+                // The reference has no icon here — it opens straight on "Snor".
+                // This is our own control (the panel has to be togglable), so
+                // it is drawn at the *panel header's* folder weight rather than
+                // filling its 24pt hit box, which made it the heaviest thing in
+                // the title bar.
+                if icons::icon_button(ui, 24.0, "toggle explorer (Ctrl+B)", |p, r, c| {
+                    icons::folder(
+                        p,
+                        egui::Rect::from_center_size(r.center(), egui::vec2(17.6, 15.0)),
+                        c,
+                    )
+                })
+                .clicked()
                 {
                     self.show_explorer = !self.show_explorer;
                 }
                 ui.label(
                     egui::RichText::new("Snor")
-                        .size(13.5)
+                        .size(18.0)
                         .strong()
                         .color(theme::accent()),
                 );
                 // The reference separates the product name from its tagline
                 // with a raised dot, not a plus.
-                ui.label(egui::RichText::new("\u{2022}").size(12.0).color(theme::faint()));
+                ui.label(egui::RichText::new("\u{2022}").size(11.5).color(theme::faint()));
                 ui.label(
                     egui::RichText::new("Calm tools for focused minds.")
-                        .size(12.0)
-                        .color(theme::tagline()),
-                );
-                ui.label(
-                    egui::RichText::new(self.tree.root.display().to_string())
                         .size(11.5)
-                        .color(theme::faint()),
+                        .color(theme::tagline()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right-to-left: the label goes in first so the leaf ends
@@ -78,21 +110,25 @@ impl SnorApp {
                     // reading order.
                     ui.label(
                         egui::RichText::new("Stay consistent.")
-                            .size(12.0)
+                            .size(12.5)
                             .color(theme::dim_text()),
                     );
                     let (slot, _) =
-                        ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                     if ui.is_rect_visible(slot) {
                         icons::leaf(&ui.painter_at(slot), slot, theme::accent());
                     }
                 });
             });
+            ui.add_space(TITLE_PAD);
         });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("snor_status").show(ui, |ui| {
+            // The reference's status bar is 39.2pt tall, so the 16pt row of
+            // readouts sits in a lot of air.
+            ui.add_space(STATUS_PAD);
             ui.horizontal(|ui| {
                 let (branch, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
@@ -101,7 +137,7 @@ impl SnorApp {
                 }
                 ui.label(
                     egui::RichText::new("main")
-                        .size(12.0)
+                        .size(12.5)
                         .color(theme::dim_text()),
                 );
                 // Sync indicator: a filled accent dot with a knocked-out centre.
@@ -114,7 +150,7 @@ impl SnorApp {
                 }
                 ui.label(
                     egui::RichText::new("0")
-                        .size(12.0)
+                        .size(12.5)
                         .color(theme::dim_text()),
                 );
                 let (tri, _) =
@@ -124,10 +160,28 @@ impl SnorApp {
                 }
                 ui.label(
                     egui::RichText::new("0")
-                        .size(12.0)
+                        .size(12.5)
                         .color(theme::dim_text()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Right-to-left, so the first thing added lands furthest
+                    // right: the toggle goes in first to sit where the
+                    // reference's own status-bar icon does, with the readouts
+                    // marching away to its left. An icon rather than a
+                    // `small_button` — a filled pill among flat text was the
+                    // same "bolted on" problem as the old open-folder button.
+                    let open = !self.terminal.hidden;
+                    if icons::icon_button(ui, 20.0, "toggle terminal (Ctrl+Tab)", |p, r, c| {
+                        icons::panel_bottom(p, r.shrink(4.0), c, open)
+                    })
+                    .clicked()
+                    {
+                        self.terminal.hidden = !self.terminal.hidden;
+                    }
+                    ui.add_space(STATUS_GAP);
+                    // The reference spreads the readouts out rather than
+                    // packing them: "Ln 6, Col 1   Spaces: 4   UTF-8   CRLF
+                    // Rust".
                     for item in [
                         self.editor.active_lang(),
                         "CRLF".to_string(),
@@ -135,21 +189,12 @@ impl SnorApp {
                         "Spaces: 4".to_string(),
                         format!("Ln {}, Col {}", self.editor.cursor_line, self.editor.cursor_col),
                     ] {
-                        ui.label(egui::RichText::new(item).size(12.0).color(theme::dim_text()));
-                    }
-                    if ui
-                        .small_button(if self.terminal.hidden {
-                            "show terminal"
-                        } else {
-                            "hide terminal"
-                        })
-                        .on_hover_text("toggle terminal (Ctrl+Tab)")
-                        .clicked()
-                    {
-                        self.terminal.hidden = !self.terminal.hidden;
+                        ui.label(egui::RichText::new(item).size(12.5).color(theme::dim_text()));
+                        ui.add_space(STATUS_GAP);
                     }
                 });
             });
+            ui.add_space(STATUS_PAD);
         });
     }
 
