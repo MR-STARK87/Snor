@@ -6,6 +6,8 @@ use eframe::egui;
 mod app;
 mod editor;
 mod file_tree;
+mod icons;
+mod mascot;
 mod syntax;
 mod terminal;
 mod theme;

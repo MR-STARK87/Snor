@@ -105,7 +105,7 @@ fn term_job(screen: &vt100::Screen) -> eframe::egui::text::LayoutJob {
                 text = " ".to_string();
             }
             if row == cur_row && col == cur_col {
-                bg = vt100::Color::Rgb(0x7D, 0xD3, 0xA8);
+                bg = vt100::Color::Rgb(0xBC, 0xDF, 0x9C);
                 fg = vt100::Color::Rgb(0x10, 0x12, 0x17);
                 bold = false;
             }
@@ -422,69 +422,45 @@ impl Terminal {
         }
     }
 
-    /// Small vector-style maximize/restore icon (no font glyph needed).
-    fn maximize_icon(ui: &mut eframe::egui::Ui, fullscreen: bool) -> eframe::egui::Response {
-        use eframe::egui::{Sense, Stroke, vec2};
-        let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
-        if ui.is_rect_visible(rect) {
-            let painter = ui.painter_at(rect);
-            if resp.hovered() {
-                painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
-            }
-            let stroke = Stroke::new(1.5, ui.visuals().text_color());
-            if fullscreen {
-                painter.rect_stroke(
-                    eframe::egui::Rect::from_min_size(rect.min + vec2(7.0, 3.0), vec2(9.0, 9.0)),
-                    1.0,
-                    stroke,
-                    eframe::egui::StrokeKind::Middle,
-                );
-                painter.rect_stroke(
-                    eframe::egui::Rect::from_min_size(rect.min + vec2(3.0, 7.0), vec2(9.0, 9.0)),
-                    1.0,
-                    stroke,
-                    eframe::egui::StrokeKind::Middle,
-                );
-            } else {
-                painter.rect_stroke(
-                    eframe::egui::Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(12.0, 12.0)),
-                    1.0,
-                    stroke,
-                    eframe::egui::StrokeKind::Middle,
-                );
-            }
-        }
-        resp
-    }
-
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, cwd: &PathBuf) {
         self.ensure_started(cwd);
         self.poll();
 
         let is_active = self.active;
+        let accent = crate::theme::accent();
 
         ui.horizontal(|ui| {
             // Tab pill, like the reference terminal header.
             eframe::egui::Frame::NONE
                 .fill(crate::theme::tab_active())
+                .stroke(eframe::egui::Stroke::new(1.0, crate::theme::hairline()))
                 .corner_radius(6.0)
-                .inner_margin(eframe::egui::Margin::symmetric(6, 2))
+                .inner_margin(eframe::egui::Margin::symmetric(8, 3))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             eframe::egui::RichText::new(">_")
-                                .small()
+                                .size(12.0)
                                 .strong()
-                                .color(crate::theme::accent()),
+                                .color(accent),
                         );
-                        ui.label("Terminal");
+                        ui.label(
+                            eframe::egui::RichText::new("Terminal")
+                                .size(12.5)
+                                .color(crate::theme::text()),
+                        );
                     });
                 });
-            if ui
-                .small_button(if self.collapsed { "+" } else { "-" })
-                .on_hover_text("collapse / expand")
-                .clicked()
-            {
+            let collapse = if self.collapsed {
+                crate::icons::icon_button(ui, 20.0, "expand", |p, r, c| {
+                    crate::icons::plus(p, r, c)
+                })
+            } else {
+                crate::icons::icon_button(ui, 20.0, "collapse", |p, r, c| {
+                    crate::icons::minus(p, r, c)
+                })
+            };
+            if collapse.clicked() {
                 self.collapsed = !self.collapsed;
             }
             ui.label(
@@ -493,25 +469,45 @@ impl Terminal {
                 } else {
                     "stopped"
                 })
-                .small()
-                .color(crate::theme::dim_text()),
+                .size(11.5)
+                .color(crate::theme::faint()),
             );
             if is_active {
-                ui.label(
-                    eframe::egui::RichText::new("●")
-                        .small()
-                        .color(crate::theme::accent()),
-                );
+                ui.label(eframe::egui::RichText::new("●").size(11.5).color(accent));
             } else {
                 ui.label(
                     eframe::egui::RichText::new("click to type")
-                        .small()
-                        .color(crate::theme::dim_text()),
+                        .size(11.5)
+                        .color(crate::theme::faint()),
                 );
             }
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
+                    if crate::icons::icon_button(ui, 20.0, "clear screen", |p, r, c| {
+                        crate::icons::trash(p, r, c)
+                    })
+                    .clicked()
+                    {
+                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                    }
+                    let fullscreen = self.fullscreen;
+                    if crate::icons::icon_button(
+                        ui,
+                        20.0,
+                        if fullscreen {
+                            "restore terminal"
+                        } else {
+                            "maximize terminal"
+                        },
+                        |p, r, c| crate::icons::maximize(p, r, c, fullscreen),                    )
+                    .clicked()
+                    {
+                        self.fullscreen = !self.fullscreen;
+                        if self.fullscreen {
+                            self.collapsed = false;
+                        }
+                    }
                     if ui
                         .small_button("restart")
                         .on_hover_text("restart powershell")
@@ -525,45 +521,25 @@ impl Terminal {
                         self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                         self.ensure_started(cwd);
                     }
-                    if ui
-                        .small_button("clear")
-                        .on_hover_text("clear screen")
-                        .clicked()
-                    {
-                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
-                    }
                     // Shell picker look, like the reference (single shell).
                     eframe::egui::Frame::NONE
                         .fill(crate::theme::tab_active())
+                        .stroke(eframe::egui::Stroke::new(1.0, crate::theme::hairline()))
                         .corner_radius(6.0)
-                        .inner_margin(eframe::egui::Margin::symmetric(8, 2))
+                        .inner_margin(eframe::egui::Margin::symmetric(9, 3))
                         .show(ui, |ui| {
                             ui.label(
                                 eframe::egui::RichText::new("powershell")
-                                    .small()
+                                    .size(11.5)
                                     .color(crate::theme::dim_text()),
                             );
                         });
-                    let max_resp = Self::maximize_icon(ui, self.fullscreen);
-                    if max_resp
-                        .on_hover_text(if self.fullscreen {
-                            "restore terminal"
-                        } else {
-                            "maximize terminal"
-                        })
-                        .clicked()
-                    {
-                        self.fullscreen = !self.fullscreen;
-                        if self.fullscreen {
-                            self.collapsed = false;
-                        }
-                    }
                 },
             );
         });
 
         if let Some(err) = &self.error {
-            ui.colored_label(eframe::egui::Color32::from_rgb(0xE0, 0x6C, 0x75), err);
+            ui.colored_label(crate::theme::danger(), err);
         }
 
         if self.collapsed {

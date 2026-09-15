@@ -85,14 +85,74 @@ fn is_word_char(c: char) -> bool {
 }
 
 fn tab_badge(ui: &mut egui::Ui, filename: &str) {
-    let (letter, bg, fg) = crate::theme::file_badge(filename);
-    egui::Frame::NONE
-        .fill(bg)
-        .corner_radius(4.0)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(letter).small().strong().color(fg));
-        });
+    let (slot, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    if !ui.is_rect_visible(slot) {
+        return;
+    }
+    let painter = ui.painter_at(slot);
+    // The reference fills the badge with the accent colour and knocks the
+    // letter out in the panel colour; non-source files get a page glyph.
+    match crate::theme::file_letter(filename) {
+        Some(letter) => crate::icons::badge_filled(
+            &painter,
+            slot,
+            letter,
+            crate::theme::accent(),
+            crate::theme::on_accent(),
+        ),
+        None => crate::icons::doc(&painter, slot.shrink(1.0), crate::theme::dim_text()),
+    }
+}
+
+/// The Run button: a play triangle plus a label, sized to its own text.
+fn run_button(ui: &mut egui::Ui) -> egui::Response {
+    let accent = crate::theme::accent();
+    let galley = ui
+        .painter()
+        .layout_no_wrap("Run".to_owned(), egui::FontId::proportional(13.0), accent);
+    let pad = egui::vec2(10.0, 4.0);
+    let tri = 11.0;
+    let gap = 6.0;
+    let size = egui::vec2(
+        pad.x * 2.0 + tri + gap + galley.size().x,
+        (pad.y * 2.0 + galley.size().y).max(pad.y * 2.0 + tri),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            6.0,
+            if resp.hovered() {
+                egui::Color32::from_rgb(0x25, 0x38, 0x2E)
+            } else {
+                crate::theme::tab_active()
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.0, crate::theme::hairline()),
+            egui::StrokeKind::Middle,
+        );
+        crate::icons::play(
+            &painter,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + pad.x + tri * 0.5, rect.center().y),
+                egui::vec2(tri, tri),
+            ),
+            accent,
+        );
+        painter.galley(
+            egui::pos2(
+                rect.left() + pad.x + tri + gap,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            accent,
+        );
+    }
+    resp.on_hover_text("send `cargo run` to the terminal")
 }
 
 pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
@@ -448,38 +508,65 @@ impl Editor {
                                 .unwrap_or_default();
                             let label =
                                 if tab.dirty { format!("{name} *") } else { name.clone() };
-                            let pill = if idx == self.active {
-                                crate::theme::tab_active()
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
+                            let active = idx == self.active;
+                            // The pill itself is the highlight, so the label
+                            // must not draw egui's own selection background.
                             egui::Frame::NONE
-                                .fill(pill)
+                                .fill(if active {
+                                    crate::theme::tab_active()
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .stroke(if active {
+                                    egui::Stroke::new(1.0, crate::theme::hairline())
+                                } else {
+                                    egui::Stroke::NONE
+                                })
                                 .corner_radius(6.0)
-                                .inner_margin(egui::Margin::symmetric(6, 2))
+                                .inner_margin(egui::Margin::symmetric(6, 3))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         tab_badge(ui, &name);
+                                        let text = egui::RichText::new(label).size(12.5).color(
+                                            if active {
+                                                crate::theme::text()
+                                            } else {
+                                                crate::theme::dim_text()
+                                            },
+                                        );
                                         if ui
-                                            .selectable_label(idx == self.active, label)
+                                            .add(egui::Label::new(text).sense(egui::Sense::click()))
                                             .clicked()
                                         {
                                             self.active = idx;
                                             tab_switched = true;
                                         }
-                                        if ui.small_button("x").clicked() {
+                                        if crate::icons::icon_button(
+                                            ui,
+                                            16.0,
+                                            "close tab",
+                                            crate::icons::close_x,
+                                        )
+                                        .clicked()
+                                        {
                                             close_idx = Some(idx);
                                         }
                                     });
                                 });
                         }
                         if self.tabs.is_empty() {
-                            let _ =
-                                ui.selectable_label(true, "no file — open one in Explorer");
-                        } else if ui.small_button("+").clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .set_directory(workdir)
-                                .pick_file()
+                            ui.label(
+                                egui::RichText::new("no file — open one in Explorer")
+                                    .size(12.5)
+                                    .color(crate::theme::faint()),
+                            );
+                        }
+                        if crate::icons::icon_button(ui, 20.0, "open file", |p, r, c| {
+                            crate::icons::plus(p, r, c)
+                        })
+                        .clicked()
+                            && let Some(path) =
+                                rfd::FileDialog::new().set_directory(workdir).pick_file()
                         {
                             self.open_file(path);
                             tab_switched = true;
@@ -487,11 +574,7 @@ impl Editor {
                     });
                 });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(egui::RichText::new("Run").color(crate::theme::accent()).strong())
-                    .on_hover_text("send `cargo run` to the terminal")
-                    .clicked()
-                {
+                if run_button(ui).clicked() {
                     self.want_run = true;
                 }
             });
@@ -509,13 +592,16 @@ impl Editor {
         ui.separator();
 
         if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(0xE0, 0x6C, 0x75), err);
+            ui.colored_label(crate::theme::danger(), err);
         }
 
         if self.tabs.is_empty() {
             self.find_open = false;
+            // Fill the column: a content-sized scroll area would let the
+            // editor collapse and drag the split divider up with it.
             egui::ScrollArea::both()
                 .id_salt("snor_editor_empty")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.monospace("// open a file from Explorer to edit.");
                     ui.monospace("// tabs + tree-sitter highlight + Ctrl+S to save.");
@@ -645,17 +731,26 @@ impl Editor {
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     if line_count <= 6000 {
-                        ui.scope(|ui| {
-                            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
-                            let mono = egui::FontId::monospace(13.0);
-                            for n in 1..=line_count {
-                                ui.label(
-                                    egui::RichText::new(format!("{n:>4} "))
-                                        .font(mono.clone())
-                                        .color(crate::theme::faint()),
-                                );
-                            }
-                        });
+                        // Must be an explicit vertical layout: `ui.scope` would
+                        // inherit the enclosing `horizontal_top`, and the whole
+                        // gutter would run off to the right, taking the code
+                        // with it.
+                        ui.scope_builder(
+                            egui::UiBuilder::new().layout(egui::Layout::top_down(
+                                egui::Align::LEFT,
+                            )),
+                            |ui| {
+                                ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+                                let mono = egui::FontId::monospace(13.0);
+                                for n in 1..=line_count {
+                                    ui.label(
+                                        egui::RichText::new(format!("{n:>4} "))
+                                            .font(mono.clone())
+                                            .color(crate::theme::faint()),
+                                    );
+                                }
+                            },
+                        );
                         ui.separator();
                     }
                     egui::ScrollArea::horizontal()
