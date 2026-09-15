@@ -1,0 +1,6 @@
+/target
+/session.json
+*.orig
+*.bk
+.DS_Store
+Thumbs.db
