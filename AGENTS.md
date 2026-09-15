@@ -75,24 +75,45 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
   shell still answers prompts and still writes to its pty; leaving its channel
   unread grows it without bound. This is verified live: `ping -n 8` started in
   one tab, switched away from, then revisited, shows all eight replies.
-- **The last tab cannot be closed** (`close_tab` refuses at `len() <= 1`). An
-  empty terminal panel would need its own empty state, and the whole input
-  design assumes there is a shell to talk to. Restarting a wedged shell is what
-  the refresh button is for.
+- **The last tab *can* be closed.** That empties `sessions` and sets
+  `hidden`, which takes the whole terminal section away — there is deliberately
+  no "a shell must always exist" rule. `Terminal::reveal(cwd)` is the way back:
+  it un-hides and spawns a fresh shell if the list is empty. Ctrl+Tab, the
+  status-bar toggle and the Run button all go through it, because each of them
+  wants a terminal and cannot assume one exists. Guarded by test
+  `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`.
+- **`sessions` may be empty, so `session()`/`session_mut()` return `Option`.**
+  Every access is guarded; `ui()` also returns early on an empty list so no
+  call path can index it. Do not reintroduce a bare `self.sessions[i]`.
 - **`close_tab` clamps `active_tab`** rather than recomputing it, so closing a
   tab *before* the active one keeps the same shell selected. Guarded by test
   `closing_an_earlier_tab_keeps_the_same_shell_selected`.
-- **Tab labels count shells ever spawned, not tabs open** (`shell_title(n)`,
-  numbering from 2 so a lone tab never reads "powershell 1"). Reusing a number
-  would put two identical labels on screen at once. Guarded by test
-  `tab_numbers_are_not_reused`.
+- **Tab labels take the lowest free number** (`next_free_title`), numbered from
+  2 so a lone tab never reads "powershell 1". Deliberately *not* a monotonic
+  counter: that produced "powershell 6", "powershell 7" after the panel had
+  been emptied and reopened, a sequence depending on history the user cannot
+  see. Emptying the panel restarts the sequence at "powershell". Guarded by
+  test `tab_numbers_take_the_lowest_free_slot`.
 - **The tab strip is a bounded `ScrollArea`** (`max_width` less
   `TERM_HDR_RIGHT_W`), because it shares its line with the right-hand controls:
   an unbounded scroll area claims the whole line and pushes them off it.
+- **The "+" button lives *outside* the `ScrollArea`.** Inside it, the button is
+  laid out after the last pill, so once there are more tabs than fit it scrolls
+  off with them and there is no longer any way to open another shell. Verified
+  at 10 tabs: the strip scrolls, the "+" stays at 1293.6pt, and the right-hand
+  cluster holds 1517.6pt.
+- **`reveal_active_tab` scrolls the active pill into view** — but only on the
+  frame after the selection changed, then it is cleared. Doing it every frame
+  would pin the strip and stop the user scrolling it by hand. Without it, a
+  shell opened on a full strip appears clipped at the edge.
 - **Mutations are deferred.** The strip's closure cannot hold `&mut self` while
   iterating `self.sessions`, so clicks record `switch_to` / `close_tab` /
   `open_tab` locals that are applied after the closure returns.
 - `new_tab` clears `collapsed` — a new shell you cannot see is not a new shell.
+- **The collapse toggle is a chevron in the right-hand cluster**, not a
+  `plus`/`minus` beside the tab strip. There it sat next to the "+", and while
+  collapsed it drew a "+" of its own, so the header showed two identical plus
+  glyphs side by side. See `icons::chevron_v`.
 
 ## Editor gotchas
 
@@ -140,15 +161,17 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
 
 ## Tests
 
-- `cargo test` must stay green (21 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (22 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
-  tests, the four terminal-tab tests (`tabs_spawn_switch_and_refuse_to_empty_the_panel`,
-  `closing_an_earlier_tab_keeps_the_same_shell_selected`, `tab_numbers_are_not_reused`),
-  and `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
+  tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
+  `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
+  `closing_an_earlier_tab_keeps_the_same_shell_selected`,
+  `tab_numbers_take_the_lowest_free_slot`), and
+  `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
 - Tab bookkeeping is tested through `Terminal::open_stub_tab` (a `#[cfg(test)]`
   twin of `new_tab` minus the pty) so the tests stay hermetic. It shares
-  `shell_title` with the real path, so a numbering change cannot pass the
+  `next_free_title` with the real path, so a numbering change cannot pass the
   tests while breaking the app.
 - GUI behavior itself (clicks, drags, pixels) cannot be verified headlessly:
   after UI changes, rebuild, relaunch, and have a human confirm with a
@@ -156,9 +179,18 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
 - `.workbuddy-ai/tools/snor_ui_probe.py` drives the real window through
   user32: `info`, `shot`, `click`, `move`, `drag`, `place`, `maximize`, `type`,
   `key`. Coordinates are egui points relative to the client area.
-  `.workbuddy-ai/tools/tab_bbox.py` reports the tab strip's ink bounding boxes
+  `key` accepts chords (`ctrl+tab`, `ctrl+b`) and holds the modifiers down
+  around the key — egui reads modifier state from the event itself, so sending
+  them as separate presses arrives as a bare key.
+- `.workbuddy-ai/tools/tab_bbox.py` reports the terminal tab strip's ink boxes
   in points, which is how click targets are aimed instead of guessed — a click
-  that misses by a few points reads as "the feature is broken".
+  that misses by a few points reads as "the feature is broken". Two traps it
+  handles: the explorer tree shares the header's rows to the left, and the
+  separator rule under the header out-inks the text row, so a naive
+  densest-row search locks onto the rule.
+- `.workbuddy-ai/tools/many_tabs.py` adds tabs one at a time and reports where
+  the "+" and the right-hand cluster actually are, which is how the overflow
+  behaviour above was measured.
 
 ## Conventions
 

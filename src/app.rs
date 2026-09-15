@@ -424,7 +424,14 @@ impl SnorApp {
                     })
                     .clicked()
                     {
-                        self.terminal.hidden = !self.terminal.hidden;
+                        // Closing the last terminal tab removes the section
+                        // entirely, so un-hiding has to ask for a shell rather
+                        // than just flipping a flag.
+                        if self.terminal.hidden {
+                            self.terminal.reveal(&self.tree.root);
+                        } else {
+                            self.terminal.hidden = true;
+                        }
                     }
                     ui.add_space(STATUS_GAP);
                     // The reference spreads the readouts out rather than
@@ -603,7 +610,7 @@ impl eframe::App for SnorApp {
             self.editor.open_file(opened);
         }
         if std::mem::take(&mut self.editor.want_run) {
-            self.terminal.send_line("cargo run");
+            self.terminal.send_line("cargo run", &self.tree.root);
         }
 
         if ui.input_mut(|i| {
@@ -612,9 +619,13 @@ impl eframe::App for SnorApp {
                 egui::Key::Tab,
             ))
         }) {
-            self.terminal.hidden = !self.terminal.hidden;
-            if !self.terminal.hidden {
-                self.terminal.collapsed = false;
+            // Ctrl+Tab is the way back from an emptied panel: closing the last
+            // tab takes the whole section away, and this brings it back with a
+            // fresh shell rather than an empty strip.
+            if self.terminal.hidden {
+                self.terminal.reveal(&self.tree.root);
+            } else {
+                self.terminal.hidden = true;
             }
         }
         if ui.input_mut(|i| {

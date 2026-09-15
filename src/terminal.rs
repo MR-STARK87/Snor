@@ -7,11 +7,11 @@ const ROWS: u16 = 24;
 const COLS: u16 = 80;
 const SCROLLBACK: usize = 1000;
 
-/// Width reserved on the right of the terminal header for the shell pill and
-/// the three icon buttons, so the tab strip can be bounded and leave them on
-/// the same line. Measured off a live capture: the pill inks 55pt and the
-/// three 20pt buttons plus their spacing come to about 100pt.
-const TERM_HDR_RIGHT_W: f32 = 190.0;
+/// Width reserved on the right of the terminal header for the status hint and
+/// the icon cluster, so the tab strip can be bounded and leave them on the
+/// same line. Measured off a live capture: the shell pill inks 58pt, the four
+/// 20pt buttons plus their spacing about 110pt, and "click to type" 68pt.
+const TERM_HDR_RIGHT_W: f32 = 250.0;
 
 /// Tab label for the n-th shell ever spawned.
 ///
@@ -203,12 +203,10 @@ impl Session {
 
 pub struct Terminal {
     sessions: Vec<Session>,
-    /// Index into `sessions`. Never out of range: closing the last tab is
-    /// refused, so there is always at least one.
+    /// Index into `sessions`. Meaningless while `sessions` is empty — closing
+    /// the last tab takes the whole section away — so every access goes
+    /// through `session()`/`session_mut()`, which are `Option`.
     active_tab: usize,
-    /// Counts shells ever spawned rather than tabs currently open, so titles
-    /// stay stable as tabs are closed and reopened.
-    spawned: usize,
     pub collapsed: bool,
     pub fullscreen: bool,
     /// Click-to-type latch: set when the terminal grid is clicked, cleared
@@ -227,6 +225,12 @@ pub struct Terminal {
     /// explicit focus grab (click, Ctrl+F) apart from egui's Tab focus
     /// theft, which must be handed back so shell completion keeps working.
     focus_clear: bool,
+    /// One-shot: scroll the tab strip so the active pill is visible.
+    ///
+    /// Set when the active tab changes (a new shell, or a click on another
+    /// pill) and cleared the next frame. Doing it every frame instead would
+    /// pin the strip and stop the user scrolling it by hand.
+    reveal_active_tab: bool,
 }
 
 impl Terminal {
@@ -234,20 +238,37 @@ impl Terminal {
         Self {
             sessions: vec![Session::new(shell_title(1))],
             active_tab: 0,
-            spawned: 1,
             collapsed: false,
             fullscreen: false,
             active: false,
             hidden: false,
             term_h: 280.0,
             focus_clear: true,
+            reveal_active_tab: false,
+        }
+    }
+
+    /// Title for the next shell: the lowest number not already on screen.
+    ///
+    /// Deliberately not a monotonic counter. That read badly the moment tabs
+    /// were closed: emptying the panel and opening a shell again produced
+    /// "powershell 6", "powershell 7" and so on, a sequence that depends on
+    /// history the user cannot see. Counting the free slot instead keeps the
+    /// labels unique and restarts at "powershell" once the panel is empty.
+    fn next_free_title(&self) -> String {
+        let mut n = 1;
+        loop {
+            let candidate = shell_title(n);
+            if !self.sessions.iter().any(|s| s.title == candidate) {
+                return candidate;
+            }
+            n += 1;
         }
     }
 
     /// Open another shell and switch to it.
     fn new_tab(&mut self, cwd: &PathBuf) {
-        self.spawned += 1;
-        let mut session = Session::new(shell_title(self.spawned));
+        let mut session = Session::new(self.next_free_title());
         session.started = true;
         session.spawn(cwd);
         self.sessions.push(session);
@@ -255,39 +276,62 @@ impl Terminal {
         self.active = true;
         // A new shell you cannot see is not a new shell.
         self.collapsed = false;
+        self.reveal_active_tab = true;
     }
 
     /// Append a shell without opening a real pty, so the tab bookkeeping can
     /// be tested hermetically. Everything except the `spawn` call is the same
-    /// as `new_tab`, and the title comes from the same `shell_title`, so a
+    /// as `new_tab`, and the title comes from the same `next_free_title`, so a
     /// numbering change cannot pass the tests while breaking the app.
     #[cfg(test)]
     fn open_stub_tab(&mut self) {
-        self.spawned += 1;
-        self.sessions.push(Session::new(shell_title(self.spawned)));
+        self.sessions.push(Session::new(self.next_free_title()));
         self.active_tab = self.sessions.len() - 1;
         self.active = true;
         self.collapsed = false;
+        self.reveal_active_tab = true;
     }
 
     /// Close a tab.
     ///
-    /// The last one is refused: an empty terminal panel would need its own
-    /// empty state, and the whole feature is built on there being a shell to
-    /// talk to. Restarting a wedged shell is what the refresh button is for.
+    /// The last one may be closed. That empties the panel and takes the whole
+    /// terminal section away (`hidden`); `reveal` brings it back with a fresh
+    /// shell. There is no "a shell must always exist" rule on purpose — the
+    /// terminal is optional, and Ctrl+Tab is how it comes back.
     fn close_tab(&mut self, index: usize) {
-        if self.sessions.len() <= 1 || index >= self.sessions.len() {
+        if index >= self.sessions.len() {
             return;
         }
         self.sessions.remove(index);
+        if self.sessions.is_empty() {
+            self.active_tab = 0;
+            self.active = false;
+            self.hidden = true;
+            return;
+        }
         self.active_tab = self.active_tab.min(self.sessions.len() - 1);
+    }
+
+    /// Bring the panel back with a shell in it.
+    ///
+    /// Closing the last tab takes the section away, so anything that wants a
+    /// terminal — Ctrl+Tab, the status-bar toggle, the Run button — has to be
+    /// able to ask for one rather than assume it exists.
+    pub fn reveal(&mut self, cwd: &PathBuf) {
+        self.hidden = false;
+        self.collapsed = false;
+        if self.sessions.is_empty() {
+            self.new_tab(cwd);
+        }
     }
 
     pub fn ensure_started(&mut self, cwd: &PathBuf) {
         let i = self.active_tab;
-        if !self.sessions[i].started {
-            self.sessions[i].started = true;
-            self.sessions[i].spawn(cwd);
+        if let Some(session) = self.sessions.get_mut(i)
+            && !session.started
+        {
+            session.started = true;
+            session.spawn(cwd);
         }
     }
 
@@ -377,24 +421,30 @@ impl Session {
 }
 
 impl Terminal {
-    fn session(&self) -> &Session {
-        &self.sessions[self.active_tab]
+    fn session(&self) -> Option<&Session> {
+        self.sessions.get(self.active_tab)
     }
 
-    fn session_mut(&mut self) -> &mut Session {
-        &mut self.sessions[self.active_tab]
+    fn session_mut(&mut self) -> Option<&mut Session> {
+        self.sessions.get_mut(self.active_tab)
     }
 
     /// Forward bytes to the active shell.
     fn send_bytes(&mut self, bytes: &[u8]) {
-        self.session_mut().send_bytes(bytes);
+        if let Some(session) = self.session_mut() {
+            session.send_bytes(bytes);
+        }
     }
 
     /// Send a full shell line (used by the editor Run button).
     ///
     /// Goes to the active shell: that is the one whose output the user is
-    /// watching, and the one the Run button's result should land in.
-    pub fn send_line(&mut self, line: &str) {
+    /// watching, and the one the Run button's result should land in. Spawns a
+    /// shell first if the panel was emptied, so Run always has somewhere to go.
+    pub fn send_line(&mut self, line: &str, cwd: &PathBuf) {
+        if self.sessions.is_empty() {
+            self.new_tab(cwd);
+        }
         if self.collapsed {
             self.collapsed = false;
         }
@@ -403,7 +453,7 @@ impl Terminal {
         if !s.ends_with('\r') && !s.ends_with('\n') {
             s.push('\r');
         }
-        self.session_mut().send_bytes(s.as_bytes());
+        self.send_bytes(s.as_bytes());
     }
 
     /// Map a pressed key to pty bytes. Returns None to leave the event alone
@@ -552,6 +602,12 @@ impl Session {
 
 impl Terminal {
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, cwd: &PathBuf) {
+        // Closing the last tab takes the section away entirely, and `hidden`
+        // is what stops `ui()` being called — but guard here too, so no future
+        // call path can index an empty session list.
+        if self.sessions.is_empty() {
+            return;
+        }
         self.ensure_started(cwd);
         self.poll();
 
@@ -564,8 +620,8 @@ impl Terminal {
         // short titles per frame is cheaper than restructuring around it.
         let titles: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
         let active_tab = self.active_tab;
-        let running = self.session().running;
-        let error = self.session().error.clone();
+        let error = self.session().and_then(|s| s.error.clone());
+        let reveal_active_tab = self.reveal_active_tab;
 
         let mut switch_to: Option<usize> = None;
         let mut close_tab: Option<usize> = None;
@@ -588,7 +644,7 @@ impl Terminal {
                     ui.horizontal(|ui| {
                         for (idx, title) in titles.iter().enumerate() {
                             let active = idx == active_tab;
-                            eframe::egui::Frame::NONE
+                            let pill = eframe::egui::Frame::NONE
                                 .fill(if active {
                                     crate::theme::tab_active()
                                 } else {
@@ -637,20 +693,35 @@ impl Terminal {
                                         }
                                     });
                                 });
-                        }
-                        if crate::icons::icon_button(ui, 20.0, "new terminal", crate::icons::plus)
-                            .clicked()
-                        {
-                            open_tab = true;
+                            // Bring the active pill into view when the
+                            // selection changed. Without this, opening a shell
+                            // on a strip that is already full leaves the new
+                            // tab clipped at the edge, so the shell you just
+                            // asked for is the one you cannot see.
+                            if active && reveal_active_tab {
+                                pill.response
+                                    .scroll_to_me(Some(eframe::egui::Align::Center));
+                            }
                         }
                     });
                 });
+            // One-shot: consumed, so the strip is free to be scrolled by hand
+            // from the next frame on.
+            self.reveal_active_tab = false;
+            // Outside the scroll area on purpose. Inside it, the "+" is laid
+            // out after the last pill, so once there are more tabs than fit it
+            // scrolls off the strip along with them and there is no longer any
+            // way to open another one.
+            if crate::icons::icon_button(ui, 20.0, "new terminal", crate::icons::plus).clicked() {
+                open_tab = true;
+            }
 
             // Applied after the strip is built, so the list is not mutated
             // while it is being iterated.
             if let Some(i) = switch_to {
                 self.active_tab = i;
                 self.active = true;
+                self.reveal_active_tab = true;
             }
             if let Some(i) = close_tab {
                 self.close_tab(i);
@@ -659,27 +730,6 @@ impl Terminal {
                 self.new_tab(cwd);
             }
 
-            let collapse = if self.collapsed {
-                crate::icons::icon_button(ui, 20.0, "expand", |p, r, c| {
-                    crate::icons::plus(p, r, c)
-                })
-            } else {
-                crate::icons::icon_button(ui, 20.0, "collapse", |p, r, c| {
-                    crate::icons::minus(p, r, c)
-                })
-            };
-            if collapse.clicked() {
-                self.collapsed = !self.collapsed;
-            }
-            ui.label(
-                eframe::egui::RichText::new(if running {
-                    "powershell.exe"
-                } else {
-                    "stopped"
-                })
-                .size(11.5)
-                .color(crate::theme::faint()),
-            );
             if is_active {
                 ui.label(eframe::egui::RichText::new("●").size(11.5).color(accent));
             } else {
@@ -696,8 +746,9 @@ impl Terminal {
                         crate::icons::trash(p, r, c)
                     })
                     .clicked()
+                        && let Some(session) = self.session_mut()
                     {
-                        self.session_mut().parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                        session.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                     }
                     let fullscreen = self.fullscreen;
                     if crate::icons::icon_button(
@@ -708,7 +759,8 @@ impl Terminal {
                         } else {
                             "maximize terminal"
                         },
-                        |p, r, c| crate::icons::maximize(p, r, c, fullscreen),                    )
+                        |p, r, c| crate::icons::maximize(p, r, c, fullscreen),
+                    )
                     .clicked()
                     {
                         self.fullscreen = !self.fullscreen;
@@ -726,14 +778,15 @@ impl Terminal {
                     {
                         // Restart this shell only. The other tabs keep their
                         // own ptys and their own scrollback.
-                        let session = self.session_mut();
-                        session.started = false;
-                        session.rx = None;
-                        session.writer = None;
-                        session._child = None;
-                        session._master = None;
-                        session.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
-                        session.error = None;
+                        if let Some(session) = self.session_mut() {
+                            session.started = false;
+                            session.rx = None;
+                            session.writer = None;
+                            session._child = None;
+                            session._master = None;
+                            session.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
+                            session.error = None;
+                        }
                         self.ensure_started(cwd);
                     }
                     // Shell picker look, like the reference (single shell).
@@ -749,6 +802,29 @@ impl Terminal {
                                     .color(crate::theme::dim_text()),
                             );
                         });
+                    // Collapse / expand.
+                    //
+                    // Lives here, not beside the tab strip's "+": the two were
+                    // adjacent, and while the panel was collapsed the toggle
+                    // drew a "+" of its own, so the header showed two identical
+                    // plus glyphs side by side. A chevron also states what the
+                    // control does — it moves the panel edge — where a plus
+                    // read as "add", which is the neighbouring button's job.
+                    let collapsed = self.collapsed;
+                    if crate::icons::icon_button(
+                        ui,
+                        20.0,
+                        if collapsed {
+                            "expand terminal"
+                        } else {
+                            "collapse terminal"
+                        },
+                        |p, r, c| crate::icons::chevron_v(p, r.shrink(5.0), !collapsed, c),
+                    )
+                    .clicked()
+                    {
+                        self.collapsed = !self.collapsed;
+                    }
                 },
             );
         });
@@ -763,7 +839,10 @@ impl Terminal {
 
         ui.separator();
 
-        let job = term_job(self.session().parser.screen());
+        let job = match self.session() {
+            Some(session) => term_job(session.parser.screen()),
+            None => return,
+        };
         // No input widget at all: the grid itself is the click-to-type area.
         // `active` latches on grid click. Forwarding is additionally gated on
         // no other widget holding keyboard focus, so keystrokes never leak
@@ -881,7 +960,7 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::Terminal;
+    use super::{Session, Terminal};
     use eframe::egui::{Key, Modifiers};
 
     #[test]
@@ -934,52 +1013,72 @@ mod tests {
     #[test]
     fn query_responder_handles_split_sequences() {
         let mut t = Terminal::new();
-        t.session_mut().respond_to_queries(b"\x1b[");
+        sm(&mut t).respond_to_queries(b"\x1b[");
         assert!(
-            !t.session().inq.is_empty(),
+            !s(&t).inq.is_empty(),
             "partial sequence must be kept"
         );
-        t.session_mut().respond_to_queries(b"6n");
-        t.session_mut().respond_to_queries(b"\x1b[?2026$p");
-        t.session_mut().respond_to_queries(b"\x1b[c");
-        t.session_mut()
-            .respond_to_queries(b"plain text without escapes");
-        assert!(t.session().inq.len() <= 64);
+        sm(&mut t).respond_to_queries(b"6n");
+        sm(&mut t).respond_to_queries(b"\x1b[?2026$p");
+        sm(&mut t).respond_to_queries(b"\x1b[c");
+        sm(&mut t).respond_to_queries(b"plain text without escapes");
+        assert!(s(&t).inq.len() <= 64);
     }
 
-    /// The whole point of the refactor: tabs are independent, and the last
-    /// one cannot be closed out from under the panel.
+    /// The active shell, for tests where "there is a shell" is the invariant.
+    /// `session()` itself is `Option` because the panel can be emptied.
+    fn s(t: &Terminal) -> &Session {
+        t.session().expect("test expects a live session")
+    }
+
+    fn sm(t: &mut Terminal) -> &mut Session {
+        t.session_mut().expect("test expects a live session")
+    }
+
+    /// Tabs are independent, and switching reads each shell's own screen.
     #[test]
-    fn tabs_spawn_switch_and_refuse_to_empty_the_panel() {
+    fn tabs_spawn_and_switch() {
         let mut t = Terminal::new();
         assert_eq!(t.sessions.len(), 1);
         assert_eq!(t.active_tab, 0);
-        assert_eq!(t.session().title, "powershell");
+        assert_eq!(s(&t).title, "powershell");
 
         // A second tab is titled "powershell 2", not "powershell 1", and
         // becomes active on creation.
         t.open_stub_tab();
         assert_eq!(t.sessions.len(), 2);
         assert_eq!(t.active_tab, 1);
-        assert_eq!(t.session().title, "powershell 2");
+        assert_eq!(s(&t).title, "powershell 2");
 
         // Switching back reads the first shell's own screen.
         t.active_tab = 0;
-        assert_eq!(t.session().title, "powershell");
+        assert_eq!(s(&t).title, "powershell");
+    }
 
-        // Closing the active tab clamps the index back into range.
-        t.close_tab(1);
-        assert_eq!(t.sessions.len(), 1);
-        assert_eq!(t.active_tab, 0);
+    /// Closing the last tab takes the whole section away, and `reveal` brings
+    /// it back with a fresh shell. There is no "a shell must always exist"
+    /// rule — the terminal is optional.
+    #[test]
+    fn closing_the_last_tab_hides_the_panel_and_reveal_restores_it() {
+        let cwd = std::env::temp_dir();
+        let mut t = Terminal::new();
+        assert!(!t.hidden);
 
-        // The last tab survives a close attempt.
         t.close_tab(0);
-        assert_eq!(t.sessions.len(), 1, "the last shell must not be closable");
-        assert_eq!(t.active_tab, 0);
+        assert!(t.sessions.is_empty(), "the last shell must be closable");
+        assert!(t.hidden, "an empty terminal takes the section away");
+        assert!(!t.active, "no shell means nothing to type into");
+        assert!(t.session().is_none(), "no session to hand out");
 
-        // An out-of-range index is a no-op rather than a panic.
+        // An out-of-range index on an empty panel is a no-op, not a panic.
         t.close_tab(9);
-        assert_eq!(t.sessions.len(), 1);
+        assert!(t.sessions.is_empty());
+
+        t.reveal(&cwd);
+        assert!(!t.hidden);
+        assert!(!t.collapsed);
+        assert_eq!(t.sessions.len(), 1, "reveal must spawn a fresh shell");
+        assert_eq!(s(&t).title, "powershell", "and restart the numbering");
     }
 
     /// Closing a tab *before* the active one must not shift the selection
@@ -990,28 +1089,40 @@ mod tests {
         t.open_stub_tab();
         t.open_stub_tab();
         t.active_tab = 2;
-        assert_eq!(t.session().title, "powershell 3");
+        assert_eq!(s(&t).title, "powershell 3");
         t.close_tab(0);
         // Index 2 clamped to the new last index — the same shell, now at 1.
         assert_eq!(t.sessions.len(), 2);
-        assert_eq!(t.session().title, "powershell 3");
+        assert_eq!(s(&t).title, "powershell 3");
     }
 
-    /// Numbering counts shells spawned, not tabs open: reopening after a
-    /// close must not reissue a label that is still on screen.
+    /// Numbering takes the lowest free slot rather than counting ever upward.
+    /// A monotonic counter produced "powershell 6", "powershell 7" after the
+    /// panel had been emptied, a sequence the user cannot account for.
     #[test]
-    fn tab_numbers_are_not_reused() {
+    fn tab_numbers_take_the_lowest_free_slot() {
         let mut t = Terminal::new();
         t.open_stub_tab();
         t.open_stub_tab();
+        assert_eq!(titles(&t), ["powershell", "powershell 2", "powershell 3"]);
+
+        // Closing a middle tab frees its number for the next shell, and no
+        // label is ever duplicated.
         t.close_tab(1);
         t.open_stub_tab();
-        let titles: Vec<&str> = t.sessions.iter().map(|s| s.title.as_str()).collect();
-        assert_eq!(titles, ["powershell", "powershell 3", "powershell 4"]);
-        let mut sorted = titles.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), titles.len(), "tab labels must stay unique");
+        assert_eq!(titles(&t), ["powershell", "powershell 3", "powershell 2"]);
+
+        // Emptying the panel resets the sequence entirely.
+        for i in (0..t.sessions.len()).rev() {
+            t.close_tab(i);
+        }
+        assert!(t.sessions.is_empty());
+        t.open_stub_tab();
+        assert_eq!(titles(&t), ["powershell"], "numbering must restart");
+    }
+
+    fn titles(t: &Terminal) -> Vec<&str> {
+        t.sessions.iter().map(|s| s.title.as_str()).collect()
     }
 
     fn headless_raw() -> eframe::egui::RawInput {
@@ -1085,20 +1196,14 @@ mod tests {
         let mut t = Terminal::new();
         t.ensure_started(&std::env::temp_dir());
         let t0 = Instant::now();
-        while t.session().total_bytes == 0
-            && t.session().error.is_none()
-            && t0.elapsed() < Duration::from_secs(10)
+        while s(&t).total_bytes == 0 && s(&t).error.is_none() && t0.elapsed() < Duration::from_secs(10)
         {
             std::thread::sleep(Duration::from_millis(50));
             t.poll();
         }
+        assert!(s(&t).error.is_none(), "pty spawn failed: {:?}", s(&t).error);
         assert!(
-            t.session().error.is_none(),
-            "pty spawn failed: {:?}",
-            t.session().error
-        );
-        assert!(
-            t.session().total_bytes > 0,
+            s(&t).total_bytes > 0,
             "powershell printed nothing in 10s; cannot verify input path"
         );
         t.send_bytes(b"echo SNORPTYOK123\r");
@@ -1107,7 +1212,7 @@ mod tests {
         while t1.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(50));
             t.poll();
-            if t.session().parser.screen().contents().contains("SNORPTYOK123") {
+            if s(&t).parser.screen().contents().contains("SNORPTYOK123") {
                 seen = true;
                 break;
             }

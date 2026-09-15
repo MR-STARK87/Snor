@@ -13,8 +13,7 @@ Subcommands:
     place cw ch sx sy    resize+move the window (physical px)
     maximize             fill the monitor work area
     type <text>          type text into the focused window (unicode)
-    key <name>           press one named key: enter tab esc up down left right
-                         backspace delete space home end
+    key <name>           press one key, optionally chorded: enter, ctrl+tab, ctrl+b
 
 All coordinates are egui points relative to the client area's top-left corner.
 The script converts them to physical screen pixels using the window's DPI.
@@ -138,14 +137,28 @@ def press_unicode(ch):
 
 def press_vk(vk):
     """Press and release a virtual key."""
-    for flags in (0, KEYEVENTF_KEYUP):
-        _send(
-            INPUT(
-                type=INPUT_KEYBOARD,
-                u=INPUTUNION(ki=KEYBDINPUT(vk, 0, flags, 0, None)),
-            )
+    press_vk_down(vk)
+    press_vk_up(vk)
+
+
+def press_vk_down(vk):
+    _send(
+        INPUT(
+            type=INPUT_KEYBOARD,
+            u=INPUTUNION(ki=KEYBDINPUT(vk, 0, 0, 0, None)),
         )
-        time.sleep(0.012)
+    )
+    time.sleep(0.012)
+
+
+def press_vk_up(vk):
+    _send(
+        INPUT(
+            type=INPUT_KEYBOARD,
+            u=INPUTUNION(ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None)),
+        )
+    )
+    time.sleep(0.012)
 
 
 def cmd_type(hwnd, text):
@@ -155,12 +168,33 @@ def cmd_type(hwnd, text):
     time.sleep(0.10)
 
 
+VK_MOD = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12}
+
+
 def cmd_key(hwnd, name):
+    """Press a key, optionally with modifiers: `enter`, `ctrl+tab`, `ctrl+b`.
+
+    Modifiers are held down around the key so the app sees a real chord. Sending
+    them as separate presses does not work: egui reads modifier state from the
+    key event itself, so an unheld Ctrl arrives as a bare key.
+    """
     focus(hwnd)
-    if name not in VK:
-        raise SystemExit(f"unknown key {name!r}; known: {', '.join(sorted(VK))}")
-    press_vk(VK[name])
-    time.sleep(0.10)
+    parts = [p.strip().lower() for p in name.split("+") if p.strip()]
+    if not parts:
+        raise SystemExit("empty key")
+    mods = [p for p in parts[:-1] if p in VK_MOD]
+    unknown = [p for p in parts[:-1] if p not in VK_MOD]
+    if unknown:
+        raise SystemExit(f"unknown modifier(s) {unknown}; known: {', '.join(VK_MOD)}")
+    key = parts[-1]
+    if key not in VK:
+        raise SystemExit(f"unknown key {key!r}; known: {', '.join(sorted(VK))}")
+    for m in mods:
+        press_vk_down(VK_MOD[m])
+    press_vk(VK[key])
+    for m in reversed(mods):
+        press_vk_up(VK_MOD[m])
+    time.sleep(0.12)
 
 
 def find_window(title_part="Snor"):

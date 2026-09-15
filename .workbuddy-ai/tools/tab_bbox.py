@@ -42,10 +42,16 @@ def count(y):
     return sum(1 for x in range(x_start, W, 2) if luma(x, y) > THRESH)
 
 
-lo = max(0, y_hint - 40)
-hi = min(H, y_hint + 40)
+lo = max(0, y_hint - 16)
+hi = min(H, y_hint + 16)
 counts = {y: count(y) for y in range(lo, hi)}
-peak_y = max(counts, key=lambda y: counts[y])
+sampled = len(range(x_start, W, 2))
+# A full-width rule (the separator under the header) out-inks the text row and
+# would be picked as the peak, so drop rows that span most of the scan width.
+text_rows = [y for y in counts if counts[y] <= sampled * 0.5]
+if not text_rows:
+    raise SystemExit("no text row near the header hint in the terminal column")
+peak_y = max(text_rows, key=lambda y: counts[y])
 peak = counts[peak_y]
 if peak <= 3:
     raise SystemExit("no ink near the header hint in the terminal column")

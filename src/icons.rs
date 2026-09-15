@@ -211,6 +211,24 @@ pub fn plus(painter: &Painter, rect: Rect, color: Color32) {
     painter.add(Shape::line(vec![pos2(c.x, r.top()), pos2(c.x, r.bottom())], stroke));
 }
 
+/// Vertical chevron: points down when `down`, up otherwise.
+///
+/// The terminal's collapse toggle used to be `plus`/`minus`, which put a second
+/// "+" on the header line whenever the panel was collapsed and read as a second
+/// "new terminal" button. A direction is also the honest signal here: the
+/// control moves the panel edge, it does not add or remove anything.
+pub fn chevron_v(painter: &Painter, rect: Rect, down: bool, color: Color32) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.5;
+    let sign = if down { 1.0 } else { -1.0 };
+    let pts = vec![
+        pos2(c.x - s * 0.72, c.y - sign * s * 0.34),
+        pos2(c.x, c.y + sign * s * 0.34),
+        pos2(c.x + s * 0.72, c.y - sign * s * 0.34),
+    ];
+    painter.add(Shape::line(pts, Stroke::new(1.4, color)));
+}
+
 pub fn minus(painter: &Painter, rect: Rect, color: Color32) {
     let r = rect.shrink(rect.width() * 0.3);
     let c = r.center();
