@@ -5,6 +5,139 @@ use std::sync::mpsc::{Receiver, Sender};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
+const SCROLLBACK: usize = 1000;
+
+fn vt_color(c: vt100::Color, is_bg: bool) -> eframe::egui::Color32 {
+    use eframe::egui::Color32 as C;
+    match c {
+        vt100::Color::Default => {
+            if is_bg {
+                C::TRANSPARENT
+            } else {
+                C::from_rgb(0xD5, 0xDA, 0xE2)
+            }
+        }
+        vt100::Color::Rgb(r, g, b) => C::from_rgb(r, g, b),
+        vt100::Color::Idx(i) => match i {
+            0 => C::from_rgb(0x1E, 0x23, 0x2C),
+            1 => C::from_rgb(0xE0, 0x6C, 0x75),
+            2 => C::from_rgb(0x7D, 0xD3, 0xA8),
+            3 => C::from_rgb(0xE5, 0xC0, 0x7B),
+            4 => C::from_rgb(0x7A, 0xA2, 0xF7),
+            5 => C::from_rgb(0xC6, 0x78, 0xDD),
+            6 => C::from_rgb(0x56, 0xB6, 0xC2),
+            7 => C::from_rgb(0xAB, 0xB2, 0xBF),
+            8 => C::from_rgb(0x5C, 0x63, 0x70),
+            9 => C::from_rgb(0xE0, 0x6C, 0x75),
+            10 => C::from_rgb(0x98, 0xC3, 0x79),
+            11 => C::from_rgb(0xE5, 0xC0, 0x7B),
+            12 => C::from_rgb(0x61, 0xAF, 0xEF),
+            13 => C::from_rgb(0xC6, 0x78, 0xDD),
+            14 => C::from_rgb(0x56, 0xB6, 0xC2),
+            15 => C::from_rgb(0xFF, 0xFF, 0xFF),
+            16..=231 => {
+                let n = i - 16;
+                let r = (n / 36) % 6;
+                let g = (n / 6) % 6;
+                let b = n % 6;
+                let v = |x: u8| if x == 0 { 0 } else { 55 + 40 * x };
+                C::from_rgb(v(r), v(g), v(b))
+            }
+            _ => {
+                let v = 8 + 10 * (i - 232);
+                C::from_rgb(v, v, v)
+            }
+        },
+    }
+}
+
+fn term_job(screen: &vt100::Screen) -> eframe::egui::text::LayoutJob {
+    use eframe::egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let mono = eframe::egui::FontId::monospace(12.5);
+    let (cur_row, cur_col) = screen.cursor_position();
+    for row in 0..ROWS {
+        let mut run = String::new();
+        let mut run_fg = vt100::Color::Default;
+        let mut run_bg = vt100::Color::Default;
+        let mut run_bold = false;
+        let mut started = false;
+        let flush = |job: &mut LayoutJob,
+                     run: &mut String,
+                     fg: vt100::Color,
+                     bg: vt100::Color,
+                     bold: bool| {
+            if run.is_empty() {
+                return;
+            }
+            let mut color = vt_color(fg, false);
+            if bold && matches!(fg, vt100::Color::Default | vt100::Color::Idx(0..=7)) {
+                color = eframe::egui::Color32::WHITE;
+            }
+            job.append(
+                run.as_str(),
+                0.0,
+                TextFormat {
+                    font_id: mono.clone(),
+                    color,
+                    background: vt_color(bg, true),
+                    ..Default::default()
+                },
+            );
+            run.clear();
+        };
+        for col in 0..COLS {
+            let (mut fg, mut bg, mut bold, mut text) = match screen.cell(row, col) {
+                Some(cell) => (
+                    cell.fgcolor(),
+                    cell.bgcolor(),
+                    cell.bold(),
+                    cell.contents().to_string(),
+                ),
+                None => (
+                    vt100::Color::Default,
+                    vt100::Color::Default,
+                    false,
+                    " ".to_string(),
+                ),
+            };
+            if text.is_empty() {
+                text = " ".to_string();
+            }
+            if row == cur_row && col == cur_col {
+                bg = vt100::Color::Rgb(0x7D, 0xD3, 0xA8);
+                fg = vt100::Color::Rgb(0x10, 0x12, 0x17);
+                bold = false;
+            }
+            if !started {
+                run_fg = fg;
+                run_bg = bg;
+                run_bold = bold;
+                started = true;
+            }
+            if fg != run_fg || bg != run_bg || bold != run_bold {
+                flush(&mut job, &mut run, run_fg, run_bg, run_bold);
+                run_fg = fg;
+                run_bg = bg;
+                run_bold = bold;
+            }
+            run.push_str(&text);
+        }
+        flush(&mut job, &mut run, run_fg, run_bg, run_bold);
+        if row + 1 < ROWS {
+            job.append(
+                "\n",
+                0.0,
+                TextFormat {
+                    font_id: mono.clone(),
+                    color: eframe::egui::Color32::TRANSPARENT,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    job
+}
 
 pub struct Terminal {
     parser: vt100::Parser,
@@ -21,7 +154,7 @@ pub struct Terminal {
 impl Terminal {
     pub fn new() -> Self {
         Self {
-            parser: vt100::Parser::new(ROWS, COLS, 2000),
+            parser: vt100::Parser::new(ROWS, COLS, SCROLLBACK),
             rx: None,
             writer: None,
             _child: None,
@@ -147,7 +280,7 @@ impl Terminal {
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
                     if ui.small_button("clear").clicked() {
-                        self.parser = vt100::Parser::new(ROWS, COLS, 2000);
+                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                     }
                     if ui.small_button("Ctrl+C").clicked() {
                         self.send_bytes(&[0x03]);
@@ -158,7 +291,7 @@ impl Terminal {
                         self.writer = None;
                         self._child = None;
                         self._master = None;
-                        self.parser = vt100::Parser::new(ROWS, COLS, 2000);
+                        self.parser = vt100::Parser::new(ROWS, COLS, SCROLLBACK);
                         self.ensure_started(cwd);
                     }
                 },
@@ -171,12 +304,12 @@ impl Terminal {
 
         ui.separator();
 
-        let contents = self.parser.screen().contents();
+        let job = term_job(self.parser.screen());
         eframe::egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                ui.monospace(contents);
+                ui.add(eframe::egui::Label::new(job).extend());
             });
 
         ui.separator();

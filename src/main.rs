@@ -5,6 +5,7 @@ mod editor;
 mod file_tree;
 mod git;
 mod search;
+mod syntax;
 mod terminal;
 mod theme;
 

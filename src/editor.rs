@@ -394,7 +394,8 @@ impl Editor {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                    let mut job = highlight_job(text.as_str(), &lang);
+                    let mut job = crate::syntax::ts_job(text.as_str(), &lang)
+                        .unwrap_or_else(|| highlight_job(text.as_str(), &lang));
                     job.wrap.max_width = wrap_width;
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
