@@ -111,6 +111,7 @@ pub struct SnorApp {
 
 impl SnorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::fonts::install(&cc.egui_ctx);
         crate::theme::apply_dark(&cc.egui_ctx);
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let tree = FileTree::new(root);
@@ -164,7 +165,7 @@ impl SnorApp {
                 ui.label(
                     egui::RichText::new("Snor")
                         .size(18.8)
-                        .strong()
+                        .family(theme::medium())
                         .color(theme::accent()),
                 );
                 // The reference separates the product name from its tagline

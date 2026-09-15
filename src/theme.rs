@@ -46,6 +46,16 @@ pub fn accent() -> egui::Color32 {
     egui::Color32::from_rgb(0xBC, 0xDF, 0x9C)
 }
 
+/// The medium face, for the few places that want real weight rather than a
+/// brighter colour.
+///
+/// Not `RichText::strong()`: in egui that only swaps the colour for
+/// `strong_text_color()` and leaves the face alone, so a bold weight has to be
+/// asked for by family.
+pub fn medium() -> egui::FontFamily {
+    egui::FontFamily::Name(crate::fonts::MEDIUM.into())
+}
+
 /// Ink on top of a filled badge or an [`accent`] fill: the reference knocks
 /// the letter out of the fill rather than drawing it on the panel, so this is
 /// the *absence* of ink, not a highlight. Measured at (0, 1, 2) inside an

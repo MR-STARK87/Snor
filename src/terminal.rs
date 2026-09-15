@@ -441,7 +441,7 @@ impl Terminal {
                         ui.label(
                             eframe::egui::RichText::new(">_")
                                 .size(12.0)
-                                .strong()
+                                .family(crate::theme::medium())
                                 .color(accent),
                         );
                         ui.label(
