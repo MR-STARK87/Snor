@@ -151,6 +151,7 @@ pub struct Terminal {
     pub fullscreen: bool,
     pub total_bytes: u64,
     pub total_chunks: u64,
+    key_catcher: String,
     inq: Vec<u8>,
     started: bool,
 }
@@ -169,6 +170,7 @@ impl Terminal {
             fullscreen: false,
             total_bytes: 0,
             total_chunks: 0,
+            key_catcher: String::new(),
             inq: Vec::new(),
             started: false,
         }
@@ -332,7 +334,22 @@ impl Terminal {
                             replies.push(b"\x1b[0n".to_vec());
                         }
                         b'c' => {
-                            replies.push(b"\x1b[?62;c".to_vec());
+                            if params.first() == Some(&b'>') {
+                                replies.push(b"\x1b[>0;0;0c".to_vec());
+                            } else {
+                                replies.push(b"\x1b[?62;c".to_vec());
+                            }
+                        }
+                        // DECRQM (?mode$p): answer "not set" so the shell never
+                        // blocks waiting for a mode report.
+                        b'p' if params.first() == Some(&b'?') && params.last() == Some(&b'$') => {
+                            let mode = String::from_utf8_lossy(&params[1..params.len() - 1]);
+                            replies.push(format!("\x1b[?{mode};2$y").into_bytes());
+                        }
+                        // Kitty keyboard query (?u): report unsupported.
+                        // Plain `u` (restore cursor) needs no reply.
+                        b'u' if params.first() == Some(&b'?') => {
+                            replies.push(b"\x1b[?0u".to_vec());
                         }
                         _ => {}
                     }
@@ -374,16 +391,56 @@ impl Terminal {
         }
     }
 
+    /// Small vector-style maximize/restore icon (no font glyph needed).
+    fn maximize_icon(ui: &mut eframe::egui::Ui, fullscreen: bool) -> eframe::egui::Response {
+        use eframe::egui::{Sense, Stroke, vec2};
+        let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            if resp.hovered() {
+                painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+            }
+            let stroke = Stroke::new(1.5, ui.visuals().text_color());
+            if fullscreen {
+                painter.rect_stroke(
+                    eframe::egui::Rect::from_min_size(rect.min + vec2(7.0, 3.0), vec2(9.0, 9.0)),
+                    1.0,
+                    stroke,
+                    eframe::egui::StrokeKind::Middle,
+                );
+                painter.rect_stroke(
+                    eframe::egui::Rect::from_min_size(rect.min + vec2(3.0, 7.0), vec2(9.0, 9.0)),
+                    1.0,
+                    stroke,
+                    eframe::egui::StrokeKind::Middle,
+                );
+            } else {
+                painter.rect_stroke(
+                    eframe::egui::Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(12.0, 12.0)),
+                    1.0,
+                    stroke,
+                    eframe::egui::StrokeKind::Middle,
+                );
+            }
+        }
+        resp
+    }
+
     pub fn ui(&mut self, ui: &mut eframe::egui::Ui, cwd: &PathBuf) {
         self.ensure_started(cwd);
         self.poll();
 
-        let focus_id = ui.make_persistent_id("snor_term_focus");
-        let is_focused = ui.memory(|m| m.has_focus(focus_id));
+        let catcher_id = ui.make_persistent_id("snor_term_catcher");
+        let is_focused = ui.memory(|m| m.has_focus(catcher_id));
 
         ui.horizontal(|ui| {
-            if ui
-                .small_button(if self.fullscreen { "unmax" } else { "max" })
+            let max_resp = Self::maximize_icon(ui, self.fullscreen);
+            if max_resp
+                .on_hover_text(if self.fullscreen {
+                    "restore terminal"
+                } else {
+                    "maximize terminal"
+                })
                 .clicked()
             {
                 self.fullscreen = !self.fullscreen;
@@ -443,10 +500,8 @@ impl Terminal {
 
         ui.separator();
 
-        let focus_id = ui.make_persistent_id("snor_term_focus");
-
         let job = term_job(self.parser.screen());
-        let grid_max = (ui.available_height() - 12.0).max(60.0);
+        let grid_max = (ui.available_height() - 34.0).max(60.0);
         eframe::egui::ScrollArea::vertical()
             .id_salt("snor_term_grid")
             .max_height(grid_max)
@@ -458,38 +513,49 @@ impl Terminal {
                         .sense(eframe::egui::Sense::click()),
                 );
                 if resp.clicked() {
-                    ui.memory_mut(|m| m.request_focus(focus_id));
+                    ui.memory_mut(|m| m.request_focus(catcher_id));
                 }
             });
 
-        if ui.memory(|m| m.has_focus(focus_id)) {
+        // Special keys go straight to the pty (pre-consumed so the catcher
+        // TextEdit below never sees them). Printable text + paste arrive
+        // through the catcher, which uses TextEdit's proven input path.
+        if ui.memory(|m| m.has_focus(catcher_id)) {
             use eframe::egui::{Event, Key};
             let events = ui.input(|i| i.events.clone());
             for ev in &events {
-                match ev {
-                    Event::Text(text) => {
-                        self.send_bytes(text.as_bytes());
+                if let Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    // Never steal editor save / find.
+                    if matches!(key, Key::S | Key::F) && (modifiers.ctrl || modifiers.command) {
+                        continue;
                     }
-                    Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        // Never steal editor save.
-                        if *key == Key::S && (modifiers.ctrl || modifiers.command) {
-                            continue;
-                        }
-                        if let Some(bytes) = Self::key_to_bytes(*key, *modifiers) {
-                            self.send_bytes(bytes);
-                            ui.input_mut(|i| {
-                                i.consume_key(*modifiers, *key);
-                            });
-                        }
+                    if let Some(bytes) = Self::key_to_bytes(*key, *modifiers) {
+                        self.send_bytes(bytes);
+                        ui.input_mut(|i| {
+                            i.consume_key(*modifiers, *key);
+                        });
                     }
-                    _ => {}
                 }
             }
+        }
+
+        // Invisible-ish input catcher: collects printable chars (and paste)
+        // via TextEdit, flushes them to the pty every frame.
+        ui.add(
+            eframe::egui::TextEdit::singleline(&mut self.key_catcher)
+                .id(catcher_id)
+                .frame(eframe::egui::Frame::NONE)
+                .desired_width(1.0),
+        );
+        if !self.key_catcher.is_empty() {
+            let pending = std::mem::take(&mut self.key_catcher);
+            self.send_bytes(pending.as_bytes());
         }
     }
 }
@@ -550,7 +616,19 @@ mod tests {
             Terminal::key_to_bytes(Key::C, ctrl),
             Some([0x03].as_slice())
         );
-        // Plain letters travel via Text events, not keys.
+        // Plain letters travel via the catcher TextEdit, not keys.
         assert_eq!(Terminal::key_to_bytes(Key::A, Modifiers::NONE), None);
+    }
+
+    #[test]
+    fn query_responder_handles_split_sequences() {
+        let mut t = Terminal::new();
+        t.respond_to_queries(b"\x1b[");
+        assert!(!t.inq.is_empty(), "partial sequence must be kept");
+        t.respond_to_queries(b"6n");
+        t.respond_to_queries(b"\x1b[?2026$p");
+        t.respond_to_queries(b"\x1b[c");
+        t.respond_to_queries(b"plain text without escapes");
+        assert!(t.inq.len() <= 64);
     }
 }

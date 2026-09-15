@@ -329,9 +329,6 @@ impl FileTree {
                 let resp = ui.selectable_label(selected, &node.name);
                 if resp.clicked() {
                     self.selected = Some(node.path.clone());
-                }
-                if resp.double_clicked() {
-                    self.selected = Some(node.path.clone());
                     self.opened_file = Some(node.path.clone());
                 }
                 resp.context_menu(|ui| {
