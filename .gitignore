@@ -4,3 +4,10 @@
 *.bk
 .DS_Store
 Thumbs.db
+
+# Verification captures and agent bookkeeping: regenerated every iteration and
+# large (the screenshot set alone runs ~10MB), so they are not worth tracking.
+# The measurement scripts under .workbuddy-ai/tools ARE tracked -- AGENTS.md
+# points at them and they are the only way to verify GUI behavior.
+.workbuddy-ai/screenshots/
+.workbuddy-ai/memory/
