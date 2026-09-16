@@ -64,7 +64,15 @@ fn fill_stroke(painter: &Painter, points: Vec<Pos2>, fill: Color32, stroke: Stro
 ///
 /// Snorri's parts overlap, and filled shapes occlude each other the way
 /// painted art does — bare strokes would leave every hidden contour visible.
-pub fn blob(painter: &Painter, center: Pos2, rx: f32, ry: f32, rot: f32, fill: Color32, stroke: Stroke) {
+pub fn blob(
+    painter: &Painter,
+    center: Pos2,
+    rx: f32,
+    ry: f32,
+    rot: f32,
+    fill: Color32,
+    stroke: Stroke,
+) {
     fill_stroke(painter, ellipse_points(center, rx, ry, rot), fill, stroke);
 }
 
@@ -161,7 +169,11 @@ pub fn doc(painter: &Painter, rect: Rect, color: Color32) {
     painter.add(Shape::closed_line(rounded_poly(&pts, 1.2), stroke));
     // The folded corner itself.
     painter.add(Shape::line(
-        vec![pos2(x1 - fold, y0), pos2(x1 - fold, y0 + fold), pos2(x1, y0 + fold)],
+        vec![
+            pos2(x1 - fold, y0),
+            pos2(x1 - fold, y0 + fold),
+            pos2(x1, y0 + fold),
+        ],
         stroke,
     ));
     let rule = Stroke::new(1.0, color);
@@ -210,8 +222,14 @@ pub fn plus(painter: &Painter, rect: Rect, color: Color32) {
     let r = rect.shrink(rect.width() * 0.3);
     let stroke = Stroke::new(1.3, color);
     let c = r.center();
-    painter.add(Shape::line(vec![pos2(r.left(), c.y), pos2(r.right(), c.y)], stroke));
-    painter.add(Shape::line(vec![pos2(c.x, r.top()), pos2(c.x, r.bottom())], stroke));
+    painter.add(Shape::line(
+        vec![pos2(r.left(), c.y), pos2(r.right(), c.y)],
+        stroke,
+    ));
+    painter.add(Shape::line(
+        vec![pos2(c.x, r.top()), pos2(c.x, r.bottom())],
+        stroke,
+    ));
 }
 
 /// Vertical chevron: points down when `down`, up otherwise.
@@ -248,7 +266,10 @@ pub fn trash(painter: &Painter, rect: Rect, color: Color32) {
     let w = rect.width();
     // Lid + handle.
     painter.add(Shape::line(
-        vec![pos2(x0, y0 + rect.height() * 0.22), pos2(x1, y0 + rect.height() * 0.22)],
+        vec![
+            pos2(x0, y0 + rect.height() * 0.22),
+            pos2(x1, y0 + rect.height() * 0.22),
+        ],
         stroke,
     ));
     painter.add(Shape::line(
@@ -348,7 +369,10 @@ pub fn branch(painter: &Painter, rect: Rect, color: Color32) {
     let dot = |p: Pos2| Shape::circle_stroke(p, rect.width() * 0.14, stroke);
     let trunk_x = x0 + rect.width() * 0.26;
     painter.add(Shape::line(
-        vec![pos2(trunk_x, y0 + rect.height() * 0.18), pos2(trunk_x, y1 - rect.height() * 0.18)],
+        vec![
+            pos2(trunk_x, y0 + rect.height() * 0.18),
+            pos2(trunk_x, y1 - rect.height() * 0.18),
+        ],
         stroke,
     ));
     // Fork curving off to the right.
@@ -365,7 +389,10 @@ pub fn branch(painter: &Painter, rect: Rect, color: Color32) {
     ));
     painter.add(dot(pos2(trunk_x, y0 + rect.height() * 0.18)));
     painter.add(dot(pos2(trunk_x, y1 - rect.height() * 0.18)));
-    painter.add(dot(pos2(x1 - rect.width() * 0.26, y1 - rect.height() * 0.18)));
+    painter.add(dot(pos2(
+        x1 - rect.width() * 0.26,
+        y1 - rect.height() * 0.18,
+    )));
 }
 
 /// Outlined triangle, the reference's "changed lines" marker.
@@ -422,6 +449,61 @@ pub fn leaf(painter: &Painter, rect: Rect, color: Color32) {
         vec![at(-len * 0.55, 0.0), at(len * 0.70, 0.0)],
         Stroke::new(1.0, color.gamma_multiply(0.30)),
     ));
+}
+
+/// Crescent moon for the Dim Mode toggle.
+///
+/// Two stroked arcs rather than a filled shape: a crescent is concave, so
+/// it cannot be a convex fill, and overdrawing a bite with the panel colour
+/// would bake one background into the icon. The opening faces the upper
+/// right, the conventional tilt. Drawn to meet at the tips so it reads at
+/// status-bar size.
+pub fn moon(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.5 * 0.74;
+    let stroke = Stroke::new(1.3, color);
+    // Outer arc: most of a disc, open toward the upper right.
+    let mid = -std::f32::consts::FRAC_PI_4;
+    let gap = 0.62;
+    let a0 = mid + gap;
+    let a1 = mid - gap + std::f32::consts::TAU;
+    let steps = 24;
+    let mut pts: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let a = a0 + (a1 - a0) * (i as f32 / steps as f32);
+            pos2(c.x + a.cos() * r, c.y + a.sin() * r)
+        })
+        .collect();
+    let (tip_a, tip_b) = (pts[0], pts[steps as usize]);
+    // Bite: an arc between the same tips whose middle dips toward the disc
+    // centre. Its sweep is picked, not fixed: of the two arcs joining the
+    // tips around the offset centre, the one passing nearer the disc centre
+    // is the concave bite a crescent needs.
+    let dir = vec2(mid.cos(), mid.sin());
+    let ic = c + dir * r * 0.52;
+    let ri = r * 0.88;
+    let ang = |p: Pos2| (p - ic).angle();
+    let (b0, mut b1) = (ang(tip_a), ang(tip_b));
+    while b1 < b0 {
+        b1 += std::f32::consts::TAU;
+    }
+    // Two candidate sweeps: b0 -> b1, or b0 -> b1 - TAU. Take the one whose
+    // midpoint lands closest to the disc centre.
+    let mid_of = |end: f32| {
+        let a = (b0 + end) * 0.5;
+        pos2(ic.x + a.cos() * ri, ic.y + a.sin() * ri)
+    };
+    let short_end = if (mid_of(b1) - c).length() < (mid_of(b1 - std::f32::consts::TAU) - c).length()
+    {
+        b1
+    } else {
+        b1 - std::f32::consts::TAU
+    };
+    for i in 1..16 {
+        let a = b0 + (short_end - b0) * (i as f32 / 16.0);
+        pts.push(pos2(ic.x + a.cos() * ri, ic.y + a.sin() * ri));
+    }
+    painter.add(Shape::closed_line(pts, stroke));
 }
 
 /// Circular arrow for "rescan the tree".

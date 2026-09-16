@@ -348,7 +348,6 @@ impl Terminal {
 }
 
 impl Session {
-
     fn spawn(&mut self, cwd: &PathBuf) {
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -417,7 +416,6 @@ impl Session {
             self.error = Some(format!("pty write failed: {e}"));
         }
     }
-
 }
 
 impl Terminal {
@@ -499,7 +497,6 @@ impl Terminal {
             _ => None,
         }
     }
-
 }
 
 impl Session {
@@ -597,7 +594,6 @@ impl Session {
             }
         }
     }
-
 }
 
 impl Terminal {
@@ -922,8 +918,17 @@ impl Terminal {
                         modifiers,
                         ..
                     } => {
-                        // Never steal editor save / find.
-                        if matches!(key, Key::S | Key::F) && (modifiers.ctrl || modifiers.command)
+                        // Never steal editor save / find, and never steal Dim
+                        // Mode: Ctrl+Shift+D is an app toggle handled in
+                        // `SnorApp::ui` before the terminal sees the key. Plain
+                        // Ctrl+D, which the shell needs for EOF, has no Shift
+                        // and still forwards.
+                        if matches!(key, Key::S | Key::F) && (modifiers.ctrl || modifiers.command) {
+                            continue;
+                        }
+                        if matches!(key, Key::D)
+                            && modifiers.shift
+                            && (modifiers.ctrl || modifiers.command)
                         {
                             continue;
                         }
@@ -1014,10 +1019,7 @@ mod tests {
     fn query_responder_handles_split_sequences() {
         let mut t = Terminal::new();
         sm(&mut t).respond_to_queries(b"\x1b[");
-        assert!(
-            !s(&t).inq.is_empty(),
-            "partial sequence must be kept"
-        );
+        assert!(!s(&t).inq.is_empty(), "partial sequence must be kept");
         sm(&mut t).respond_to_queries(b"6n");
         sm(&mut t).respond_to_queries(b"\x1b[?2026$p");
         sm(&mut t).respond_to_queries(b"\x1b[c");
@@ -1196,7 +1198,9 @@ mod tests {
         let mut t = Terminal::new();
         t.ensure_started(&std::env::temp_dir());
         let t0 = Instant::now();
-        while s(&t).total_bytes == 0 && s(&t).error.is_none() && t0.elapsed() < Duration::from_secs(10)
+        while s(&t).total_bytes == 0
+            && s(&t).error.is_none()
+            && t0.elapsed() < Duration::from_secs(10)
         {
             std::thread::sleep(Duration::from_millis(50));
             t.poll();
@@ -1223,4 +1227,3 @@ mod tests {
         );
     }
 }
-

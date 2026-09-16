@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 
+use crate::dim::DimManager;
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
 use crate::icons;
@@ -103,6 +104,11 @@ pub struct SnorApp {
     tree: FileTree,
     editor: Editor,
     terminal: Terminal,
+    /// Dim Mode: lowers the display backlight while agents keep running.
+    /// Owned here, next to the other global UI state, and deliberately
+    /// separate from `Terminal` — toggling brightness must never touch a
+    /// pty or a child process.
+    dim: DimManager,
     show_explorer: bool,
     /// Explorer width, driven by our own grip rather than egui's built-in
     /// panel resize. See [`SnorApp::tree_grip`] for why.
@@ -119,6 +125,7 @@ impl SnorApp {
             tree,
             editor: Editor::new(),
             terminal: Terminal::new(),
+            dim: DimManager::new(),
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
         }
@@ -128,84 +135,86 @@ impl SnorApp {
         egui::Panel::top("snor_top")
             .frame(egui::Frame::side_top_panel(ui.style()).fill(theme::surface_title()))
             .show(ui, |ui| {
-            // Drag-to-move, registered *first* so the controls added below win
-            // the hit test where they overlap it: egui resolves a press to the
-            // most recently registered widget under the pointer, and a drag
-            // band registered last would swallow every click on "close".
-            let drag = ui.interact(
-                ui.max_rect(),
-                egui::Id::new("snor_title_drag"),
-                egui::Sense::click_and_drag(),
-            );
-            if drag.dragged() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-            // Double-click the bar to toggle maximise, as every desktop does.
-            if drag.double_clicked() {
-                let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
-                ui.ctx()
-                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-            }
-
-            // The reference's title bar is 45.6pt tall with its row centred;
-            // the text row itself only comes to ~20pt.
-            ui.add_space(TITLE_PAD);
-            ui.horizontal(|ui| {
-                // The reference insets its wordmark 28px = 22.4pt from the
-                // window's left edge; the panel's own 8pt inner margin only
-                // gets us to 8.8pt, which left the bar looking like the name
-                // had been shoved into the corner.
-                ui.add_space(TITLE_LEFT_PAD);
-                // No explorer toggle up here. The reference opens straight on
-                // "Snor" with nothing beside it, and a folder glyph sitting on
-                // the product name reads as a logo — which is exactly what the
-                // mock's wordmark is not. Ctrl+B still toggles the panel.
-                // 18.8 rather than 18: the reference's wordmark inks 47px wide
-                // against our 45 at 18pt.
-                ui.label(
-                    egui::RichText::new("Snor")
-                        .size(18.8)
-                        .family(theme::medium())
-                        .color(theme::accent()),
+                // Drag-to-move, registered *first* so the controls added below win
+                // the hit test where they overlap it: egui resolves a press to the
+                // most recently registered widget under the pointer, and a drag
+                // band registered last would swallow every click on "close".
+                let drag = ui.interact(
+                    ui.max_rect(),
+                    egui::Id::new("snor_title_drag"),
+                    egui::Sense::click_and_drag(),
                 );
-                // The reference separates the product name from its tagline
-                // with a raised dot, not a plus. Drawn rather than typed: the
-                // mock's dot is a solid 4pt disc, and the bullet glyph at any
-                // sensible text size comes out 2.4pt — half the size — while
-                // also moving if the UI font changes.
-                ui.add_space(TITLE_DOT_LEAD);
-                let (dot, _) =
-                    ui.allocate_exact_size(egui::vec2(TITLE_DOT, TITLE_DOT), egui::Sense::hover());
-                if ui.is_rect_visible(dot) {
-                    ui.painter()
-                        .circle_filled(dot.center(), TITLE_DOT * 0.5, theme::faint());
+                if drag.dragged() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                ui.label(
-                    egui::RichText::new("Calm tools for focused minds.")
-                        .size(11.5)
-                        .color(theme::tagline()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    Self::window_controls(ui);
-                    ui.add_space(TITLE_RIGHT_GAP);
+                // Double-click the bar to toggle maximise, as every desktop does.
+                if drag.double_clicked() {
+                    let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
 
-                    // Right-to-left: the label goes in first so the leaf ends
-                    // up on its *left*, matching the reference's leaf-then-text
-                    // reading order.
+                // The reference's title bar is 45.6pt tall with its row centred;
+                // the text row itself only comes to ~20pt.
+                ui.add_space(TITLE_PAD);
+                ui.horizontal(|ui| {
+                    // The reference insets its wordmark 28px = 22.4pt from the
+                    // window's left edge; the panel's own 8pt inner margin only
+                    // gets us to 8.8pt, which left the bar looking like the name
+                    // had been shoved into the corner.
+                    ui.add_space(TITLE_LEFT_PAD);
+                    // No explorer toggle up here. The reference opens straight on
+                    // "Snor" with nothing beside it, and a folder glyph sitting on
+                    // the product name reads as a logo — which is exactly what the
+                    // mock's wordmark is not. Ctrl+B still toggles the panel.
+                    // 18.8 rather than 18: the reference's wordmark inks 47px wide
+                    // against our 45 at 18pt.
                     ui.label(
-                        egui::RichText::new("Stay consistent.")
-                            .size(12.5)
-                            .color(theme::dim_text()),
+                        egui::RichText::new("Snor")
+                            .size(18.8)
+                            .family(theme::medium())
+                            .color(theme::accent()),
                     );
-                    let (slot, _) =
-                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                    if ui.is_rect_visible(slot) {
-                        icons::leaf(&ui.painter_at(slot), slot, theme::accent());
+                    // The reference separates the product name from its tagline
+                    // with a raised dot, not a plus. Drawn rather than typed: the
+                    // mock's dot is a solid 4pt disc, and the bullet glyph at any
+                    // sensible text size comes out 2.4pt — half the size — while
+                    // also moving if the UI font changes.
+                    ui.add_space(TITLE_DOT_LEAD);
+                    let (dot, _) = ui.allocate_exact_size(
+                        egui::vec2(TITLE_DOT, TITLE_DOT),
+                        egui::Sense::hover(),
+                    );
+                    if ui.is_rect_visible(dot) {
+                        ui.painter()
+                            .circle_filled(dot.center(), TITLE_DOT * 0.5, theme::faint());
                     }
+                    ui.label(
+                        egui::RichText::new("Calm tools for focused minds.")
+                            .size(11.5)
+                            .color(theme::tagline()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        Self::window_controls(ui);
+                        ui.add_space(TITLE_RIGHT_GAP);
+
+                        // Right-to-left: the label goes in first so the leaf ends
+                        // up on its *left*, matching the reference's leaf-then-text
+                        // reading order.
+                        ui.label(
+                            egui::RichText::new("Stay consistent.")
+                                .size(12.5)
+                                .color(theme::dim_text()),
+                        );
+                        let (slot, _) =
+                            ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                        if ui.is_rect_visible(slot) {
+                            icons::leaf(&ui.painter_at(slot), slot, theme::accent());
+                        }
+                    });
                 });
+                ui.add_space(TITLE_PAD_BELOW);
             });
-            ui.add_space(TITLE_PAD_BELOW);
-        });
     }
 
     /// Minimise / maximise-or-restore / close, in the theme.
@@ -342,11 +351,7 @@ impl SnorApp {
         ];
 
         for (i, (rect, dir, cursor)) in edges.into_iter().chain(corners).enumerate() {
-            let resp = ui.interact(
-                rect,
-                egui::Id::new(("snor_resize", i)),
-                egui::Sense::drag(),
-            );
+            let resp = ui.interact(rect, egui::Id::new(("snor_resize", i)), egui::Sense::drag());
             if resp.hovered() || resp.dragged() {
                 ui.ctx().set_cursor_icon(cursor);
             }
@@ -360,97 +365,124 @@ impl SnorApp {
         egui::Panel::bottom("snor_status")
             .frame(egui::Frame::side_top_panel(ui.style()).fill(theme::surface_recessed()))
             .show(ui, |ui| {
-            // The reference's status bar is 39.2pt tall, so the 16pt row of
-            // readouts sits in a lot of air.
-            ui.add_space(STATUS_PAD);
-            ui.horizontal(|ui| {
-                // Far left, mirroring the terminal's toggle at the far right,
-                // so the two panel toggles read as a pair. This is the only
-                // control that survives hiding the panel — the explorer header
-                // goes with it — so unlike the terminal's it has to read both
-                // ways rather than only offering to close what is already up.
-                let sidebar = self.show_explorer;
-                if icons::icon_button(ui, 20.0, "toggle sidebar (Ctrl+B)", |p, r, c| {
-                    icons::panel_left(p, r.shrink(4.0), c, sidebar)
-                })
-                .clicked()
-                {
-                    self.show_explorer = !self.show_explorer;
-                }
-                ui.add_space(STATUS_GAP);
-                let (branch, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                if ui.is_rect_visible(branch) {
-                    icons::branch(&ui.painter_at(branch), branch, theme::dim_text());
-                }
-                ui.label(
-                    egui::RichText::new("main")
-                        .size(12.5)
-                        .color(theme::dim_text()),
-                );
-                // Sync indicator: a filled accent dot with a knocked-out centre.
-                let (dot, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                if ui.is_rect_visible(dot) {
-                    let p = ui.painter_at(dot);
-                    p.circle_filled(dot.center(), 4.6, theme::accent());
-                    p.circle_filled(dot.center(), 1.6, theme::on_accent());
-                }
-                ui.label(
-                    egui::RichText::new("0")
-                        .size(12.5)
-                        .color(theme::dim_text()),
-                );
-                let (tri, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                if ui.is_rect_visible(tri) {
-                    icons::triangle_outline(&ui.painter_at(tri), tri, theme::dim_text());
-                }
-                ui.label(
-                    egui::RichText::new("0")
-                        .size(12.5)
-                        .color(theme::dim_text()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Right-to-left, so the first thing added lands furthest
-                    // right: the toggle goes in first to sit where the
-                    // reference's own status-bar icon does, with the readouts
-                    // marching away to its left. An icon rather than a
-                    // `small_button` — a filled pill among flat text was the
-                    // same "bolted on" problem as the old open-folder button.
-                    let open = !self.terminal.hidden;
-                    if icons::icon_button(ui, 20.0, "toggle terminal (Ctrl+Tab)", |p, r, c| {
-                        icons::panel_bottom(p, r.shrink(4.0), c, open)
+                // The reference's status bar is 39.2pt tall, so the 16pt row of
+                // readouts sits in a lot of air.
+                ui.add_space(STATUS_PAD);
+                ui.horizontal(|ui| {
+                    // Far left, mirroring the terminal's toggle at the far right,
+                    // so the two panel toggles read as a pair. This is the only
+                    // control that survives hiding the panel — the explorer header
+                    // goes with it — so unlike the terminal's it has to read both
+                    // ways rather than only offering to close what is already up.
+                    let sidebar = self.show_explorer;
+                    if icons::icon_button(ui, 20.0, "toggle sidebar (Ctrl+B)", |p, r, c| {
+                        icons::panel_left(p, r.shrink(4.0), c, sidebar)
                     })
                     .clicked()
                     {
-                        // Closing the last terminal tab removes the section
-                        // entirely, so un-hiding has to ask for a shell rather
-                        // than just flipping a flag.
-                        if self.terminal.hidden {
-                            self.terminal.reveal(&self.tree.root);
-                        } else {
-                            self.terminal.hidden = true;
-                        }
+                        self.show_explorer = !self.show_explorer;
                     }
                     ui.add_space(STATUS_GAP);
-                    // The reference spreads the readouts out rather than
-                    // packing them: "Ln 6, Col 1   Spaces: 4   UTF-8   CRLF
-                    // Rust".
-                    for item in [
-                        self.editor.active_lang(),
-                        "CRLF".to_string(),
-                        "UTF-8".to_string(),
-                        "Spaces: 4".to_string(),
-                        format!("Ln {}, Col {}", self.editor.cursor_line, self.editor.cursor_col),
-                    ] {
-                        ui.label(egui::RichText::new(item).size(12.5).color(theme::dim_text()));
-                        ui.add_space(STATUS_GAP);
+                    let (branch, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    if ui.is_rect_visible(branch) {
+                        icons::branch(&ui.painter_at(branch), branch, theme::dim_text());
                     }
+                    ui.label(
+                        egui::RichText::new("main")
+                            .size(12.5)
+                            .color(theme::dim_text()),
+                    );
+                    // Sync indicator: a filled accent dot with a knocked-out centre.
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    if ui.is_rect_visible(dot) {
+                        let p = ui.painter_at(dot);
+                        p.circle_filled(dot.center(), 4.6, theme::accent());
+                        p.circle_filled(dot.center(), 1.6, theme::on_accent());
+                    }
+                    ui.label(egui::RichText::new("0").size(12.5).color(theme::dim_text()));
+                    let (tri, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    if ui.is_rect_visible(tri) {
+                        icons::triangle_outline(&ui.painter_at(tri), tri, theme::dim_text());
+                    }
+                    ui.label(egui::RichText::new("0").size(12.5).color(theme::dim_text()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right-to-left, so the first thing added lands furthest
+                        // right: the toggle goes in first to sit where the
+                        // reference's own status-bar icon does, with the readouts
+                        // marching away to its left. An icon rather than a
+                        // `small_button` — a filled pill among flat text was the
+                        // same "bolted on" problem as the old open-folder button.
+                        let open = !self.terminal.hidden;
+                        if icons::icon_button(ui, 20.0, "toggle terminal (Ctrl+Tab)", |p, r, c| {
+                            icons::panel_bottom(p, r.shrink(4.0), c, open)
+                        })
+                        .clicked()
+                        {
+                            // Closing the last terminal tab removes the section
+                            // entirely, so un-hiding has to ask for a shell rather
+                            // than just flipping a flag.
+                            if self.terminal.hidden {
+                                self.terminal.reveal(&self.tree.root);
+                            } else {
+                                self.terminal.hidden = true;
+                            }
+                        }
+                        ui.add_space(STATUS_GAP);
+                        // Dim Mode: a moon that fills with the accent while the
+                        // screen is dimmed, plus the word itself so the state
+                        // reads at a glance. Clicking toggles, same as
+                        // Ctrl+Shift+D. Backend failures show as a short
+                        // non-blocking note beside it; terminals keep running.
+                        let dim_active = self.dim.is_active();
+                        let dim_tip = format!(
+                            "Dim Mode (Ctrl+Shift+D) — dims to {}%",
+                            self.dim.dim_level()
+                        );
+                        if icons::icon_button(ui, 20.0, &dim_tip, |p, r, c| {
+                            icons::moon(p, r, if dim_active { theme::accent() } else { c })
+                        })
+                        .clicked()
+                        {
+                            self.dim.toggle(
+                                crate::brightness::get_brightness,
+                                crate::brightness::set_brightness,
+                            );
+                        }
+                        if dim_active {
+                            ui.label(egui::RichText::new("Dim").size(12.5).color(theme::accent()));
+                        }
+                        if let Some(note) = self.dim.notice().map(str::to_owned) {
+                            let short: String = note.chars().take(48).collect();
+                            ui.label(egui::RichText::new(short).size(11.5).color(theme::danger()))
+                                .on_hover_text(note);
+                        }
+                        // The reference spreads the readouts out rather than
+                        // packing them: "Ln 6, Col 1   Spaces: 4   UTF-8   CRLF
+                        // Rust".
+                        for item in [
+                            self.editor.active_lang(),
+                            "CRLF".to_string(),
+                            "UTF-8".to_string(),
+                            "Spaces: 4".to_string(),
+                            format!(
+                                "Ln {}, Col {}",
+                                self.editor.cursor_line, self.editor.cursor_col
+                            ),
+                        ] {
+                            ui.label(
+                                egui::RichText::new(item)
+                                    .size(12.5)
+                                    .color(theme::dim_text()),
+                            );
+                            ui.add_space(STATUS_GAP);
+                        }
+                    });
                 });
+                ui.add_space(STATUS_PAD);
             });
-            ui.add_space(STATUS_PAD);
-        });
     }
 
     /// Editor + terminal column, split at an explicit divider.
@@ -515,7 +547,9 @@ impl SnorApp {
             let top_down = egui::Layout::top_down(egui::Align::LEFT);
             if !full_scr {
                 ui.scope_builder(
-                    egui::UiBuilder::new().max_rect(editor_rect).layout(top_down),
+                    egui::UiBuilder::new()
+                        .max_rect(editor_rect)
+                        .layout(top_down),
                     |ui| self.editor.ui(ui, &self.tree.root),
                 );
             }
@@ -559,8 +593,11 @@ impl SnorApp {
                 // hover state has to say "this is draggable" out loud.
                 let c = rect.center();
                 for i in -1..=1 {
-                    ui.painter()
-                        .circle_filled(egui::pos2(c.x + i as f32 * 8.0, c.y), 1.7, theme::accent());
+                    ui.painter().circle_filled(
+                        egui::pos2(c.x + i as f32 * 8.0, c.y),
+                        1.7,
+                        theme::accent(),
+                    );
                 }
             }
             resp.on_hover_cursor(egui::CursorIcon::ResizeVertical);
@@ -594,8 +631,11 @@ impl SnorApp {
             );
             let c = egui::pos2(edge, panel.center().y);
             for i in -1..=1 {
-                ui.painter()
-                    .circle_filled(egui::pos2(c.x, c.y + i as f32 * 8.0), 1.7, theme::accent());
+                ui.painter().circle_filled(
+                    egui::pos2(c.x, c.y + i as f32 * 8.0),
+                    1.7,
+                    theme::accent(),
+                );
             }
         }
         resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
@@ -646,6 +686,23 @@ impl eframe::App for SnorApp {
             ))
         }) {
             self.show_explorer = !self.show_explorer;
+        }
+        // Dim Mode (Ctrl+Shift+D): lower the display backlight without
+        // touching any terminal or agent process. Handled up here with the
+        // other global shortcuts so it works in every layout — editor,
+        // terminal split, fullscreen — and before the terminal sees the
+        // key, so the shell never receives it as input. Ctrl+Shift rather
+        // than plain Ctrl+D, which the shell needs for EOF.
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::D,
+            ))
+        }) {
+            self.dim.toggle(
+                crate::brightness::get_brightness,
+                crate::brightness::set_brightness,
+            );
         }
 
         self.title_bar(ui);
@@ -703,5 +760,14 @@ impl eframe::App for SnorApp {
 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(150));
+    }
+}
+
+impl Drop for SnorApp {
+    fn drop(&mut self) {
+        // Leaving while dimmed hands the screen back at its pre-dim level.
+        // Best effort by design: shutdown must never panic or hang waiting
+        // on display control, and terminals are reaped by their own `Drop`.
+        self.dim.restore_on_exit(crate::brightness::set_brightness);
     }
 }

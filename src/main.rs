@@ -4,6 +4,8 @@
 use eframe::egui;
 
 mod app;
+mod brightness;
+mod dim;
 mod editor;
 mod file_tree;
 mod fonts;
