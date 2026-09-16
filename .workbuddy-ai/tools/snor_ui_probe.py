@@ -116,6 +116,13 @@ VK = {
     "home": 0x24,
     "end": 0x23,
 }
+# Letters and digits use their ASCII codes. egui matches a shortcut by the key
+# it resolves from the virtual-key code, so `ctrl+b` needs the real VK rather
+# than a synthesised one.
+VK.update({c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"})
+VK.update({c: ord(c) for c in "0123456789"})
+# F1 is 0x70.
+VK.update({f"f{i}": 0x6F + i for i in range(1, 13)})
 
 
 def _send(inp):
