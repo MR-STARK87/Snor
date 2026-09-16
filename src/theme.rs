@@ -231,9 +231,8 @@ mod tests {
 
     #[test]
     fn accent_is_readable_on_panel() {
-        let lum = |c: egui::Color32| {
-            0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
-        };
+        let lum =
+            |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
         assert!(
             lum(accent()) > lum(on_accent()) + 80.0,
             "tab badge letter would not read"
@@ -248,9 +247,8 @@ mod tests {
         assert!(tilt(moss()) > tilt(dim_text()));
         assert!(tilt(moss()) > tilt(faint()));
         // ...but it still has to be dimmer than body text, or it shouts.
-        let lum = |c: egui::Color32| {
-            0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
-        };
+        let lum =
+            |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
         assert!(lum(moss()) < lum(text()));
         assert!(lum(moss()) > lum(faint()));
     }

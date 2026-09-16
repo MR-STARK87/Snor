@@ -26,14 +26,24 @@ pub fn install(ctx: &eframe::egui::Context) {
     let mut fonts = eframe::egui::FontDefinitions::default();
 
     let faces: [(&str, &'static [u8]); 3] = [
-        (REGULAR, include_bytes!("../assets/fonts/SpaceGrotesk-Regular.ttf")),
-        (MEDIUM, include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf")),
-        (BOLD, include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf")),
+        (
+            REGULAR,
+            include_bytes!("../assets/fonts/SpaceGrotesk-Regular.ttf"),
+        ),
+        (
+            MEDIUM,
+            include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf"),
+        ),
+        (
+            BOLD,
+            include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf"),
+        ),
     ];
     for (name, bytes) in faces {
-        fonts
-            .font_data
-            .insert(name.to_owned(), Arc::new(eframe::egui::FontData::from_static(bytes)));
+        fonts.font_data.insert(
+            name.to_owned(),
+            Arc::new(eframe::egui::FontData::from_static(bytes)),
+        );
     }
 
     // Our face leads and egui's built-ins stay behind it as fallbacks, so the

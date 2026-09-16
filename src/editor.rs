@@ -115,9 +115,9 @@ fn tab_badge(ui: &mut egui::Ui, filename: &str) {
 /// The Run button: a play triangle plus a label, sized to its own text.
 fn run_button(ui: &mut egui::Ui) -> egui::Response {
     let accent = crate::theme::accent();
-    let galley = ui
-        .painter()
-        .layout_no_wrap("Run".to_owned(), egui::FontId::proportional(13.0), accent);
+    let galley =
+        ui.painter()
+            .layout_no_wrap("Run".to_owned(), egui::FontId::proportional(13.0), accent);
     let pad = egui::vec2(10.0, 4.0);
     let tri = 11.0;
     let gap = 6.0;
@@ -606,8 +606,7 @@ impl Editor {
                         egui::vec2(w_new + gap + w_open, h),
                         egui::Sense::hover(),
                     );
-                    let new_rect =
-                        egui::Rect::from_min_size(row.min, egui::vec2(w_new, h));
+                    let new_rect = egui::Rect::from_min_size(row.min, egui::vec2(w_new, h));
                     let open_rect = egui::Rect::from_min_size(
                         egui::pos2(row.min.x + w_new + gap, row.min.y),
                         egui::vec2(w_open, h),
@@ -721,8 +720,11 @@ impl Editor {
                                 .file_name()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            let label =
-                                if tab.dirty { format!("{name} *") } else { name.clone() };
+                            let label = if tab.dirty {
+                                format!("{name} *")
+                            } else {
+                                name.clone()
+                            };
                             let active = idx == self.active;
                             // The pill itself is the highlight, so the label
                             // must not draw egui's own selection background.
@@ -930,9 +932,8 @@ impl Editor {
                         // gutter would run off to the right, taking the code
                         // with it.
                         ui.scope_builder(
-                            egui::UiBuilder::new().layout(egui::Layout::top_down(
-                                egui::Align::LEFT,
-                            )),
+                            egui::UiBuilder::new()
+                                .layout(egui::Layout::top_down(egui::Align::LEFT)),
                             |ui| {
                                 let mono = egui::FontId::monospace(13.0);
                                 // The gutter has to advance in step with the
@@ -960,9 +961,7 @@ impl Editor {
                             let mut layouter =
                                 |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                                     let mut job = crate::syntax::ts_job(text.as_str(), &lang)
-                                        .unwrap_or_else(|| {
-                                            highlight_job(text.as_str(), &lang)
-                                        });
+                                        .unwrap_or_else(|| highlight_job(text.as_str(), &lang));
                                     job.wrap.max_width = f32::INFINITY;
                                     // The reference sets 27.5px between code
                                     // lines against a 17px ink height, i.e. a

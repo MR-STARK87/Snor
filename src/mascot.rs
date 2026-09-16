@@ -15,7 +15,9 @@
 //! transparent fills leave every hidden contour visible and the creature
 //! reads as stacked circles instead of one body.
 
-use eframe::egui::{Align2, Color32, FontId, Painter, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2};
+use eframe::egui::{
+    Align2, Color32, FontId, Painter, Rect, Response, Sense, Shape, Stroke, Ui, pos2, vec2,
+};
 
 use crate::icons::{blob, blob_poly};
 use crate::theme;
@@ -35,7 +37,14 @@ pub fn height_for(width: f32) -> f32 {
     width / ASPECT
 }
 
-fn arc(painter: &Painter, center: eframe::egui::Pos2, w: f32, bow: f32, color: Color32, width: f32) {
+fn arc(
+    painter: &Painter,
+    center: eframe::egui::Pos2,
+    w: f32,
+    bow: f32,
+    color: Color32,
+    width: f32,
+) {
     let mut pts = Vec::with_capacity(12);
     for i in 0..=10 {
         let t = i as f32 / 10.0;
@@ -63,7 +72,12 @@ fn paint(painter: &Painter, rect: Rect) {
     let stroke = Stroke::new(1.3, line);
     let faint = Stroke::new(1.1, line.gamma_multiply(0.55));
     // Normalised helper: (0,0) is the top-left of the drawing box.
-    let p = |x: f32, y: f32| pos2(rect.left() + rect.width() * x, rect.top() + rect.height() * y);
+    let p = |x: f32, y: f32| {
+        pos2(
+            rect.left() + rect.width() * x,
+            rect.top() + rect.height() * y,
+        )
+    };
     let s = |v: f32| rect.width() * v;
 
     // Ears first, so the head covers their bases. Short and round — nubs,
@@ -83,19 +97,47 @@ fn paint(painter: &Painter, rect: Rect) {
         stroke,
     );
     // Head, tipped sideways as it rests against the body.
-    blob(painter, p(0.48, 0.36), s(0.28), s(0.23), -0.14, hide, stroke);
+    blob(
+        painter,
+        p(0.48, 0.36),
+        s(0.28),
+        s(0.23),
+        -0.14,
+        hide,
+        stroke,
+    );
     // Far paw, flat on the ground behind everything.
     blob(painter, p(0.16, 0.70), s(0.15), s(0.21), 0.18, hide, stroke);
     // Body mass: the dominant slump.
-    blob(painter, p(0.55, 0.72), s(0.30), s(0.23), -0.06, hide, stroke);
+    blob(
+        painter,
+        p(0.55, 0.72),
+        s(0.30),
+        s(0.23),
+        -0.06,
+        hide,
+        stroke,
+    );
     // Near paw draped across the belly.
     blob(painter, p(0.50, 0.70), s(0.27), s(0.20), -0.10, hide, faint);
     // Foot poking out at the bottom right.
-    blob(painter, p(0.80, 0.84), s(0.13), s(0.11), -0.20, hide, stroke);
+    blob(
+        painter,
+        p(0.80, 0.84),
+        s(0.13),
+        s(0.11),
+        -0.20,
+        hide,
+        stroke,
+    );
 
     // Belly patch: a few short moss strokes suggesting fur tufts, not a
     // filled region. Colour is the only tint on the creature.
-    for (tx, ty0, ty1) in [(0.46_f32, 0.66_f32, 0.72_f32), (0.54, 0.68, 0.74), (0.62, 0.66, 0.71)] {
+    for (tx, ty0, ty1) in [
+        (0.46_f32, 0.66_f32, 0.72_f32),
+        (0.54, 0.68, 0.74),
+        (0.62, 0.66, 0.71),
+    ] {
         painter.add(Shape::line(
             vec![p(tx, ty0), p(tx, ty1)],
             Stroke::new(1.1, belly),

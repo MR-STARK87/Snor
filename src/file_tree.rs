@@ -623,7 +623,12 @@ impl FileTree {
             );
             let font = egui::FontId::proportional(ROOT_TEXT);
             let text_x = base + ROOT_LABEL;
-            let label = icons::truncate(&painter, &name, font.clone(), (row.right() - text_x).max(8.0));
+            let label = icons::truncate(
+                &painter,
+                &name,
+                font.clone(),
+                (row.right() - text_x).max(8.0),
+            );
             painter.text(
                 egui::pos2(text_x, row.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -738,8 +743,12 @@ impl FileTree {
                 }
                 let text_x = base + label_left(depth);
                 let font = egui::FontId::proportional(ROW_TEXT);
-                let label =
-                    icons::truncate(&painter, &node.name, font.clone(), (row.right() - text_x).max(8.0));
+                let label = icons::truncate(
+                    &painter,
+                    &node.name,
+                    font.clone(),
+                    (row.right() - text_x).max(8.0),
+                );
                 painter.text(
                     egui::pos2(text_x, row.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -867,7 +876,9 @@ impl FileTree {
                     }
                     let head = ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Workspace").size(14.0).color(theme::text()),
+                            egui::RichText::new("Workspace")
+                                .size(14.0)
+                                .color(theme::text()),
                         )
                         .truncate(),
                     );
