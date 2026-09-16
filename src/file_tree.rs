@@ -970,14 +970,15 @@ impl FileTree {
         // only lines down here are the status bar's own top edge.
         //
         // There is no space added between the mascot and the caption: the
-        // mascot's blobs stop short of the bottom of the block they are given,
-        // and that empty band *is* the gap the reference shows between the
-        // feet and the text. Adding more on top of it doubled the gap.
+        // creature's shapes stop short of the bottom of the block they are
+        // given, and that empty band *is* the gap the reference shows between
+        // the feet and the text. Adding more on top of it doubled the gap.
         ui.horizontal(|ui| {
             ui.add_space(FOOTER_PAD * panel_w);
-            crate::mascot::snorlax(ui, FOOTER_MASCOT * panel_w)
-                .on_hover_text("Rest. Then build again.");
+            crate::mascot::snorri(ui, FOOTER_MASCOT * panel_w)
+                .on_hover_text("Shhh… Snorri is compiling dreams.");
         });
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(FOOTER_PAD * panel_w);
             ui.label(

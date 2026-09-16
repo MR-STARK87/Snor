@@ -61,11 +61,14 @@ fn fill_stroke(painter: &Painter, points: Vec<Pos2>, fill: Color32, stroke: Stro
 }
 
 /// Filled ellipse with an outline.
+///
+/// Snorri's parts overlap, and filled shapes occlude each other the way
+/// painted art does — bare strokes would leave every hidden contour visible.
 pub fn blob(painter: &Painter, center: Pos2, rx: f32, ry: f32, rot: f32, fill: Color32, stroke: Stroke) {
     fill_stroke(painter, ellipse_points(center, rx, ry, rot), fill, stroke);
 }
 
-/// Filled rounded polygon with an outline.
+/// Filled rounded polygon with an outline. See [`blob`].
 pub fn blob_poly(painter: &Painter, points: &[Pos2], radius: f32, fill: Color32, stroke: Stroke) {
     fill_stroke(painter, rounded_poly(points, radius), fill, stroke);
 }

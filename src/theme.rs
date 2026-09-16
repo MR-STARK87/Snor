@@ -108,31 +108,16 @@ pub fn moss() -> egui::Color32 {
     egui::Color32::from_rgb(0x6E, 0x86, 0x70)
 }
 
-/// The mascot's floating sleep marks (`#38433A`). Deliberately dimmer than
-/// [`outline`]: the reference draws them as a fading trail, not as part of
-/// the silhouette.
-pub fn sleep_mark() -> egui::Color32 {
-    egui::Color32::from_rgb(0x38, 0x43, 0x3A)
-}
-
-/// Stroke colour for line-art icons and the mascot.
-pub fn outline() -> egui::Color32 {
-    egui::Color32::from_rgb(0x5B, 0x6A, 0x59)
-}
-
-/// Ink for the explorer tree's glyphs: the folder, document and badge
-/// outlines, and the disclosure chevrons.
+/// Ink for the explorer tree's glyphs — the folder, document and badge
+/// outlines, the disclosure chevrons — and for Snorri, the footer creature.
 ///
 /// Sampled from the reference at (208, 203, 189) on the folder's horizontal
 /// top edge, which is fully covered and therefore reports the true stroke
 /// colour. Diagonal strokes read ~16% dimmer than this in the mock
 /// ((175, 178, 171) on a chevron, (175, 171, 166) on a badge corner) — that
 /// is antialiasing spread over two pixels, not a second, darker ink, so
-/// everything in the tree uses this one colour.
-///
-/// Deliberately *not* [`outline`]: that green-grey is right for the mascot,
-/// but the reference's tree is pale warm line art. Painting it in `outline`
-/// left the glyphs at (89, 104, 88) — far too dim, and the wrong hue.
+/// everything in the tree uses this one colour. Snorri shares it so the
+/// creature reads as part of the chrome rather than a sticker pasted on.
 pub fn glyph() -> egui::Color32 {
     egui::Color32::from_rgb(0xD0, 0xCB, 0xBD)
 }
@@ -146,12 +131,6 @@ pub fn glyph() -> egui::Color32 {
 /// thin stroke's brightest pixel.
 pub fn badge_fill() -> egui::Color32 {
     egui::Color32::from_rgb(0xBC, 0xB9, 0xB3)
-}
-
-/// Fill behind the mascot's outlines: a hair lighter than the panel so the
-/// silhouette reads without turning into a solid block.
-pub fn mascot_fill() -> egui::Color32 {
-    egui::Color32::from_rgb(0x19, 0x22, 0x1F)
 }
 
 /// Active editor tab / selected explorer row.
@@ -274,13 +253,5 @@ mod tests {
         };
         assert!(lum(moss()) < lum(text()));
         assert!(lum(moss()) > lum(faint()));
-    }
-
-    #[test]
-    fn sleep_marks_stay_dimmer_than_the_silhouette() {
-        let lum = |c: egui::Color32| {
-            0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
-        };
-        assert!(lum(sleep_mark()) < lum(outline()));
     }
 }
