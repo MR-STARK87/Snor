@@ -163,6 +163,94 @@ fn run_button(ui: &mut egui::Ui) -> egui::Response {
     resp.on_hover_text("send `cargo run` to the terminal")
 }
 
+/// Padding and face for a prompt button, shared by the measuring pass and the
+/// painting pass so the two cannot drift apart.
+const PROMPT_PAD_X: f32 = 16.0;
+const PROMPT_PAD_Y: f32 = 7.0;
+const PROMPT_FONT: f32 = 13.0;
+
+/// Width a prompt button will occupy, so a row of them can be centred before
+/// any of them has been laid out.
+fn prompt_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(PROMPT_FONT),
+        egui::Color32::WHITE,
+    );
+    PROMPT_PAD_X * 2.0 + galley.size().x
+}
+
+/// Height of a prompt button. Both take this so the pair line up.
+fn prompt_button_height(ui: &egui::Ui) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        "X".to_owned(),
+        egui::FontId::proportional(PROMPT_FONT),
+        egui::Color32::WHITE,
+    );
+    PROMPT_PAD_Y * 2.0 + galley.size().y
+}
+
+/// One action in the empty state, painted into a rect the caller has already
+/// reserved.
+///
+/// The rect is passed in rather than allocated here because the two buttons
+/// are centred as a *pair*. Laying them out with
+/// `Layout::left_to_right(Align::Center)` looks like the obvious way to do
+/// that, but egui sizes such a frame to the whole available height
+/// (`Layout::next_frame_ignore_wrap`: a horizontal layout whose vertical align
+/// is `Center` fills the height) and then `Placer::advance_after_rects`
+/// expands the parent to the whole frame. The row therefore sank to the middle
+/// of the pane and swallowed the space the tertiary link below it needed, so
+/// the link was laid out past the bottom and clipped away. Reserving one rect
+/// and dividing it keeps the row's height exactly the button height.
+///
+/// `primary` fills with the accent and knocks the label out of it; the other is
+/// outlined. That asymmetry is the point — the two are a recommendation and an
+/// alternative, not two equal choices.
+fn prompt_button_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    primary: bool,
+) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(label), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let color = if primary {
+            crate::theme::on_accent()
+        } else {
+            crate::theme::text()
+        };
+        let fill = if primary {
+            if resp.hovered() {
+                crate::theme::accent().gamma_multiply(1.18)
+            } else {
+                crate::theme::accent()
+            }
+        } else if resp.hovered() {
+            egui::Color32::from_rgb(0x25, 0x38, 0x2E)
+        } else {
+            crate::theme::tab_active()
+        };
+        painter.rect_filled(rect, 7.0, fill);
+        if !primary {
+            painter.rect_stroke(
+                rect,
+                7.0,
+                egui::Stroke::new(1.0, crate::theme::hairline()),
+                egui::StrokeKind::Middle,
+            );
+        }
+        let galley = painter.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(PROMPT_FONT),
+            color,
+        );
+        painter.galley(rect.center() - galley.size() * 0.5, galley, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
@@ -394,6 +482,15 @@ pub struct Editor {
     /// Set by the Run button; the app shell consumes it to send
     /// `cargo run` to the terminal.
     pub want_run: bool,
+    /// Set by the empty state's "New file". The editor cannot reach the file
+    /// tree, so the shell consumes this to reveal the Workspace panel and
+    /// open its inline name field.
+    pub want_new_file: bool,
+    /// Set by the empty state's "Open from Workspace": reveal the panel so a
+    /// file can be picked. Separate from `want_new_file` because revealing is
+    /// all it should do — starting the create flow as well would put a text
+    /// field in front of someone who asked to browse.
+    pub want_workspace: bool,
 }
 
 impl Editor {
@@ -411,6 +508,8 @@ impl Editor {
             cursor_line: 1,
             cursor_col: 1,
             want_run: false,
+            want_new_file: false,
+            want_workspace: false,
         }
     }
 
@@ -444,6 +543,105 @@ impl Editor {
                 _ => "Text".to_string(),
             })
             .unwrap_or_else(|| "—".to_string())
+    }
+
+    /// What the editor shows when nothing is open.
+    ///
+    /// The editor's chrome — tab strip, separator, gutter, code area — is not
+    /// drawn at all. An empty tab strip above an empty gutter reads as a
+    /// broken editor rather than an idle one, and the gutter's line numbers
+    /// especially look like a file that failed to load. What replaces it is a
+    /// short invitation with the two things a person actually wants next.
+    fn empty_state(&mut self, ui: &mut egui::Ui, workdir: &std::path::Path) {
+        if let Some(err) = &self.error {
+            ui.colored_label(crate::theme::danger(), err);
+        }
+        // Fill the column: a content-sized area would let the editor collapse
+        // and drag the split divider up with it.
+        egui::ScrollArea::both()
+            .id_salt("snor_editor_empty")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    // Roughly a third down, which reads as centred without
+                    // needing the content's measured height.
+                    ui.add_space((ui.available_height() * 0.3).max(24.0));
+
+                    let (glyph, _) =
+                        ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                    if ui.is_rect_visible(glyph) {
+                        crate::icons::doc(
+                            &ui.painter_at(glyph),
+                            egui::Rect::from_center_size(glyph.center(), egui::vec2(26.0, 33.0)),
+                            crate::theme::faint(),
+                        );
+                    }
+
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("Nothing open yet")
+                            .size(17.0)
+                            .family(crate::theme::medium())
+                            .color(crate::theme::text()),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Pick a file from the Workspace panel, or start a new one.",
+                        )
+                        .size(12.5)
+                        .color(crate::theme::dim_text()),
+                    );
+                    ui.add_space(22.0);
+
+                    // The two actions, centred as a pair. One rect is
+                    // reserved for the whole row and divided between the
+                    // buttons; see `prompt_button_at` for why they are not
+                    // laid out with a nested horizontal layout.
+                    let gap = 10.0;
+                    let w_new = prompt_button_width(ui, "New file");
+                    let w_open = prompt_button_width(ui, "Open from Workspace");
+                    let h = prompt_button_height(ui);
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(w_new + gap + w_open, h),
+                        egui::Sense::hover(),
+                    );
+                    let new_rect =
+                        egui::Rect::from_min_size(row.min, egui::vec2(w_new, h));
+                    let open_rect = egui::Rect::from_min_size(
+                        egui::pos2(row.min.x + w_new + gap, row.min.y),
+                        egui::vec2(w_open, h),
+                    );
+                    if prompt_button_at(ui, new_rect, "New file", true).clicked() {
+                        self.want_new_file = true;
+                    }
+                    if prompt_button_at(ui, open_rect, "Open from Workspace", false).clicked() {
+                        self.want_workspace = true;
+                    }
+
+                    ui.add_space(14.0);
+                    // Tertiary, and the reason it exists: the file dialog lives
+                    // on the tab strip's "+", and the strip is not drawn while
+                    // nothing is open, so without this there is no way left to
+                    // reach a file outside the project root.
+                    let browse = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new("or browse for a file elsewhere…")
+                                    .size(11.5)
+                                    .color(crate::theme::faint()),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if browse.clicked()
+                        && let Some(path) =
+                            rfd::FileDialog::new().set_directory(workdir).pick_file()
+                    {
+                        self.open_file(path);
+                    }
+                });
+            });
     }
 
     fn recompute_find(&mut self) {
@@ -500,6 +698,15 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, workdir: &std::path::Path) {
+        // Nothing open: draw none of the editor's own chrome. See
+        // `empty_state` for why an empty tab strip and gutter are worse than
+        // no editor at all.
+        if self.tabs.is_empty() {
+            self.find_open = false;
+            self.empty_state(ui, workdir);
+            return;
+        }
+
         // Tab bar: lang badge + name pills, file picker, Run button.
         ui.horizontal(|ui| {
             let mut close_idx: Option<usize> = None;
@@ -562,13 +769,6 @@ impl Editor {
                                     });
                                 });
                         }
-                        if self.tabs.is_empty() {
-                            ui.label(
-                                egui::RichText::new("no file — open one in Workspace")
-                                    .size(12.5)
-                                    .color(crate::theme::faint()),
-                            );
-                        }
                         if crate::icons::icon_button(ui, 20.0, "open file", |p, r, c| {
                             crate::icons::plus(p, r, c)
                         })
@@ -601,20 +801,6 @@ impl Editor {
 
         if let Some(err) = &self.error {
             ui.colored_label(crate::theme::danger(), err);
-        }
-
-        if self.tabs.is_empty() {
-            self.find_open = false;
-            // Fill the column: a content-sized scroll area would let the
-            // editor collapse and drag the split divider up with it.
-            egui::ScrollArea::both()
-                .id_salt("snor_editor_empty")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.monospace("// open a file from Workspace to edit.");
-                    ui.monospace("// tabs + tree-sitter highlight + Ctrl+S to save.");
-                });
-            return;
         }
 
         if ui.input_mut(|i| {

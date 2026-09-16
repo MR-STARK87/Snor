@@ -612,6 +612,17 @@ impl eframe::App for SnorApp {
         if std::mem::take(&mut self.editor.want_run) {
             self.terminal.send_line("cargo run", &self.tree.root);
         }
+        // The empty editor's two actions. The editor has no handle on the file
+        // tree, so it raises a flag and the shell does the work. Both reveal
+        // the panel first: a create field or a file list you cannot see is no
+        // use.
+        if std::mem::take(&mut self.editor.want_new_file) {
+            self.show_explorer = true;
+            self.tree.begin_create_at_root(false);
+        }
+        if std::mem::take(&mut self.editor.want_workspace) {
+            self.show_explorer = true;
+        }
 
         if ui.input_mut(|i| {
             i.consume_shortcut(&egui::KeyboardShortcut::new(
