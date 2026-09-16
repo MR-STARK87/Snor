@@ -11,3 +11,4 @@ Thumbs.db
 # points at them and they are the only way to verify GUI behavior.
 .workbuddy-ai/screenshots/
 .workbuddy-ai/memory/
+.workbuddy-ai/verify/
