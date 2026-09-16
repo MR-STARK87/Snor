@@ -9,6 +9,7 @@ Thumbs.db
 # large (the screenshot set alone runs ~10MB), so they are not worth tracking.
 # The measurement scripts under .workbuddy-ai/tools ARE tracked -- AGENTS.md
 # points at them and they are the only way to verify GUI behavior.
+# Exception: 2026-09-17.md is force-added, being the written verification record.
 .workbuddy-ai/screenshots/
 .workbuddy-ai/memory/
 .workbuddy-ai/verify/
