@@ -405,6 +405,19 @@ impl SnorApp {
                              Focus next/previous: Alt+Right/Left · Close pane: Ctrl+Shift+W · \
                              Dividers drag — sizes stick.",
                         );
+                        // A refused pane creation reports here rather than in
+                        // the grid: the grid's top-left corner is the first
+                        // pane's header, so painting there overlaid the note on
+                        // the pane title and neither was readable.
+                        if let Some(note) = self.terminal.notice_text().map(str::to_owned) {
+                            ui.add_space(STATUS_GAP);
+                            ui.label(egui::RichText::new(note).size(11.5).color(theme::faint()))
+                                .on_hover_text(
+                                    "Snor keeps four live shells: enough for a \
+                                 supervisor and three agents. Close a pane \
+                                 (Ctrl+Shift+W) to open another.",
+                                );
+                        }
                         ui.add_space(STATUS_GAP);
                     }
                     let (branch, _) =

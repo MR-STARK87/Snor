@@ -288,7 +288,8 @@ pub struct Terminal {
     /// pane"; always resolved through live sessions, never trusted blind.
     flow_focus: Option<u64>,
     /// Why the last shell creation refused (the 4-shell cap). Shown subtly
-    /// in the tab strip and the flow area; cleared by the next success.
+    /// in the tab strip, and — in Flow Mode — in the status bar beside the
+    /// "Flow" word; cleared by the next success.
     notice: Option<String>,
 }
 
@@ -1348,6 +1349,15 @@ impl FlowGrid {
 /// constant so the two can never disagree about how big a cell is.
 const TERM_FONT_SIZE: f32 = 12.5;
 
+/// Height of a Flow pane's header row — the focus dot plus the title and
+/// directory labels. Reserved out of the pane's rectangle before its rows
+/// and columns are computed, so the PTY is never told it has a line the
+/// grid does not actually show.
+const PANE_HEADER_H: f32 = 18.0;
+/// Slack the renderer leaves under a pane's grid inside its scroll area.
+/// Subtracted alongside the header for the same reason.
+const PANE_GRID_PAD: f32 = 4.0;
+
 /// Pixels per terminal cell, measured off the live font. Panes divide their
 /// pixel rects by these to learn their real rows and columns.
 fn term_cell_size(ui: &eframe::egui::Ui) -> (f32, f32) {
@@ -1569,20 +1579,37 @@ impl Terminal {
     /// (the last pane closed with it), so this never draws a dead end.
     pub fn flow_ui(&mut self, ui: &mut eframe::egui::Ui, default_cwd: &PathBuf) {
         self.ensure_started_all();
-        self.poll();
         if self.sessions.is_empty() {
             let _ = self.new_tab(default_cwd);
         }
         let live: Vec<u64> = self.sessions.iter().map(|s| s.id).collect();
         self.flow_grid.set_panes(&live);
         let rect = ui.available_rect_before_wrap();
+
+        // Size every pane *before* draining the ptys, not during the render.
+        //
+        // The renderer used to call `apply_size` as it drew each pane, which
+        // resized the ConPTY after that frame's output had already been read.
+        // The TUI's response to the new size — a full repaint — therefore did
+        // not reach the grid until the following poll, and if the shell then
+        // went quiet the torn half-resized frame stayed on screen until some
+        // unrelated event forced a repaint. OpenCode's logo was the visible
+        // casualty: the top half redrawn at the new width, the bottom half
+        // still the old one, frozen until a keypress.
+        //
+        // Measuring first closes that gap: any output the resize provokes is
+        // drained by the `poll()` below, in the same frame it was asked for.
+        let cell = term_cell_size(ui);
+        self.size_panes(rect, cell);
+
+        self.poll();
+
         // The recessed slab behind everything, like the normal terminal, so
         // the panes read as one continuous workspace.
         ui.painter()
             .rect_filled(rect, 0.0, crate::theme::surface_recessed());
         // Split borrows: the grid and the sessions travel side by side into
         // the renderer instead of fighting over `&mut self`.
-        let cell = term_cell_size(ui);
         let Self {
             sessions,
             flow_grid,
@@ -1598,23 +1625,57 @@ impl Terminal {
                 sessions,
                 focus: flow_focus,
                 latched: active,
-                cell,
             };
             view.render(ui, rect);
         }
-        // A refused creation says so here, small and out of the way, while
-        // every live shell keeps running underneath.
-        if let Some(note) = &self.notice {
-            ui.painter().text(
-                rect.min + eframe::egui::vec2(8.0, 2.0),
-                eframe::egui::Align2::LEFT_TOP,
-                note,
-                eframe::egui::FontId::proportional(11.0),
-                crate::theme::faint(),
-            );
-        }
+        // A refused creation is reported by the caller instead of here.
+        //
+        // Painting the text into `rect`'s top-left corner put it directly on
+        // top of the first pane's header — pane title, cwd and the notice
+        // interleaved into unreadable mush at exactly the moment the user
+        // needed to read it. `flow_ui` owns only the pane grid, so the note
+        // travels out through `notice_text()` and the shell draws it in the
+        // status bar, where "Flow" already lives and nothing can collide.
         let target = self.flow_target_id();
         self.forward_events(ui, target);
+    }
+
+    /// Give every visible pane's shell the rows and columns its rectangle
+    /// implies, before anything is drawn.
+    ///
+    /// The header row a pane draws for itself is subtracted here, and so is
+    /// the two points the renderer leaves under the grid, so the PTY's size
+    /// matches the cells the pane will actually show. Sizing to the raw rect
+    /// instead told the shell it had one row more than the grid displayed,
+    /// which pushed a TUI's last line out of the visible area.
+    fn size_panes(&mut self, area: eframe::egui::Rect, cell: (f32, f32)) {
+        let mut sizes: Vec<(u64, u16, u16)> = Vec::new();
+        for (r, &count) in flow_shape(self.flow_grid.len()).iter().enumerate() {
+            for c in 0..count {
+                let Some(id) = self.flow_grid.cell_at(r, c) else {
+                    continue;
+                };
+                let rect = self.flow_grid.cell_rect(area, r, c);
+                // The header eats its own line before the grid starts.
+                let grid_h = (rect.height() - PANE_HEADER_H - PANE_GRID_PAD).max(0.0);
+                let (rows, cols) = term_size_for_pixels(rect.width(), grid_h, cell);
+                sizes.push((id, rows, cols));
+            }
+        }
+        // Applied in one pass, so a pane that is not on screen — a background
+        // session — keeps whatever size it last had and is never resized by
+        // accident.
+        for (id, rows, cols) in sizes {
+            if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                s.apply_size(rows, cols);
+            }
+        }
+    }
+
+    /// The pending refusal note, if any. The status bar shows it while Flow
+    /// Mode is up; normal mode still shows it inline in the tab strip.
+    pub fn notice_text(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 }
 
@@ -1626,7 +1687,6 @@ struct FlowView<'a> {
     sessions: &'a mut Vec<Session>,
     focus: &'a mut Option<u64>,
     latched: &'a mut bool,
-    cell: (f32, f32),
 }
 
 impl<'a> FlowView<'a> {
@@ -1748,16 +1808,10 @@ impl<'a> FlowView<'a> {
                 if let Some(err) = error {
                     ui.colored_label(crate::theme::danger(), err);
                 }
-                // Size the real shell to this pane before painting it: rows
-                // and columns come from these very pixels, so the ConPTY
-                // and the grid always agree and TUIs reflow instead of
-                // clipping. Unchanged dimensions are a no-op inside.
-                let avail = ui.available_size();
-                let (rows, cols) =
-                    term_size_for_pixels(avail.x.max(0.0), avail.y.max(0.0), self.cell);
-                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    s.apply_size(rows, cols);
-                }
+                // The shell was already sized to this pane by `size_panes`,
+                // before the ptys were drained — see `flow_ui`. Sizing here
+                // instead would resize the ConPTY after its output for this
+                // frame had been read, leaving a torn frame on screen.
                 let job = match self.sessions.iter().find(|s| s.id == id) {
                     Some(s) => term_job(s.parser.screen()),
                     None => return,
@@ -2377,6 +2431,30 @@ mod tests {
         assert_eq!(term_size_for_pixels(1e6, 1e6, (10.0, 10.0)), (200, 400));
     }
 
+    /// The header is reserved before the shell is sized, so the PTY never
+    /// reports a row the pane's grid does not draw.
+    ///
+    /// This is the invariant behind the frozen torn-TUI bug: sizing from the
+    /// pane's raw rectangle told a shell it had `PANE_HEADER_H` more rows
+    /// than the scroll area would show, and a TUI's last line landed off the
+    /// bottom of the visible grid.
+    #[test]
+    fn flow_pane_sizing_reserves_its_header() {
+        use super::{PANE_GRID_PAD, PANE_HEADER_H};
+        let cell = (10.0, 10.0);
+        let pane_h = 400.0;
+        // 400px with a header and the grid's slack left is not 40 rows.
+        let (rows, _) = term_size_for_pixels(1000.0, pane_h, cell);
+        assert_eq!(rows, 40);
+        let grid_h = pane_h - PANE_HEADER_H - PANE_GRID_PAD;
+        let (rows_reserved, _) = term_size_for_pixels(1000.0, grid_h, cell);
+        assert_eq!(rows_reserved, 37, "the header must cost the shell its rows");
+        assert!(
+            rows_reserved < rows,
+            "reserving the header can only shrink the grid, never grow it"
+        );
+    }
+
     /// Resizing a shell updates its stored size and its vt100 screen, and
     /// repeats are free: no redundant work while dragging.
     #[test]
@@ -2406,10 +2484,21 @@ mod tests {
         t.flow_add_stub();
         assert_eq!(t.sessions.len(), MAX_SESSIONS);
         assert!(t.notice.is_some());
+        assert!(
+            t.notice_text().is_some(),
+            "the status bar reads the refusal through notice_text()"
+        );
         assert_eq!(leaves(&t).len(), MAX_SESSIONS);
         // Normal tabs obey the same cap.
         assert!(t.open_stub_tab().is_none());
         assert_eq!(t.sessions.len(), MAX_SESSIONS);
+        // Closing a pane frees the slot, and the survivor's creation clears
+        // the note, so the status bar cannot keep shouting after the fix.
+        t.flow_close_focused();
+        assert!(t.sessions.len() < MAX_SESSIONS);
+        t.flow_add_stub();
+        assert!(t.notice.is_none());
+        assert!(t.notice_text().is_none());
     }
 
     /// Header paths never slice mid-character, whatever the OS reports.
