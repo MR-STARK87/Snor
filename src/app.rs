@@ -109,6 +109,11 @@ pub struct SnorApp {
     /// separate from `Terminal` — toggling brightness must never touch a
     /// pty or a child process.
     dim: DimManager,
+    /// Flow Mode: the whole window becomes a multi-pane terminal
+    /// workspace for supervising agents. The editor, explorer and normal
+    /// terminal tabs hide, but nothing is destroyed — sessions, scrollback,
+    /// editor buffers and pane sizes all survive the round trip.
+    flow: bool,
     show_explorer: bool,
     /// Explorer width, driven by our own grip rather than egui's built-in
     /// panel resize. See [`SnorApp::tree_grip`] for why.
@@ -126,6 +131,7 @@ impl SnorApp {
             editor: Editor::new(),
             terminal: Terminal::new(),
             dim: DimManager::new(),
+            flow: false,
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
         }
@@ -383,6 +389,24 @@ impl SnorApp {
                         self.show_explorer = !self.show_explorer;
                     }
                     ui.add_space(STATUS_GAP);
+                    // Flow Mode indicator: a small accent word, nothing more.
+                    // The tooltip doubles as the command list — Snor has no
+                    // palette, so every Flow shortcut is documented here and
+                    // on the toggle that owns it.
+                    if self.flow {
+                        ui.label(
+                            egui::RichText::new("Flow")
+                                .size(12.5)
+                                .color(theme::accent()),
+                        )
+                        .on_hover_text(
+                            "Flow Mode — the window is yours, agents.\n\
+                             Toggle: Ctrl+Shift+F · Add pane: Ctrl+Shift+H/V/T (max 4) · \
+                             Focus next/previous: Alt+Right/Left · Close pane: Ctrl+Shift+W · \
+                             Dividers drag — sizes stick.",
+                        );
+                        ui.add_space(STATUS_GAP);
+                    }
                     let (branch, _) =
                         ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                     if ui.is_rect_visible(branch) {
@@ -487,6 +511,9 @@ impl SnorApp {
 
     /// Editor + terminal column, split at an explicit divider.
     ///
+    /// In Flow Mode the whole column goes to the terminal panes instead;
+    /// see [`SnorApp::flow_workspace`].
+    ///
     /// The panes are laid out against rects computed up front rather than by
     /// asking the parent `Ui` to reserve space for them. `Ui::scope` advances
     /// the parent cursor to the child's *content* rect, not the size that was
@@ -494,6 +521,10 @@ impl SnorApp {
     /// divider stranded at the top — dragging it changed the terminal height
     /// while the divider itself never moved.
     fn workspace(&mut self, ui: &mut egui::Ui) {
+        if self.flow {
+            self.flow_workspace(ui);
+            return;
+        }
         let mut split: Option<(egui::Rect, f32)> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -604,7 +635,57 @@ impl SnorApp {
         }
     }
 
+    /// Flow Mode workspace: terminal panes take the whole column. The
+    /// editor, its tabs and the explorer are simply not drawn — their state
+    /// sits untouched in `self`, so leaving restores the exact arrangement.
+    fn flow_workspace(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            let root = self.tree.root.clone();
+            self.terminal.flow_ui(ui, &root);
+        });
+        self.sync_flow_root();
+    }
+
+    fn toggle_flow(&mut self) {
+        if self.flow {
+            self.exit_flow();
+        } else {
+            self.enter_flow();
+        }
+        self.sync_flow_root();
+    }
+
+    fn enter_flow(&mut self) {
+        self.flow = true;
+        let root = self.tree.root.clone();
+        self.terminal.flow_enter(&root);
+    }
+
+    fn exit_flow(&mut self) {
+        self.flow = false;
+        // Land the tab strip on the focused pane; the pane layout itself is
+        // kept, so toggling back restores splits and sizes.
+        self.terminal.flow_exit_sync();
+    }
+
+    /// Adopt the focused pane's directory as the workspace root. The tree
+    /// is hidden in Flow Mode, so this only becomes visible on the way
+    /// back — returning to the focused agent's project, as it should.
+    fn sync_flow_root(&mut self) {
+        if !self.flow {
+            return;
+        }
+        if let Some(cwd) = self.terminal.flow_focused_cwd()
+            && cwd != self.tree.root
+        {
+            self.tree.set_root(cwd);
+        }
+    }
+
     /// Explorer resize grip.
+    ///
+    /// Hidden with the explorer in Flow Mode; `tree_w` itself is untouched,
+    /// so the panel comes back at its old width.
     ///
     /// egui's own panel resize handle is a `resize_grab_radius_side`-wide band
     /// centred on the panel edge, so half of it lies over the editor and is
@@ -664,12 +745,17 @@ impl eframe::App for SnorApp {
             self.show_explorer = true;
         }
 
-        if ui.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::Tab,
-            ))
-        }) {
+        // Ctrl+Tab and Ctrl+B rearrange the *normal* workspace, so they
+        // rest while Flow Mode owns the window. Otherwise toggling a hidden
+        // panel would silently rewrite the arrangement Flow Mode restores.
+        if !self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL,
+                    egui::Key::Tab,
+                ))
+            })
+        {
             // Ctrl+Tab is the way back from an emptied panel: closing the last
             // tab takes the whole section away, and this brings it back with a
             // fresh shell rather than an empty strip.
@@ -679,12 +765,14 @@ impl eframe::App for SnorApp {
                 self.terminal.hidden = true;
             }
         }
-        if ui.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::B,
-            ))
-        }) {
+        if !self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL,
+                    egui::Key::B,
+                ))
+            })
+        {
             self.show_explorer = !self.show_explorer;
         }
         // Dim Mode (Ctrl+Shift+D): lower the display backlight without
@@ -704,6 +792,99 @@ impl eframe::App for SnorApp {
                 crate::brightness::set_brightness,
             );
         }
+        // Flow Mode (Ctrl+Shift+F): the whole window becomes terminal
+        // panes for supervising agents. The Ctrl+Shift family is free —
+        // the terminal only maps Ctrl+C/D/Z/L, and Ctrl+F/B/S/Tab are the
+        // existing app shortcuts — and Alt+arrows are ignored by shells
+        // entirely, so panes never steal shell input. Handled up here, so
+        // every command works in any layout and the shell never sees the
+        // chords.
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::F,
+            ))
+        }) {
+            self.toggle_flow();
+        }
+        // Split commands enter Flow Mode when it is off: asking for a pane
+        // is asking for the workspace that shows panes. Every split adds
+        // one shell and the adaptive grid tiles it: two side by side,
+        // three as two over one full-width pane, four as 2x2.
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::H,
+            ))
+        }) {
+            self.enter_flow();
+            let root = self.tree.root.clone();
+            self.terminal.flow_add_pane(&root);
+            self.sync_flow_root();
+        }
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::V,
+            ))
+        }) {
+            self.enter_flow();
+            let root = self.tree.root.clone();
+            self.terminal.flow_add_pane(&root);
+            self.sync_flow_root();
+        }
+        // New terminal pane. Flow-only: normal mode already grows shells
+        // through the tab strip's `+`, and this must not invent a second
+        // meaning there.
+        if self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::T,
+                ))
+            })
+        {
+            let root = self.tree.root.clone();
+            self.terminal.flow_add_pane(&root);
+            self.sync_flow_root();
+        }
+        // Close the focused pane. Flow-only: outside Flow Mode Ctrl+W-family
+        // chords belong to shells and the editor, not to us.
+        if self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::W,
+                ))
+            })
+        {
+            self.terminal.flow_close_focused();
+            self.sync_flow_root();
+        }
+        // Pane focus, wrapping in grid order. Flow-only and Alt-based, so
+        // normal-mode arrow keys (editor caret, shell history) are untouched.
+        if self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::ALT,
+                    egui::Key::ArrowRight,
+                ))
+            })
+        {
+            self.terminal.flow_step_focus(1);
+            self.sync_flow_root();
+        }
+        if self.flow
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::ALT,
+                    egui::Key::ArrowLeft,
+                ))
+            })
+        {
+            self.terminal.flow_step_focus(-1);
+            self.sync_flow_root();
+        }
 
         self.title_bar(ui);
         // Shown before the explorer on purpose: in the reference the panel
@@ -721,7 +902,9 @@ impl eframe::App for SnorApp {
         }
 
         let mut panel_rect = None;
-        if self.show_explorer {
+        // The explorer hides with everything else in Flow Mode; the flag
+        // and width are left alone so the panel returns exactly as it was.
+        if self.show_explorer && !self.flow {
             let panel = egui::Panel::left("snor_tree")
                 .exact_size(self.tree_w)
                 .resizable(false)
