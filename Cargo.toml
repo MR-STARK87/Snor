@@ -2,6 +2,11 @@
 name = "snor"
 version = "0.1.0"
 edition = "2024"
+description = "Lightweight native IDE in full Rust — a minimal Windows-first editor that stays near 150MB RAM"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MR-STARK87/Snor"
+readme = "README.md"
+keywords = ["ide", "editor", "egui"]
 
 [dependencies]
 anyhow = "1.0.104"
