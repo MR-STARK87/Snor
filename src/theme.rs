@@ -143,6 +143,22 @@ pub fn hairline() -> egui::Color32 {
     egui::Color32::from_rgb(0x22, 0x2B, 0x29)
 }
 
+/// The seam between two Flow panes.
+///
+/// [`hairline`] is tuned for a divider *inside* one surface, where the two
+/// sides are the same fill and the line only has to separate regions of it.
+/// A pane seam is a different job: two recessed slabs meet edge to edge, so
+/// the line is the only thing telling them apart, and at hairline's
+/// (34, 43, 41) against a (17, 24, 23) surface the seam was effectively
+/// invisible — four panes read as one sheet with faint marks on it.
+///
+/// This sits at (51, 61, 56): about 30 luma above the recessed surface, so
+/// the seam is unambiguous, but still under [`window_edge`]'s (55, 62, 58)
+/// so the window's own boundary stays the strongest line in the frame.
+pub fn pane_edge() -> egui::Color32 {
+    egui::Color32::from_rgb(0x33, 0x3D, 0x38)
+}
+
 /// The window's own edge, drawn as a frame around the whole client area.
 ///
 /// The reference's outer frame is a 2px band at 125% — 1.6pt — reading
@@ -251,5 +267,22 @@ mod tests {
             |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
         assert!(lum(moss()) < lum(text()));
         assert!(lum(moss()) > lum(faint()));
+    }
+
+    /// The pane seam has to out-read the ordinary hairline — that was the
+    /// whole point of splitting it out — while staying under the window's
+    /// own edge, so the frame still wins.
+    #[test]
+    fn pane_edge_separates_panes_without_outshouting_the_window_frame() {
+        let lum =
+            |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+        assert!(
+            lum(pane_edge()) > lum(hairline()) + 12.0,
+            "a pane seam the same weight as a hairline is the bug this fixes"
+        );
+        assert!(lum(pane_edge()) < lum(window_edge()));
+        // It only works if it is clearly above the surface it sits on.
+        assert!(lum(pane_edge()) > lum(surface_recessed()) + 25.0);
+        assert!(lum(pane_edge()) > lum(surface_body()) + 25.0);
     }
 }

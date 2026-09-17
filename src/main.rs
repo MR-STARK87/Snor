@@ -14,6 +14,7 @@ mod mascot;
 mod syntax;
 mod terminal;
 mod theme;
+mod widgets;
 
 fn main() -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {

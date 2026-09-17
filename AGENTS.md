@@ -20,6 +20,15 @@ cargo clippy --all-targets -- -D warnings   # must be clean before commit
 Get-Process Snor | Select-Object Name, @{N='MB';E={[math]::Round($_.WorkingSet64/1MB,1)}}
 ```
 
+**Read the memory number as a peak, not a level.** `WorkingSet64` is resident
+pages and Windows trims it freely for a window that is not in the foreground, so
+it swings a long way without the app releasing anything. Measured on one
+long-lived debug process: `WorkingSetSize` 83.8 MB, `PeakWorkingSetSize` 155.8 MB,
+`PagefileUsage` (commit) 147.3 MB. The ~155 MB quoted above is the peak, and
+commit is the number that actually stays put — a low resident reading after the
+window has been backgrounded is not a win, and a high one is not a regression.
+Query all three via `GetProcessMemoryInfo` before drawing any conclusion.
+
 Windows locks a running exe: `Stop-Process -Name Snor` before rebuilding,
 otherwise `cargo build` fails with `os error 5`.
 
@@ -35,6 +44,38 @@ otherwise `cargo build` fails with `os error 5`.
 | `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback and query-responder buffer. Tab strip spawns/switches/closes shells; `collapsed`/`fullscreen`/`hidden` + drag height. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
 | `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
+| `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
+
+## Clickable labels — read this before making anything clickable
+
+Anything that is text but behaves like a button (a tab, a link) must go through
+`widgets::clickable_label`. Rolling it by hand reintroduces two bugs that are
+invisible until you watch the OS cursor:
+
+1. **A `Label` is selectable text by default.** `Label::ui` resolves
+   `selectable` from `style.interaction.selectable_labels` (true) and hands the
+   label to egui's text-selection machinery, which writes `CursorIcon::Text`
+   from `Label::ui` *and* again from `LabelSelectionState::on_end_pass` while
+   it is dragging. The end-of-pass write lands after anything the call site
+   asks for, so the tab hovered as a pointing hand and showed the I-beam for
+   the whole time the button was held. `.selectable(false)` removes the write
+   rather than racing it.
+2. **`on_hover_cursor` stops applying during a long press.** A widget that
+   senses clicks but not drags has its press abandoned once held past
+   `InputOptions::max_click_duration` (0.8s), and `hovered()` goes false with
+   it — so the hand decays to the default arrow mid-press. `clickable_label`
+   keys off `contains_pointer` instead, which is purely geometric.
+
+Both are covered by tests in `widgets.rs`. They need two frames before the
+pointer arrives (egui hit-tests against the *previous* frame's widget rects)
+and they read the widget's own rect for the hover point — a `Label`'s rect is
+its galley, so a guessed coordinate lands in padding and the assertion
+silently measures nothing.
+
+**A cursor bug cannot be caught by a screenshot.** Verify with
+`.workbuddy-ai/tools/hover_cursor.py`, which reads `GetCursorInfo` and
+classifies the live OS cursor. Its `--hold` mode samples across a press, which
+is what distinguishes "never set" from "set and then overwritten".
 
 ## Terminal input — read this before touching it
 
@@ -115,6 +156,102 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
   collapsed it drew a "+" of its own, so the header showed two identical plus
   glyphs side by side. See `icons::chevron_v`.
 
+## Flow Mode — the focus cue is threefold, on purpose
+
+`render_pane` marks the focused pane three ways, and all three are load-bearing.
+A single cue was tried and read as "no focus at all" at 1.25 DPI:
+
+1. **Header band fill** — `surface_title()` across the full pane width.
+2. **Accent bar** — 2pt wide, `PANE_HEADER_H - 6` tall, at `rect.left() + 3.0`.
+3. **Pane outline** — warms from `pane_edge()` to
+   `accent().gamma_multiply(0.55)`. The bar says *which* pane; the outline says
+   the pane is live.
+
+Measured live in a 3-pane layout at 1.25 DPI (focused pane vs unfocused):
+
+| | focused | unfocused |
+|---|---|---|
+| header band | `(22,30,28)` `surface_title`, x 10..1590 | none — `(17,24,23)` `surface_recessed` |
+| accent bar | x 14..15, y 508..519 (12px) | absent |
+| outline | `(112,135,97)` = accent ×0.55 | `(51,61,56)` = `pane_edge` |
+
+- **The header height is reserved whether or not the pane is focused.** The band
+  is *painted*, not laid out, so nothing else holds the space open. Making the
+  reservation conditional on focus would shift every prompt down the moment
+  focus moved. Measured: first prompt ink lands `PANE_HEADER_H + GRID_TOP_GAP`
+  below the pane top in both cases (~20pt), so focused and unfocused grids align.
+- **The header must not name the pane.** It once read `powershell C:\...`, then a
+  prompt-shaped `PS C:\...>`. Both were the shell's own first line written out a
+  second time — the shell prints `PS C:\My work folder\Snor>` itself one row
+  below, so every pane opened with two identical path entries stacked. The
+  shell's line cannot be taken away, so the copy is the one that goes. Dimming it
+  only makes the duplication quieter, which is not the same as fixing it.
+
+## Grid padding — `GRID_TOP_GAP` and `GRID_SIDE_GAP`
+
+Both views put air around the shell's grid, and both gaps are spent **before the
+shell is sized**, so the PTY is never promised a cell the padded grid does not
+draw. That is the same class of invariant as `PANE_TOP_CHROME`, and it fails the
+same way: a shell with one column too many wraps its last character onto a row of
+its own, which reads as the shell mis-measuring rather than as padding.
+
+- `GRID_TOP_GAP` (5.0) — air above the first row, shared by normal mode and Flow
+  panes so the prompt lands the same distance down in either.
+- `GRID_SIDE_GAP` (8.0) — air either side of the grid, applied through
+  `inset_grid_sides()`. Both `size_panes` and `render_pane` read that one
+  function rather than each subtracting the gap by hand.
+
+Measured live at 1.25 DPI, before and after adding the side gap:
+
+| | before | after |
+|---|---|---|
+| normal mode, glyph from the rule above the tab strip | 9.6 pt | **17.6 pt** |
+| Flow pane, glyph from the pane's own outline | **0.8 pt** | **8.8 pt** |
+
+The Flow number is why this exists: the prompt's first glyph sat *one pixel* off
+the pane outline. Normal mode was less bad only because the panel's own inner
+margin happened to sit between the rule and the grid.
+
+- **It is applied to both sides.** Padding only the left leaves a full-width line
+  running into the right edge, which reads as a bug rather than a margin.
+- **Verify it with an exact-width wrap test, not by eye.** Ask the shell for its
+  size (`$Host.UI.RawUI.WindowSize`), then print a string of exactly that many
+  characters and one of `n + 1`. The first must fill one row and the second must
+  wrap by exactly one character. Measured: 131 columns, `"B"*131` filled one row,
+  `"B"*132` wrapped one character. That is the only way to catch a grid and a PTY
+  that disagree, and a screenshot cannot show it.
+- `inset_grid_sides` clamps the gap to half the width, so a pane narrower than
+  its own padding yields a sane rect instead of a negative width that would clamp
+  every column count up to `MIN_TERM_COLS`.
+
+## Auto context switching (`SnorApp::sync_context_root`)
+
+The explorer re-roots itself at the focused terminal's directory, so the file
+list always describes the project the shell you are typing into belongs to. Runs
+in both modes: `Terminal::context_session(flow)` returns the focused pane's id in
+Flow Mode, the active tab's otherwise.
+
+- **It fires on a change of session id, not on the directories differing.** That
+  distinction is the whole design. Comparing directories every frame fights the
+  user: pick a folder from the header's dialog and the very next frame puts the
+  focused shell's directory back, leaving the dialog unable to do anything while
+  any terminal is open. Keying on the session id means a manual choice survives
+  until focus actually moves — which is what "switch context when I move to
+  another terminal" is supposed to mean.
+- **Known limit: `session.cwd` is the directory a shell was *spawned* in**, not
+  one it has `cd`-ed into since. Nothing here reads the shell's own output, so a
+  pane that changes directory by hand keeps the directory it started with and the
+  explorer will not follow it. Following a `cd` needs OSC 7 emitted by the shell
+  and parsed in `terminal.rs`, which PowerShell does not do by default.
+- "Open terminal here" from a folder's context menu is the only way to get two
+  terminals that disagree about their directory, so it is also the only way to
+  exercise this by hand.
+- Verified live end-to-end: right-click `src` → *open terminal here* re-roots the
+  explorer from `Snor` to `src` (header reads `src`, lists the 13 `.rs` files);
+  clicking back to tab 1 re-roots it to `Snor`. Guarded by tests
+  `context_session_follows_the_active_tab_in_normal_mode` and
+  `hidden_terminal_reports_no_context`.
+
 ## Editor gotchas
 
 - **The fallback highlighter MUST stay char-boundary safe.** Byte-wise
@@ -131,6 +268,29 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
   `cursor.char_range().primary.index.0` (`CCursor.index` is `CharIndex`, a
   tuple struct). Compute line/col locally, then assign fields (borrowck:
   end the `buf` borrow first).
+- **A tab close happens *mid-frame*, so the top-of-`ui()` empty guard cannot
+  protect the rest of the frame.** `Editor::ui()` returns early through
+  `empty_state()` when `tabs` is empty, but that check runs *before* the tab
+  bar is drawn. The close is applied afterwards, so the list goes empty with
+  most of the frame still to draw — and the code below the tab bar evaluates
+  `self.tabs[self.active.min(self.tabs.len() - 1)]`. `usize` cannot go
+  negative, so `len() - 1` on an empty list **overflows and panics** rather
+  than producing a bad index: closing the only open file took the whole app
+  down with `attempt to subtract with overflow` at `editor.rs`.
+  The fix is two-part and both halves are load-bearing:
+  1. `close_tab(idx) -> bool` owns the removal, the `active` clamp and
+     `find_open` reset, and returns `false` exactly when the list just went
+     empty.
+  2. `ui()` early-returns when that `false` comes back, so nothing below the
+     tab bar runs against the empty list. The next frame redraws through the
+     normal empty-state path.
+  Guarded by `closing_the_last_tab_empties_the_list_without_underflow`.
+  `Terminal::close_tab` already followed this shape (`is_empty` → set
+  `hidden` → early return) — that is why the terminal never had the bug.
+- Anywhere else a `len() - 1` appears, confirm the `len() >= 1` invariant
+  holds on the same path. The ones in `open_file` and `new_tab` sit directly
+  after a `push`, and `icons.rs`'s `pts[len() - 1]` is built from `0..=20`,
+  so those are statically safe. Do not add a new one without the same proof.
 
 ## egui 0.36 API notes (verified against the registry source)
 
@@ -159,14 +319,97 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
   plus `panel_fill`, so an absolute inset is measured from the panel's
   *content* edge, not the window edge. `Panel::frame(..)` replaces it entirely.
 
+## Window shell (title bar, maximise, fullscreen)
+
+`with_decorations(false)` means the OS chrome is off, so everything the OS
+would normally do has to be ours. Three rules here are load-bearing and each
+one was a bug first:
+
+- **The title bar is drawn by us, so it must be hidden by us.** `SnorApp::ui`
+  gates `self.title_bar(ui)` on the viewport's `fullscreen` flag. Leaving it
+  unconditional means fullscreen changes nothing the user can see: the window
+  grows, the taskbar goes away, and the bar on top looks identical — reported
+  as "F11 doesn't work, it just hides the taskbar".
+- **`window_resize_bands` must also return early when fullscreen**, not just
+  when maximised. The window covers the monitor exactly, so there is nothing
+  to drag it out to, and the bands would put resize arrows on the screen's own
+  edges.
+- **Never send `Fullscreen(true)` while the window is maximised.** A window
+  still carrying `WS_MAXIMIZE` keeps the maximised *client* size whatever
+  rectangle winit hands `SetWindowPos`: the outer rect reads 1920x1080 and
+  `covers screen` is true, but egui is told the old work-area height, paints
+  only that far, and the bottom band of the screen keeps stale pixels. The F11
+  handler sends `Maximized(false)` first — both commands go to winit's window
+  thread and run in order, and the un-maximise is a plain
+  `ShowWindow(SW_RESTORE)` — then re-maximises on exit from
+  `SnorApp::restore_maximized`, because winit saves the placement *after* our
+  restore and would otherwise only bring back the floating rect.
+
+Verifying this needs a **desktop** capture, not `snor_drive.py shot`: a
+client-rect capture cannot show whether the taskbar is covered. Also note
+`IsWindowVisible` on the taskbar stays true even when a fullscreen window
+covers it, so it is not a usable test — compare the window rect against the
+monitor rect (`tools/screen_info.py`).
+
+**The 1px line outside our frame is not ours.** Windows 11 draws a
+system-accent-coloured border around every top-level window, at the window's
+outermost pixel. Sampled live: screen x=160 and x=1759 (and y=160) read
+`(30,126,146)` — a teal that appears nowhere in `theme.rs` — while screen x=161
+and x=1758 read `(55,62,58)`, which is our `window_edge()`. So the visible frame
+is DWM's teal hairline, then our own contrast line, then content. Do not "fix"
+the teal by drawing over it; if it clashes with the palette the fix is the user's
+system accent colour, not the app. The client rect starts one pixel *below* the
+window rect for the same reason.
+
+**A floating window can hide its own status bar.** The default inner size is
+1280x800 *logical*, which at 125% scaling is 1000 physical px tall against a
+1080p work area of 1020 — only 20px of slack. Windows placed this machine's
+window at y=160, so the bottom ~80px (the whole status bar, which is where the
+Dim Mode moon, its `Dim` label and any backend `notice` live) sat below the
+screen edge and appeared in no client-rect capture. Maximise before verifying
+anything that lives in the status bar. Note eframe is built without the
+`persistence` feature, so the position is the OS's choice, not a saved value.
+
+## Dim Mode (`dim.rs`, `brightness.rs`)
+
+Lowers the physical backlight so agents can keep running with the screen dark.
+
+- **The overlay only appears when Dim Mode genuinely took effect.** `is_active()`
+  is `saved.is_some()`, and `saved` is written only after *both* the read and the
+  write succeed (`DimManager::activate` returns early with a `notice` otherwise).
+  So on hardware with no WMI brightness control the user gets a small status-bar
+  notice and **no overlay at all**. That is deliberate — the overlay exists to
+  tell "Dim Mode is on" apart from "dark theme on a dim monitor", and if nothing
+  was dimmed there is nothing to disambiguate — but the consequence is worth
+  knowing: on a desktop with only external monitors the feature looks like it
+  does nothing.
+- Verified live end to end on this machine: `CurrentBrightness` read **70**,
+  toggling Dim Mode set it to **10**, toggling off restored **70** exactly. The
+  status bar shows `Dim` plus an accent-filled moon while active. The overlay's
+  pixels disappear completely on exit — 0 non-background pixels left in its
+  region, so there is no stale residue.
+- Overlay geometry (measured, 1536pt-wide window): 257.6 x 50.4 pt, centred
+  horizontally (centre x 767.6 against a window centre of 768.0), bottom edge
+  34.4 pt above the window bottom — i.e. it sits just above the status bar.
+- Backend is WMI through `powershell.exe`: `WmiMonitorBrightness` to read,
+  `WmiMonitorBrightnessMethods.WmiSetBrightness` to write, with `Timeout = 0` so
+  Windows cannot silently revert the level and desync the saved restore value.
+  `restore_on_exit` is best-effort on shutdown and never panics.
+- **A screenshot cannot verify this.** Captures grab the framebuffer, not the
+  panel, so a dimmed screen looks identical in a PNG. Confirm the level by
+  re-reading `CurrentBrightness` after the toggle, never by looking at a capture.
+
 ## Tests
 
-- `cargo test` must stay green (22 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (63 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
   `closing_an_earlier_tab_keeps_the_same_shell_selected`,
-  `tab_numbers_take_the_lowest_free_slot`), and
+  `tab_numbers_take_the_lowest_free_slot`), the grid-padding pair
+  (`flow_pane_sizing_reserves_its_header` and its side-gap twin
+  `flow_pane_sizing_reserves_its_side_gaps`),
+  `closing_the_last_tab_empties_the_list_without_underflow`, and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
 - Tab bookkeeping is tested through `Terminal::open_stub_tab` (a `#[cfg(test)]`
@@ -194,6 +437,45 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
   - `many_tabs.py` adds tabs one at a time and reports where the "+" and the
     right-hand cluster actually are, which is how the overflow behaviour above
     was measured.
+  - `snor_drive.py` is the current driver (`focus`, `shot`, `click`, `rclick`,
+    `drag`, `key`, `type`, `info`). It taps Alt before raising, because
+    `SetForegroundWindow` fails while another app owns the foreground and the
+    capture then grabs whatever is on top.
+  - `desktop_shot.py` grabs the whole desktop, for anything about the window's
+    own frame or the taskbar.
+  - `screen_info.py` prints screen, work area, window rect, window style bits
+    and taskbar in one go.
+  - `ink_groups.py` finds glyph clusters in a band and prints their centres in
+    egui points. Aim clicks with this rather than estimating from a downscaled
+    screenshot — a click that lands in padding reads as "the feature is
+    broken", and it cost two wasted clicks to learn.
+  - `hover_cursor.py` reads `GetCursorInfo` and classifies the live OS cursor.
+    A cursor never appears in a screenshot, so this is the only way to check
+    one. `--hold` presses the button and samples across the press. It moves
+    the pointer with `mouse_event(MOUSEEVENTF_MOVE|ABSOLUTE)` and approaches
+    from a nearby point, so the window gets a real move message and the
+    position always changes. A bare `SetCursorPos` does neither reliably and
+    will report the *previous* point's cursor — an earlier probe built on it
+    produced a confident but wrong "IBEAM on the tab" reading.
+- **`powershell.exe` must not be launched from the Bash tool** — it is blocked
+  there by design, and the block cannot be worked around from inside a Python
+  subprocess either. Use the PowerShell tool. In some sessions that tool returns
+  **empty stdout** even for commands that ran fine; when that happens, have the
+  command write its result to a file and read the file back. That is how the
+  Dim Mode brightness readings above were taken, and it costs one extra call
+  instead of a lost investigation.
+- **Relaunching the app: do not background it with a shell `&`.** A subshell
+  launch (`(./target/debug/snor.exe &)`) reports the process alive for a few
+  seconds and then it vanishes, because the process dies with the shell that
+  spawned it — which looks exactly like a startup crash and is not one. Launch it
+  as a managed background task instead, and confirm with `tasklist` *and* a
+  window query before concluding anything. Rebuilding also needs
+  `Stop-Process -Name Snor` first, or the link fails with `os error 5` on the
+  locked exe.
+  - `prompt_gap.py` / `scan_row.py` / `scan_col.py` profile colour runs along
+    a row or column, for measuring clearances in pixels.
+  - All of these need Pillow, which the managed Python 3.13 does not have. Use
+    the system Python 3.12.
 
 ## Conventions
 

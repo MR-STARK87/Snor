@@ -528,6 +528,40 @@ impl Editor {
         }
     }
 
+    /// Close tab `idx`, keeping `active` on a real tab.
+    ///
+    /// Returns `true` while tabs remain. A `false` means the list is now empty
+    /// and **the caller must stop drawing the frame**: everything below the tab
+    /// bar indexes `tabs`, and an empty list makes `tabs.len() - 1` underflow.
+    /// That is `usize`, so it is a panic rather than a negative index — the bug
+    /// that made "close the last open file" take the whole app down.
+    ///
+    /// The `is_empty` guard at the top of `ui()` cannot catch it. That guard
+    /// runs before the tab bar is drawn; the close is applied *during* the
+    /// frame, so the list goes empty with most of the frame still to draw.
+    pub fn close_tab(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return !self.tabs.is_empty();
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+            self.find_open = false;
+            // The status bar keeps drawing `Ln x, Col y` from these fields, and
+            // nothing else resets them while the editor is empty — `empty_state`
+            // draws no code area, and the readout below the tab bar is skipped
+            // by the caller's early return. Without this the bar would advertise
+            // the closed file's last cursor position indefinitely.
+            self.cursor_line = 1;
+            self.cursor_col = 1;
+            return false;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
     pub fn active_lang(&self) -> String {
         self.tabs
             .get(self.active)
@@ -623,16 +657,12 @@ impl Editor {
                     // on the tab strip's "+", and the strip is not drawn while
                     // nothing is open, so without this there is no way left to
                     // reach a file outside the project root.
-                    let browse = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new("or browse for a file elsewhere…")
-                                    .size(11.5)
-                                    .color(crate::theme::faint()),
-                            )
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let browse = crate::widgets::clickable_label(
+                        ui,
+                        egui::RichText::new("or browse for a file elsewhere…")
+                            .size(11.5)
+                            .color(crate::theme::faint()),
+                    );
                     if browse.clicked()
                         && let Some(path) =
                             rfd::FileDialog::new().set_directory(workdir).pick_file()
@@ -751,9 +781,8 @@ impl Editor {
                                                 crate::theme::dim_text()
                                             },
                                         );
-                                        if ui
-                                            .add(egui::Label::new(text).sense(egui::Sense::click()))
-                                            .clicked()
+                                        // Same as the terminal's tab strip.
+                                        if crate::widgets::clickable_label(ui, text).clicked()
                                         {
                                             self.active = idx;
                                             tab_switched = true;
@@ -789,16 +818,31 @@ impl Editor {
                 }
             });
             if let Some(idx) = close_idx {
-                self.tabs.remove(idx);
-                if self.active >= self.tabs.len() && !self.tabs.is_empty() {
-                    self.active = self.tabs.len() - 1;
+                // `false` means the list just went empty, so nothing is left to
+                // switch to. `tab_switched` deliberately stays as it is —
+                // `recompute_find()` below indexes the active tab, and the
+                // frame returns early right after this block anyway.
+                if self.close_tab(idx) {
+                    tab_switched = true;
                 }
-                tab_switched = true;
             }
             if tab_switched {
                 self.recompute_find();
             }
         });
+        // Closing the last tab empties the list *mid-frame*. The `is_empty`
+        // guard at the top of `ui()` has already run by the time this close is
+        // applied, so the rest of the frame has to be skipped by hand.
+        //
+        // Without this, the metadata row further down evaluates
+        // `self.tabs.len() - 1` on an empty list. `usize` cannot go negative,
+        // so that subtraction overflows — a panic in debug builds, which is
+        // what "close the last open file" used to do to the whole app. The
+        // next frame redraws through the normal empty-state path.
+        if self.tabs.is_empty() {
+            self.find_open = false;
+            return;
+        }
         ui.separator();
 
         if let Some(err) = &self.error {
@@ -1041,6 +1085,63 @@ mod tests {
         assert!(!ed.tabs[0].dirty);
         let back = std::fs::read_to_string(&path).unwrap();
         assert!(back.contains("// edited"), "saved text missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn closing_the_last_tab_empties_the_list_without_underflow() {
+        // Regression. `Editor::ui` used to close a tab inline and then carry on
+        // drawing the frame, where `self.tabs[self.active.min(self.tabs.len() - 1)]`
+        // ran against a now-empty list. `usize` cannot go negative, so closing
+        // the only open file panicked with "attempt to subtract with overflow"
+        // and took the whole app down with it. `close_tab` now reports the empty
+        // case so the caller can bail out of the frame before that line is
+        // reached.
+        let dir = std::env::temp_dir().join("snor_editor_close_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ed = Editor::new();
+
+        // Closing with nothing open is a no-op, not a panic.
+        assert!(!ed.close_tab(0));
+        assert!(ed.tabs.is_empty());
+
+        for i in 0..3 {
+            let path = dir.join(format!("f{i}.rs"));
+            std::fs::write(&path, "fn main() {}\n").unwrap();
+            ed.open_file(path);
+        }
+        assert_eq!(ed.tabs.len(), 3);
+        assert_eq!(ed.active, 2, "the newest tab is the active one");
+
+        // Closing a tab *before* the active one must not steal the selection:
+        // the same file stays open, just at a lower index.
+        let active_path = ed.tabs[ed.active].path.clone();
+        assert!(ed.close_tab(0));
+        assert_eq!(ed.tabs.len(), 2);
+        assert_eq!(ed.active, 1);
+        assert_eq!(ed.tabs[ed.active].path, active_path);
+
+        // Closing the active tab hands over to the last remaining one.
+        assert!(ed.close_tab(1));
+        assert_eq!(ed.tabs.len(), 1);
+        assert_eq!(ed.active, 0);
+
+        // The one that used to take the app down.
+        ed.cursor_line = 42;
+        ed.cursor_col = 7;
+        assert!(!ed.close_tab(0), "an emptied list must report false");
+        assert!(ed.tabs.is_empty());
+        assert_eq!(ed.active, 0);
+        assert!(!ed.find_open, "the find bar must not outlive the last tab");
+        assert_eq!(
+            (ed.cursor_line, ed.cursor_col),
+            (1, 1),
+            "the status bar must not keep the closed file's position"
+        );
+
+        // Out-of-range stays safe, empty or not.
+        assert!(!ed.close_tab(7));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

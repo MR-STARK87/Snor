@@ -356,6 +356,18 @@ impl Terminal {
         Some(id)
     }
 
+    /// Open a shell in `cwd`, make it the active tab, and bring the section
+    /// back if it had been closed off. The entry point for the explorer's
+    /// "open terminal here".
+    ///
+    /// `new_tab` already clears `collapsed` on the grounds that a new shell you
+    /// cannot see is not a new shell; `hidden` is the stronger form of the same
+    /// problem and is cleared here, for the same reason.
+    pub fn open_at(&mut self, cwd: &PathBuf) {
+        self.hidden = false;
+        self.new_tab(cwd);
+    }
+
     /// Append a shell without opening a real pty, so the tab bookkeeping can
     /// be tested hermetically. Everything except the `spawn` call is the same
     /// as `new_tab`, and the title comes from the same `next_free_title`, so a
@@ -740,6 +752,12 @@ impl Terminal {
         // `&mut self` for close/new does not work, and cloning a handful of
         // short titles per frame is cheaper than restructuring around it.
         let titles: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
+        // Each tab's directory as well, for its hover hint. Auto context
+        // switching makes the tab you click decide which project the explorer
+        // shows, and "powershell 3" says nothing about which project that is —
+        // so the one piece of information the click depends on was the one
+        // piece the strip did not show.
+        let dirs: Vec<String> = self.sessions.iter().map(|s| short_cwd(&s.cwd)).collect();
         let active_tab = self.active_tab;
         let error = self.session().and_then(|s| s.error.clone());
         let reveal_active_tab = self.reveal_active_tab;
@@ -793,13 +811,15 @@ impl Terminal {
                                             } else {
                                                 crate::theme::dim_text()
                                             });
-                                        if ui
-                                            .add(
-                                                eframe::egui::Label::new(label)
-                                                    .sense(eframe::egui::Sense::click()),
-                                            )
-                                            .clicked()
-                                        {
+                                        // A tab is a button, not selectable
+                                        // text — see `widgets::clickable_label`
+                                        // for the three separate things that
+                                        // has to mean.
+                                        let resp = crate::widgets::clickable_label(ui, label)
+                                            .on_hover_text(
+                                                dirs.get(idx).cloned().unwrap_or_default(),
+                                            );
+                                        if resp.clicked() {
                                             switch_to = Some(idx);
                                         }
                                         if crate::icons::icon_button(
@@ -978,6 +998,11 @@ impl Terminal {
         }
 
         ui.separator();
+        // Same air the Flow panes leave under their focus band, so the shell's
+        // first line sits the same distance below its header in both views.
+        // Inserted *before* the grid is measured, so `grid_max` and the rows
+        // derived from it both shrink by this much and the PTY stays in step.
+        ui.add_space(GRID_TOP_GAP);
 
         let job = match self.session() {
             Some(session) => term_job(session.parser.screen()),
@@ -998,26 +1023,38 @@ impl Terminal {
         // Size the live shell to the grid it is about to paint: rows and
         // columns come from these pixels, so window resizes reflow the
         // ConPTY instead of clipping it. Unchanged dimensions are a no-op.
+        //
+        // Measured from the *inset* rect, not the panel's raw width: the shell
+        // is told how many columns the padded grid can actually show, so the
+        // last column does not wrap onto a row of its own.
+        let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
         let cell = term_cell_size(ui);
-        let (rows, cols) = term_size_for_pixels(ui.available_width().max(0.0), grid_max, cell);
+        let (rows, cols) = term_size_for_pixels(grid_rect.width().max(0.0), grid_max, cell);
         if let Some(session) = self.session_mut() {
             session.apply_size(rows, cols);
         }
         let mut grid_clicked = false;
-        eframe::egui::ScrollArea::vertical()
-            .id_salt("snor_term_grid")
-            .max_height(grid_max)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.push_id("snor_term_grid_label", |ui| {
-                    let resp = ui.add(
-                        eframe::egui::Label::new(job)
-                            .extend()
-                            .sense(eframe::egui::Sense::click()),
-                    );
-                    grid_clicked = resp.clicked();
-                });
-            });
+        ui.scope_builder(
+            eframe::egui::UiBuilder::new()
+                .max_rect(grid_rect)
+                .layout(eframe::egui::Layout::top_down(eframe::egui::Align::LEFT)),
+            |ui| {
+                eframe::egui::ScrollArea::vertical()
+                    .id_salt("snor_term_grid")
+                    .max_height(grid_max)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.push_id("snor_term_grid_label", |ui| {
+                            let resp = ui.add(
+                                eframe::egui::Label::new(job)
+                                    .extend()
+                                    .sense(eframe::egui::Sense::click()),
+                            );
+                            grid_clicked = resp.clicked();
+                        });
+                    });
+            },
+        );
         if grid_clicked {
             self.active = true;
         }
@@ -1349,11 +1386,51 @@ impl FlowGrid {
 /// constant so the two can never disagree about how big a cell is.
 const TERM_FONT_SIZE: f32 = 12.5;
 
-/// Height of a Flow pane's header row — the focus dot plus the title and
-/// directory labels. Reserved out of the pane's rectangle before its rows
-/// and columns are computed, so the PTY is never told it has a line the
-/// grid does not actually show.
+/// Height of a Flow pane's header row — the focus band and its marker. No
+/// text: the shell prints its own prompt, so naming the pane here only ever
+/// duplicated it. Reserved out of the pane's rectangle before its rows and
+/// columns are computed, so the PTY is never told it has a line the grid does
+/// not actually show.
 const PANE_HEADER_H: f32 = 18.0;
+/// Air between a terminal's header and the shell's first row.
+///
+/// The prompt used to sit flush against whatever sat above it — the pane's
+/// focus band in Flow mode, the tab strip's separator in normal mode — which
+/// read as text crammed under a rule. Deliberately small: this is breathing
+/// room, not a margin. Both views read this one constant so the shell's first
+/// line lands the same distance down in either, rather than each growing its
+/// own private nudge.
+const GRID_TOP_GAP: f32 = 5.0;
+/// Air between a terminal's own side edges and its first and last column.
+///
+/// The prompt used to start flush against the pane's vertical boundary — the
+/// rule above the tab strip in normal mode, the pane's own outline in Flow mode
+/// — so the first glyph of `PS C:\...>` read as touching the edge. Same idea as
+/// `GRID_TOP_GAP`, measured on the other axis, and deliberately a different
+/// number: a line of text wants less air above it than a column of text wants
+/// beside it.
+///
+/// Applied to **both** sides. Padding only the left would leave a line that
+/// fills the grid running into the right edge, which reads as a bug rather than
+/// a margin.
+///
+/// Like the header height, this is spent *before* the shell is sized: the
+/// columns come from the padded width, so the PTY is never promised a column
+/// the padded grid cannot show.
+const GRID_SIDE_GAP: f32 = 8.0;
+/// Everything a pane spends above its first grid row: the painted header band
+/// plus the air under it.
+///
+/// `size_panes` and the renderer both read this one value rather than adding
+/// the two constants up separately, because the two *must* agree. They are the
+/// same measurement taken from opposite ends — the PTY's row count and the
+/// pixels the grid is actually given — and the bug this guards against is
+/// exactly that they drift: the header was originally held open as a side
+/// effect of laying out a label row, so deleting the labels shrank the chrome
+/// in the renderer while `size_panes` kept subtracting the old height. The
+/// shell was then promised fewer rows than the pane could show, which is the
+/// same class of mismatch as the frozen half-resized TUI frame.
+const PANE_TOP_CHROME: f32 = PANE_HEADER_H + GRID_TOP_GAP;
 /// Slack the renderer leaves under a pane's grid inside its scroll area.
 /// Subtracted alongside the header for the same reason.
 const PANE_GRID_PAD: f32 = 4.0;
@@ -1391,6 +1468,25 @@ fn term_size_for_pixels(width: f32, height: f32, cell: (f32, f32)) -> (u16, u16)
     )
 }
 
+/// A pane's rectangle with [`GRID_SIDE_GAP`] taken off the left and right.
+///
+/// `size_panes` sizes the shell from this rect and `render_pane` draws the grid
+/// into it, so both read the same function instead of each subtracting the gap
+/// by hand. That is the lesson of the header-height bug documented on
+/// `PANE_TOP_CHROME`: two sites computing one measurement separately will drift,
+/// and the drift is invisible until a shell is told it has a column the grid
+/// does not draw.
+fn inset_grid_sides(rect: eframe::egui::Rect) -> eframe::egui::Rect {
+    // Clamped to half the width, so a pane narrower than its own padding still
+    // yields a sane (non-inverted) rect rather than a negative width that would
+    // clamp every column count up to `MIN_TERM_COLS`.
+    let gap = GRID_SIDE_GAP.min(rect.width() / 2.0);
+    eframe::egui::Rect::from_min_max(
+        eframe::egui::pos2(rect.left() + gap, rect.top()),
+        eframe::egui::pos2(rect.right() - gap, rect.bottom()),
+    )
+}
+
 /// Last ~32 chars of a working directory for pane headers. Char-wise, so
 /// multi-byte paths cannot panic the slice.
 fn short_cwd(path: &std::path::Path) -> String {
@@ -1422,14 +1518,32 @@ impl Terminal {
             .find(|id| self.index_of(*id).is_some())
     }
 
-    /// Working directory of the focused flow pane, for the explorer to adopt
-    /// when the user returns to normal mode.
-    pub fn flow_focused_cwd(&self) -> Option<PathBuf> {
-        let id = self.flow_target_id()?;
-        self.sessions
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.cwd.clone())
+    /// The session the user is working in, with its directory: the focused pane
+    /// in Flow Mode, the active tab otherwise. `flow` is passed in rather than
+    /// read from a field because the terminal has no mode flag — the shell owns
+    /// that decision, and `flow_target_id` answers in either mode.
+    ///
+    /// This is what auto context switching follows. `session.cwd` is the
+    /// directory a shell was *spawned* in, not one it has `cd`-ed into since:
+    /// nothing here parses the shell's own output, so a pane that changes
+    /// directory by hand keeps the directory it started with. That is the
+    /// honest limit of the feature — see `SnorApp::sync_context_root`.
+    pub fn context_session(&self, flow: bool) -> Option<(u64, PathBuf)> {
+        // A hidden terminal has no focused tab to speak of, and the section is
+        // not on screen to prove otherwise — leaving the explorer where it is
+        // beats re-rooting it to something the user cannot see.
+        if self.hidden || self.sessions.is_empty() {
+            return None;
+        }
+        if flow {
+            let id = self.flow_target_id()?;
+            self.sessions
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| (s.id, s.cwd.clone()))
+        } else {
+            self.session().map(|s| (s.id, s.cwd.clone()))
+        }
     }
 
     /// Enter Flow Mode: reconcile the kept grid with live sessions. Dead
@@ -1656,9 +1770,13 @@ impl Terminal {
                     continue;
                 };
                 let rect = self.flow_grid.cell_rect(area, r, c);
-                // The header eats its own line before the grid starts.
-                let grid_h = (rect.height() - PANE_HEADER_H - PANE_GRID_PAD).max(0.0);
-                let (rows, cols) = term_size_for_pixels(rect.width(), grid_h, cell);
+                // The header band and the air under it, as one measurement.
+                let grid_h = (rect.height() - PANE_TOP_CHROME - PANE_GRID_PAD).max(0.0);
+                // Side air comes off the width through the same helper
+                // `render_pane` draws with, so the columns handed to the shell
+                // are the columns the padded grid shows.
+                let grid_w = inset_grid_sides(rect).width();
+                let (rows, cols) = term_size_for_pixels(grid_w, grid_h, cell);
                 sizes.push((id, rows, cols));
             }
         }
@@ -1749,7 +1867,11 @@ impl<'a> FlowView<'a> {
         } else if resp.hovered() {
             (crate::theme::text(), 2.0)
         } else {
-            (crate::theme::hairline(), 1.0)
+            // Idle seams carry the pane_edge colour at 1.5pt rather than a
+            // 1pt hairline: at hairline weight a four-pane grid read as one
+            // continuous sheet with faint marks on it, which is the opposite
+            // of what a tiling workspace is for.
+            (crate::theme::pane_edge(), 1.5)
         };
         let stroke = eframe::egui::Stroke::new(width, tint);
         if vertical {
@@ -1759,15 +1881,15 @@ impl<'a> FlowView<'a> {
         }
     }
 
-    /// One pane: a small header (focus dot, title, directory) over the
-    /// shell's own grid. The grid is the click target — clicking focuses the
-    /// pane and latches typing, exactly like the normal terminal.
+    /// One pane: a small header (focus marker, prompt) over the shell's own
+    /// grid. The grid is the click target — clicking focuses the pane and
+    /// latches typing, exactly like the normal terminal.
     fn render_pane(&mut self, ui: &mut eframe::egui::Ui, id: u64, rect: eframe::egui::Rect) {
         use eframe::egui::{Align, Layout};
         let focused = *self.focus == Some(id);
         // Snapshot the header first; the borrow ends before any widget.
-        let (title, cwd_name, error) = match self.sessions.iter().find(|s| s.id == id) {
-            Some(s) => (s.title.clone(), short_cwd(&s.cwd), s.error.clone()),
+        let error = match self.sessions.iter().find(|s| s.id == id) {
+            Some(s) => s.error.clone(),
             None => return,
         };
         ui.scope_builder(
@@ -1775,39 +1897,46 @@ impl<'a> FlowView<'a> {
                 .max_rect(rect)
                 .layout(Layout::top_down(Align::LEFT)),
             |ui| {
-                ui.horizontal(|ui| {
-                    if focused {
-                        // Painted, not typed: egui's bundled fonts have no
-                        // dependable bullet coverage, and a missing glyph
-                        // renders as tofu. Same treatment as the tab strip.
-                        let (slot, _) = ui.allocate_exact_size(
-                            eframe::egui::vec2(10.0, 10.0),
-                            eframe::egui::Sense::hover(),
-                        );
-                        ui.painter_at(slot).circle_filled(
-                            slot.center(),
-                            3.5,
-                            crate::theme::accent(),
-                        );
-                    }
-                    ui.label(
-                        eframe::egui::RichText::new(title)
-                            .size(12.0)
-                            .color(if focused {
-                                crate::theme::text()
-                            } else {
-                                crate::theme::dim_text()
-                            }),
+                // The header band carries focus and nothing else.
+                //
+                // It used to name the pane — "powershell C:\My work folder\
+                // Snor", later a prompt-shaped "PS C:\...\Snor>". Both were
+                // the shell's own first line written out a second time: the
+                // shell prints `PS C:\My work folder\Snor>` itself, one row
+                // below, so every new pane opened with two identical path
+                // entries stacked. The shell's line cannot be taken away, so
+                // the copy is the one that goes. Dimming it only made the
+                // duplication quieter, which is not the same as fixing it.
+                //
+                // What is left is what the header was actually for: a strip
+                // that says which pane is live. The pane's directory is still
+                // legible from the shell's own prompt, and the explorer
+                // follows the focused terminal (`SnorApp::sync_context_root`),
+                // so the workspace names the project too.
+                if focused {
+                    let header = eframe::egui::Rect::from_min_size(
+                        rect.min,
+                        eframe::egui::vec2(rect.width(), PANE_HEADER_H),
                     );
-                    ui.label(
-                        eframe::egui::RichText::new(cwd_name)
-                            .size(11.0)
-                            .color(crate::theme::faint()),
+                    ui.painter()
+                        .rect_filled(header, 0.0, crate::theme::surface_title());
+                    let bar = eframe::egui::Rect::from_min_size(
+                        eframe::egui::pos2(rect.left() + 3.0, rect.top() + 3.0),
+                        eframe::egui::vec2(2.0, PANE_HEADER_H - 6.0),
                     );
-                });
+                    ui.painter().rect_filled(bar, 1.0, crate::theme::accent());
+                }
                 if let Some(err) = error {
                     ui.colored_label(crate::theme::danger(), err);
                 }
+                // The header is *painted*, not laid out, so its height has to
+                // be reserved by hand. The label row that used to sit here was
+                // the only thing holding the space open — removing the text
+                // silently let the grid climb into the band, which both put the
+                // prompt back against the top edge and left `size_panes`
+                // promising the shell fewer rows than the pane could show.
+                // `PANE_TOP_CHROME` is the same measurement `size_panes` uses.
+                ui.add_space(PANE_TOP_CHROME);
                 // The shell was already sized to this pane by `size_panes`,
                 // before the ptys were drained — see `flow_ui`. Sizing here
                 // instead would resize the ConPTY after its output for this
@@ -1818,32 +1947,45 @@ impl<'a> FlowView<'a> {
                 };
                 let grid_max = (ui.available_height() - 2.0).max(40.0);
                 let mut clicked = false;
-                eframe::egui::ScrollArea::vertical()
-                    .id_salt(("snor_flow_grid", id))
-                    .max_height(grid_max)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.push_id(("snor_flow_grid_label", id), |ui| {
-                            let resp = ui.add(
-                                eframe::egui::Label::new(job)
-                                    .extend()
-                                    .sense(eframe::egui::Sense::click()),
-                            );
-                            clicked = resp.clicked();
-                        });
-                    });
+                // The grid is drawn into the side-inset rect, so the pane's own
+                // outline does not have the prompt's first glyph sitting on it.
+                ui.scope_builder(
+                    eframe::egui::UiBuilder::new()
+                        .max_rect(inset_grid_sides(ui.available_rect_before_wrap()))
+                        .layout(eframe::egui::Layout::top_down(eframe::egui::Align::LEFT)),
+                    |ui| {
+                        eframe::egui::ScrollArea::vertical()
+                            .id_salt(("snor_flow_grid", id))
+                            .max_height(grid_max)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.push_id(("snor_flow_grid_label", id), |ui| {
+                                    let resp = ui.add(
+                                        eframe::egui::Label::new(job)
+                                            .extend()
+                                            .sense(eframe::egui::Sense::click()),
+                                    );
+                                    clicked = resp.clicked();
+                                });
+                            });
+                    },
+                );
                 if clicked {
                     *self.focus = Some(id);
                     *self.latched = true;
                 }
             },
         );
-        // The only focus chrome: a hairline that warms to a dimmed accent.
-        // No glow, no banner — the shell text stays the loudest thing.
+        // The pane's outline. Unfocused it is the pane seam — deliberately
+        // brighter than the hairline used elsewhere, because two recessed
+        // slabs meeting edge to edge have nothing else to tell them apart.
+        // Focused it warms to a dimmed accent, which is the second half of
+        // the focus cue: the bar says *which* pane, the outline says the
+        // pane is live.
         let border = if focused {
-            crate::theme::accent().gamma_multiply(0.45)
+            crate::theme::accent().gamma_multiply(0.55)
         } else {
-            crate::theme::hairline()
+            crate::theme::pane_edge()
         };
         ui.painter().rect_stroke(
             rect,
@@ -2308,8 +2450,8 @@ mod tests {
         );
     }
 
-    /// Each pane keeps its own directory, and the focused one reports it
-    /// for the explorer to adopt on the way back to normal mode.
+    /// Each pane keeps its own directory, and the focused one reports it for
+    /// the explorer to adopt.
     #[test]
     fn flow_panes_keep_their_directories() {
         let mut t = Terminal::new();
@@ -2320,14 +2462,45 @@ mod tests {
         let order = leaves(&t);
         t.flow_focus = Some(order[0]);
         assert_eq!(
-            t.flow_focused_cwd(),
+            t.context_session(true).map(|(_, cwd)| cwd),
             Some(std::path::PathBuf::from(r"C:\Projects\Backend"))
         );
         t.flow_step_focus(1);
         assert_eq!(
-            t.flow_focused_cwd(),
+            t.context_session(true).map(|(_, cwd)| cwd),
             Some(std::path::PathBuf::from(r"C:\Projects\Frontend"))
         );
+    }
+
+    /// Outside Flow Mode the context is the active *tab*, not the pane grid —
+    /// the two answer from different state, and auto context switching would
+    /// follow the wrong one if this were wired to `flow_target_id` alone.
+    #[test]
+    fn context_session_follows_the_active_tab_in_normal_mode() {
+        let mut t = Terminal::new();
+        t.sessions[0].cwd = std::path::PathBuf::from(r"C:\Projects\One");
+        let second = t.open_stub_tab().expect("stub tab");
+        t.sessions[1].cwd = std::path::PathBuf::from(r"C:\Projects\Two");
+
+        t.active_tab = 0;
+        assert_eq!(
+            t.context_session(false).map(|(_, cwd)| cwd),
+            Some(std::path::PathBuf::from(r"C:\Projects\One"))
+        );
+        t.active_tab = 1;
+        let (id, cwd) = t.context_session(false).expect("a context");
+        assert_eq!(id, second, "the id is what the caller keys its sync on");
+        assert_eq!(cwd, std::path::PathBuf::from(r"C:\Projects\Two"));
+    }
+
+    /// A hidden terminal reports no context: the section is not on screen, so
+    /// re-rooting the explorer to it would be a change the user cannot see.
+    #[test]
+    fn hidden_terminal_reports_no_context() {
+        let mut t = Terminal::new();
+        t.hidden = true;
+        assert!(t.context_session(false).is_none());
+        assert!(t.context_session(true).is_none());
     }
 
     /// New panes inherit the focused pane's directory.
@@ -2440,19 +2613,73 @@ mod tests {
     /// bottom of the visible grid.
     #[test]
     fn flow_pane_sizing_reserves_its_header() {
-        use super::{PANE_GRID_PAD, PANE_HEADER_H};
+        use super::{PANE_GRID_PAD, PANE_TOP_CHROME};
         let cell = (10.0, 10.0);
         let pane_h = 400.0;
         // 400px with a header and the grid's slack left is not 40 rows.
         let (rows, _) = term_size_for_pixels(1000.0, pane_h, cell);
         assert_eq!(rows, 40);
-        let grid_h = pane_h - PANE_HEADER_H - PANE_GRID_PAD;
+        // `PANE_TOP_CHROME` is the one value the renderer reserves and this
+        // subtraction uses, so the two cannot drift — the header was once held
+        // open as a side effect of laying out a label row, and deleting the
+        // labels shrank the chrome in the renderer while this kept subtracting
+        // the old height, promising the shell fewer rows than the pane showed.
+        let grid_h = pane_h - PANE_TOP_CHROME - PANE_GRID_PAD;
         let (rows_reserved, _) = term_size_for_pixels(1000.0, grid_h, cell);
         assert_eq!(rows_reserved, 37, "the header must cost the shell its rows");
         assert!(
             rows_reserved < rows,
             "reserving the header can only shrink the grid, never grow it"
         );
+    }
+
+    /// The same invariant on the other axis: the side air is spent before the
+    /// shell is sized, so the columns it is given are the columns the padded
+    /// grid can draw.
+    ///
+    /// The failure this guards is subtle — a shell sized to the unpadded width
+    /// has one more column than the grid shows, so a full-width line wraps and
+    /// the last character lands on a row of its own, which looks like the shell
+    /// mis-measuring rather than like padding.
+    #[test]
+    fn flow_pane_sizing_reserves_its_side_gaps() {
+        use super::{GRID_SIDE_GAP, inset_grid_sides};
+        let cell = (10.0, 10.0);
+        let rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(1000.0, 400.0),
+        );
+        let (_, cols) = term_size_for_pixels(rect.width(), 400.0, cell);
+        assert_eq!(cols, 100);
+
+        let padded = inset_grid_sides(rect);
+        assert_eq!(padded.left(), GRID_SIDE_GAP);
+        assert_eq!(padded.right(), rect.right() - GRID_SIDE_GAP);
+        assert_eq!(padded.top(), rect.top(), "the vertical edges must not move");
+        assert_eq!(
+            padded.bottom(),
+            rect.bottom(),
+            "the vertical edges must not move"
+        );
+
+        let (_, cols_padded) = term_size_for_pixels(padded.width(), 400.0, cell);
+        assert_eq!(cols_padded, 98, "the side air must cost the shell its columns");
+        assert!(cols_padded < cols);
+    }
+
+    /// A pane narrower than its own padding must not invert its rectangle.
+    #[test]
+    fn inset_grid_sides_survives_a_pane_narrower_than_its_padding() {
+        use super::{GRID_SIDE_GAP, inset_grid_sides};
+        let thin = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(5.0, 5.0),
+            eframe::egui::vec2(GRID_SIDE_GAP, 40.0),
+        );
+        let padded = inset_grid_sides(thin);
+        assert_eq!(padded.width(), 0.0, "the gap clamps to half the width");
+        assert!(padded.left() <= padded.right(), "the rect must not invert");
+        assert_eq!(padded.top(), thin.top());
+        assert_eq!(padded.bottom(), thin.bottom());
     }
 
     /// Resizing a shell updates its stored size and its vt100 screen, and

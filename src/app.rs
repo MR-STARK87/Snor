@@ -118,6 +118,18 @@ pub struct SnorApp {
     /// Explorer width, driven by our own grip rather than egui's built-in
     /// panel resize. See [`SnorApp::tree_grip`] for why.
     tree_w: f32,
+    /// Session whose directory the explorer is currently showing. Auto context
+    /// switching keys on a *change* of this, not on the directories differing
+    /// — see [`SnorApp::sync_context_root`] for why that distinction is the
+    /// whole design.
+    ctx_session: Option<u64>,
+    /// Was the window maximised when F11 was pressed? Entering fullscreen
+    /// deliberately restores the window first (see the F11 handler), so
+    /// leaving it has to put the maximise back by hand — winit can only
+    /// restore the placement it saved, and it saves it *after* the restore.
+    /// Without this, exiting fullscreen would drop the window back to its
+    /// floating size instead of the maximised one the user left.
+    restore_maximized: bool,
 }
 
 impl SnorApp {
@@ -134,6 +146,8 @@ impl SnorApp {
             flow: false,
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
+            ctx_session: None,
+            restore_maximized: false,
         }
     }
 
@@ -290,6 +304,88 @@ impl SnorApp {
         ui.spacing_mut().item_spacing.x = step;
     }
 
+    /// Dim Mode says so, on screen.
+    ///
+    /// Lowering the backlight is invisible to anyone who did not press the
+    /// key: the window just looks dark, and "dark theme on a dim monitor" is
+    /// indistinguishable from "Dim Mode is on". The title-bar moon and the
+    /// status-bar word are both inside chrome the eye skips. So this is the
+    /// acknowledgement — a pill that states the mode and the way out.
+    ///
+    /// Three deliberate properties:
+    ///
+    /// * Painted on the foreground layer, last, so no panel can cover it.
+    /// * Painted, never built from widgets: a badge that can take a click is
+    ///   a badge that can swallow one meant for the shell underneath.
+    /// * Ink is the bright accent on a dark pill rather than the reverse. The
+    ///   screen is at `dim_level`% while this is visible, so it has to stay
+    ///   legible after the backlight has already taken most of its contrast
+    ///   away; the pill's own fill is the part that can afford to be dark.
+    fn dim_overlay(&self, ui: &egui::Ui) {
+        if !self.dim.is_active() {
+            return;
+        }
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("snor_dim_overlay"),
+        ));
+
+        let title_font = egui::FontId::new(11.5, theme::medium());
+        let hint_font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+        let title =
+            painter.layout_no_wrap("DIM MODE ACTIVE".to_owned(), title_font, theme::accent());
+        let hint = painter.layout_no_wrap(
+            format!(
+                "screen at {}%  ·  Ctrl+Shift+D to restore",
+                self.dim.dim_level()
+            ),
+            hint_font,
+            theme::dim_text(),
+        );
+
+        const ICON: f32 = 13.0;
+        const ICON_GAP: f32 = 9.0;
+        let pad = egui::vec2(14.0, 9.0);
+        let line_gap = 3.0;
+        let title_h = title.size().y;
+        let text_w = title.size().x.max(hint.size().x);
+        let text_h = title_h + line_gap + hint.size().y;
+        let size = egui::vec2(pad.x * 2.0 + ICON + ICON_GAP + text_w, pad.y * 2.0 + text_h);
+
+        // Bottom-centre, clear of the status bar's own row.
+        let viewport = ui.ctx().viewport_rect();
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(
+                viewport.center().x - size.x * 0.5,
+                viewport.bottom() - 34.0 - size.y,
+            ),
+            size,
+        );
+        painter.rect_filled(pill, 8.0, theme::surface_title());
+        painter.rect_stroke(
+            pill,
+            8.0,
+            egui::Stroke::new(1.5, theme::accent().gamma_multiply(0.7)),
+            egui::StrokeKind::Inside,
+        );
+
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(pill.left() + pad.x + ICON * 0.5, pill.center().y),
+            egui::vec2(ICON, ICON),
+        );
+        icons::moon(&painter, icon_rect, theme::accent());
+
+        let text_x = pill.left() + pad.x + ICON + ICON_GAP;
+        let text_y = pill.center().y - text_h * 0.5;
+        painter.galley(egui::pos2(text_x, text_y), title, theme::accent());
+        painter.galley(
+            egui::pos2(text_x, text_y + title_h + line_gap),
+            hint,
+            theme::dim_text(),
+        );
+    }
+
+    /// The window's resize bands: the outermost few points of the client area,
     /// Grab bands along the window's edges and corners.
     ///
     /// Undecorated windows have no OS frame to grab, so resizing has to be
@@ -300,7 +396,13 @@ impl SnorApp {
     fn window_resize_bands(ui: &mut egui::Ui) {
         use egui::ViewportCommand as Cmd;
 
-        if ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false)) {
+        // Fullscreen too: the window covers the monitor exactly, so there is
+        // nothing to drag it out to, and leaving the bands live would put
+        // resize arrows on the screen's own edges — including over the top
+        // edge where the title bar used to be.
+        if ui.ctx().input(|i| {
+            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+        }) {
             return;
         }
         let r = ui.ctx().viewport_rect();
@@ -656,7 +758,6 @@ impl SnorApp {
             let root = self.tree.root.clone();
             self.terminal.flow_ui(ui, &root);
         });
-        self.sync_flow_root();
     }
 
     fn toggle_flow(&mut self) {
@@ -665,7 +766,6 @@ impl SnorApp {
         } else {
             self.enter_flow();
         }
-        self.sync_flow_root();
     }
 
     fn enter_flow(&mut self) {
@@ -681,16 +781,37 @@ impl SnorApp {
         self.terminal.flow_exit_sync();
     }
 
-    /// Adopt the focused pane's directory as the workspace root. The tree
-    /// is hidden in Flow Mode, so this only becomes visible on the way
-    /// back — returning to the focused agent's project, as it should.
-    fn sync_flow_root(&mut self) {
-        if !self.flow {
+    /// Auto context switching: the explorer follows the focused terminal.
+    ///
+    /// Moving to a terminal that was opened somewhere else re-roots the tree at
+    /// that directory, so the file list always describes the project the
+    /// terminal you are typing into belongs to. Works in both modes — the
+    /// focused pane in Flow Mode, the active tab otherwise.
+    ///
+    /// **It fires on a change of focus, not on the directories differing.**
+    /// That distinction is the whole design. Comparing directories every frame
+    /// would fight the user: pick a folder from the header's dialog and the
+    /// very next frame would put the focused shell's directory back, leaving
+    /// the dialog unable to do anything while any terminal is open. Keying on
+    /// the session id means a manual choice survives until focus actually
+    /// moves, which is what "switch context when I move to another terminal"
+    /// is supposed to mean.
+    ///
+    /// The limit worth knowing: `session.cwd` is the directory a shell was
+    /// *spawned* in, not one it has `cd`-ed into since. Nothing in this app
+    /// reads the shell's own output, so a pane that changes directory by hand
+    /// keeps the directory it started with, and the explorer will not follow
+    /// it. Following a `cd` needs OSC 7 emitted by the shell and parsed in
+    /// `terminal.rs`, which PowerShell does not do by default.
+    fn sync_context_root(&mut self) {
+        let Some((id, cwd)) = self.terminal.context_session(self.flow) else {
+            return;
+        };
+        if self.ctx_session == Some(id) {
             return;
         }
-        if let Some(cwd) = self.terminal.flow_focused_cwd()
-            && cwd != self.tree.root
-        {
+        self.ctx_session = Some(id);
+        if cwd != self.tree.root {
             self.tree.set_root(cwd);
         }
     }
@@ -757,6 +878,14 @@ impl eframe::App for SnorApp {
         if std::mem::take(&mut self.editor.want_workspace) {
             self.show_explorer = true;
         }
+        // "Open terminal here" from a folder's context menu. Handled up here
+        // with the other polls so the shell exists by the time the terminal is
+        // drawn this frame. This is also what makes auto context switching
+        // reachable at all: it is the only way to get two terminals that
+        // disagree about which directory they are in.
+        if let Some(dir) = self.tree.take_terminal_request() {
+            self.terminal.open_at(&dir);
+        }
 
         // Ctrl+Tab and Ctrl+B rearrange the *normal* workspace, so they
         // rest while Flow Mode owns the window. Otherwise toggling a hidden
@@ -787,6 +916,62 @@ impl eframe::App for SnorApp {
             })
         {
             self.show_explorer = !self.show_explorer;
+        }
+        // F11: fullscreen. The only window-level command with no modifier —
+        // every plain key belongs to the shell or the editor, but F11 is not a
+        // key either of them has a use for, and it is what every other
+        // application on the machine uses for this.
+        //
+        // The current state is read back from the viewport rather than kept in
+        // a mirrored bool: the OS can leave fullscreen on its own (a screen
+        // lock, another window going fullscreen), and a local flag would then
+        // be wrong in the direction that makes the first press do nothing.
+        //
+        // Handled up here with the other global shortcuts, so it works in
+        // every layout and `consume_key` stops the shell ever seeing the key.
+        //
+        // Read once here and reused by the title bar and the resize bands
+        // below, so all three agree within a frame. A `send_viewport_cmd` does
+        // not take effect until egui-winit has processed the platform output
+        // and winit has reported the new size back, so the flag lags the key by
+        // one frame — harmless, because the window is still being resized.
+        let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen).unwrap_or(false);
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            if fullscreen {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                // Put the maximise back only if that is how we found it.
+                // `take` so a stale flag cannot re-maximise on a later,
+                // unrelated exit.
+                if std::mem::take(&mut self.restore_maximized) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                }
+            } else {
+                // Leave maximised before going fullscreen.
+                //
+                // A window that still carries WS_MAXIMIZE keeps the maximised
+                // *client* size whatever rectangle winit hands `SetWindowPos`:
+                // the window ends up monitor-sized on the outside — so the
+                // taskbar is covered and `GetWindowRect` reads 1920x1080 — while
+                // the client stays at the old work-area height. egui is told the
+                // smaller height, paints only that far, and the bottom band of
+                // the screen is left holding stale pixels. Measured on a
+                // maximised window: fullscreen left the app painting 1920x1020
+                // inside a 1920x1080 window.
+                //
+                // Both commands go to winit's window thread and run in order,
+                // and the un-maximise is a plain `ShowWindow(SW_RESTORE)` — so
+                // the `SetWindowPos` that follows already sees a normal window.
+                self.restore_maximized = maximized;
+                if maximized {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                }
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
         }
         // Dim Mode (Ctrl+Shift+D): lower the display backlight without
         // touching any terminal or agent process. Handled up here with the
@@ -833,7 +1018,6 @@ impl eframe::App for SnorApp {
             self.enter_flow();
             let root = self.tree.root.clone();
             self.terminal.flow_add_pane(&root);
-            self.sync_flow_root();
         }
         if ui.input_mut(|i| {
             i.consume_shortcut(&egui::KeyboardShortcut::new(
@@ -844,7 +1028,6 @@ impl eframe::App for SnorApp {
             self.enter_flow();
             let root = self.tree.root.clone();
             self.terminal.flow_add_pane(&root);
-            self.sync_flow_root();
         }
         // New terminal pane. Flow-only: normal mode already grows shells
         // through the tab strip's `+`, and this must not invent a second
@@ -859,7 +1042,6 @@ impl eframe::App for SnorApp {
         {
             let root = self.tree.root.clone();
             self.terminal.flow_add_pane(&root);
-            self.sync_flow_root();
         }
         // Close the focused pane. Flow-only: outside Flow Mode Ctrl+W-family
         // chords belong to shells and the editor, not to us.
@@ -872,7 +1054,6 @@ impl eframe::App for SnorApp {
             })
         {
             self.terminal.flow_close_focused();
-            self.sync_flow_root();
         }
         // Pane focus, wrapping in grid order. Flow-only and Alt-based, so
         // normal-mode arrow keys (editor caret, shell history) are untouched.
@@ -885,7 +1066,6 @@ impl eframe::App for SnorApp {
             })
         {
             self.terminal.flow_step_focus(1);
-            self.sync_flow_root();
         }
         if self.flow
             && ui.input_mut(|i| {
@@ -896,10 +1076,19 @@ impl eframe::App for SnorApp {
             })
         {
             self.terminal.flow_step_focus(-1);
-            self.sync_flow_root();
         }
 
-        self.title_bar(ui);
+        // No title bar in fullscreen. Ours is drawn by us precisely because the
+        // OS's is off, so hiding it is the only thing that makes the transition
+        // legible: with it left in place the window grows to the whole screen,
+        // the taskbar disappears, and nothing else moves — which is exactly how
+        // "F11 doesn't work, it just hides the taskbar" was reported. The three
+        // window controls go with it; minimise and close have no meaning on a
+        // fullscreen window, and the shortcut that got us here is the one that
+        // leaves.
+        if !fullscreen {
+            self.title_bar(ui);
+        }
         // Shown before the explorer on purpose: in the reference the panel
         // divider stops at the status bar and the bar runs the full window
         // width. Reversing these two puts the bar back on the right of the
@@ -930,6 +1119,13 @@ impl eframe::App for SnorApp {
 
         self.workspace(ui);
 
+        // After the workspace, because that is where focus changes: a click on
+        // a pane or a tab has been applied by the time this runs, so the
+        // explorer re-roots in the same frame the user moved. The tree panel
+        // is drawn above, so it paints the new root on the next frame — one
+        // frame of lag, and a repaint is already requested every 150ms.
+        self.sync_context_root();
+
         if let Some(rect) = panel_rect {
             self.tree_grip(ui, rect);
         }
@@ -953,6 +1149,10 @@ impl eframe::App for SnorApp {
                 egui::Stroke::new(WINDOW_EDGE_W, theme::window_edge()),
                 egui::StrokeKind::Inside,
             );
+
+        // After the frame, so the badge is the topmost thing on screen and
+        // cannot be clipped by the window's own edge.
+        self.dim_overlay(ui);
 
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(150));

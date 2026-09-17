@@ -362,6 +362,10 @@ pub struct FileTree {
     /// itself, because switching roots also re-seeds the editor and terminal
     /// working directory, which the tree does not own.
     open_requested: bool,
+    /// Set by a folder's "open terminal here". Polled by the shell with
+    /// [`FileTree::take_terminal_request`] rather than acted on here, because
+    /// the tree does not own the terminal.
+    terminal_here: Option<PathBuf>,
     pub error: Option<String>,
     pub opened_file: Option<PathBuf>,
 }
@@ -404,6 +408,7 @@ impl FileTree {
             rename_buf: String::new(),
             delete_target: None,
             open_requested: false,
+            terminal_here: None,
             error: None,
             opened_file: None,
         }
@@ -412,6 +417,13 @@ impl FileTree {
     /// Take a pending "open folder" click, clearing the flag.
     pub fn take_open_request(&mut self) -> bool {
         std::mem::take(&mut self.open_requested)
+    }
+
+    /// Take a pending "open terminal here", clearing it. Same shape as
+    /// [`FileTree::take_open_request`] and for the same reason: the tree does
+    /// not own the terminal.
+    pub fn take_terminal_request(&mut self) -> Option<PathBuf> {
+        self.terminal_here.take()
     }
 
     /// Whether `path` is currently shown expanded. Only meaningful for folders.
@@ -783,6 +795,15 @@ impl FileTree {
                     }
                     if ui.button("new folder here").clicked() {
                         self.begin_create(menu_path.clone(), CreateMode::Dir);
+                        ui.close();
+                    }
+                    ui.separator();
+                    // The only way to put a shell anywhere but the workspace
+                    // root. Without it every terminal in the app starts in the
+                    // same directory, and the explorer's auto context
+                    // switching has nothing to switch between.
+                    if ui.button("open terminal here").clicked() {
+                        self.terminal_here = Some(menu_path.clone());
                         ui.close();
                     }
                     ui.separator();
