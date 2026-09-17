@@ -69,6 +69,14 @@ Flow Mode — four agents supervised side by side:
 
 ![Flow Mode: four live terminal panes](docs/screenshots/flow.png)
 
+The editor up close — badge tabs, gutter, tree-sitter highlighting:
+
+![Editor: highlighted Rust with line-number gutter](docs/screenshots/editor.png)
+
+Dim Mode — backlight at 10%, overlay card and status-bar moon showing:
+
+![Dim Mode: overlay card and status-bar indicator](docs/screenshots/dim.png)
+
 ## Quickstart
 
 Prerequisites: Windows 10/11 and a stable Rust toolchain
@@ -113,6 +121,13 @@ number that stays put.
 | V1 debug / release | ~306–313 MB / ~331 MB, 17 MB exe |
 | V1.1 (glow + strip + thin LTO) | ~173 MB / ~167 MB, 12.5 MB exe |
 | Now | ~155 MB peak, ~147 MB commit, ~11 MB exe |
+
+The trimming phenomenon, caught live: 94.7 MB resident *after* Windows
+trimmed the backgrounded window — while peak sits at 155.8 and commit at
+147.3. Same process, three numbers, which is why this section leads with
+methodology instead of a single figure:
+
+![Measured: 94.7 MB resident beside the running window](docs/screenshots/memory.png)
 
 Reproduce it any time:
 
