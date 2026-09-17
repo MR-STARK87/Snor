@@ -23,6 +23,36 @@ const TREE_MAX_W: f32 = 520.0;
 /// Half-width of the explorer's resize grip.
 const TREE_GRAB: f32 = 5.0;
 
+// --- Window placement --------------------------------------------------
+/// Room left at the bottom of the monitor for the taskbar when deciding how
+/// tall a floating window may be.
+///
+/// egui reports `monitor_size`, which is the *whole* monitor — there is no
+/// work-area field to read, so the taskbar has to be estimated. 48pt is the
+/// Windows default taskbar at 125% (60px / 1.25), which is what this machine
+/// runs; at 100% the same bar is 48px, so the number holds on both.
+const TASKBAR_RESERVE: f32 = 48.0;
+/// Floor for the usable height, so a monitor that reports something absurd
+/// (or nothing) cannot produce a zero or negative size.
+const MIN_USABLE_H: f32 = 240.0;
+
+/// Where a floating window should sit so it is fully visible.
+///
+/// Takes the monitor size and the size the window wants, both in egui points,
+/// and returns the size to ask for plus the top-left corner to ask for.
+/// Centred horizontally on the monitor, and vertically on the monitor minus
+/// the taskbar reserve — a window centred on the full monitor height would
+/// still hang its bottom edge under the taskbar.
+///
+/// Pure so it can be tested without a window; see
+/// `floating_window_is_placed_fully_on_screen`.
+fn fit_to_monitor(monitor: egui::Vec2, want: egui::Vec2) -> (egui::Vec2, egui::Pos2) {
+    let usable_h = (monitor.y - TASKBAR_RESERVE).max(MIN_USABLE_H);
+    let size = egui::vec2(want.x.min(monitor.x.max(1.0)), want.y.min(usable_h));
+    let pos = egui::pos2((monitor.x - size.x) * 0.5, (usable_h - size.y) * 0.5);
+    (size, pos)
+}
+
 // --- Chrome heights ----------------------------------------------------
 //
 // Measured off the reference mock (which renders at 125%) and converted to
@@ -130,6 +160,12 @@ pub struct SnorApp {
     /// Without this, exiting fullscreen would drop the window back to its
     /// floating size instead of the maximised one the user left.
     restore_maximized: bool,
+    /// Has the one-shot "put the floating window fully on screen" run?
+    ///
+    /// The window cannot be placed before it exists, so this happens on the
+    /// first frame rather than in `main.rs`. See
+    /// [`SnorApp::fit_window_on_first_frame`].
+    window_fitted: bool,
 }
 
 impl SnorApp {
@@ -148,7 +184,53 @@ impl SnorApp {
             tree_w: TREE_DEFAULT_W,
             ctx_session: None,
             restore_maximized: false,
+            window_fitted: false,
         }
+    }
+
+    /// Put the floating window fully on screen, once.
+    ///
+    /// `main.rs` asks for 1280x800 and sets no position, so Windows cascades
+    /// the window wherever it likes. On this machine — 1920x1080 at 125%, so a
+    /// 1600x1000 physical window on a 1020px work area — it landed at y=96,
+    /// which put the bottom 76px below the work area: the window covered the
+    /// taskbar and its last 17px were off the screen entirely. A *borderless*
+    /// window gets no help from the OS here; a decorated one would have been
+    /// clamped to the work area, and this one is deliberately undecorated.
+    ///
+    /// Only the floating case is touched. A maximised or fullscreen window is
+    /// already placed by the OS, and moving it would fight the user.
+    ///
+    /// Nothing happens until egui has actually reported a monitor size, and
+    /// the flag is only set once the move is issued — a `None` on the first
+    /// frame must retry, not give up permanently.
+    fn fit_window_on_first_frame(&mut self, ctx: &egui::Context) {
+        if self.window_fitted {
+            return;
+        }
+        let (monitor, size, maximized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.monitor_size,
+                v.inner_rect.or(v.outer_rect).map(|r| r.size()),
+                v.maximized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+            )
+        });
+        let (Some(monitor), Some(size)) = (monitor, size) else {
+            return;
+        };
+        // A monitor of 1x1 (or less) is not a real measurement; retry.
+        if monitor.x <= 1.0 || monitor.y <= 1.0 {
+            return;
+        }
+        self.window_fitted = true;
+        if maximized || fullscreen {
+            return;
+        }
+        let (fitted, pos) = fit_to_monitor(monitor, size);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fitted));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
@@ -859,6 +941,7 @@ impl SnorApp {
 
 impl eframe::App for SnorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.fit_window_on_first_frame(ui.ctx());
         if let Some(opened) = self.tree.opened_file.take()
             && opened.is_file()
         {
@@ -1165,5 +1248,62 @@ impl Drop for SnorApp {
         // Best effort by design: shutdown must never panic or hang waiting
         // on display control, and terminals are reaped by their own `Drop`.
         self.dim.restore_on_exit(crate::brightness::set_brightness);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live numbers this was written against: a 1920x1080 monitor at 125%
+    /// is 1536x864 points, and the requested 1280x800 window lands at y=96
+    /// physical when Windows cascades it — 76px below the 1020px work area.
+    #[test]
+    fn floating_window_is_placed_fully_on_screen() {
+        let monitor = egui::vec2(1536.0, 864.0);
+        let want = egui::vec2(1280.0, 800.0);
+        let (size, pos) = fit_to_monitor(monitor, want);
+
+        // 800pt fits inside 864 - 48, so the size is left alone...
+        assert_eq!(size, want, "a window that fits must not be shrunk");
+        // ...and it is centred in the usable band, not the full monitor.
+        let usable_h = 864.0 - TASKBAR_RESERVE;
+        assert_eq!(pos.x, (monitor.x - size.x) * 0.5);
+        assert_eq!(pos.y, (usable_h - size.y) * 0.5);
+
+        // The whole point: the bottom edge clears the taskbar.
+        assert!(
+            pos.y + size.y <= usable_h,
+            "bottom {} must not reach past the usable height {usable_h}",
+            pos.y + size.y
+        );
+        assert!(pos.x >= 0.0 && pos.y >= 0.0, "must not start off-screen");
+        assert!(pos.x + size.x <= monitor.x, "must not run off the right edge");
+    }
+
+    #[test]
+    fn a_window_taller_than_the_monitor_is_shrunk_to_fit() {
+        // A 4K-tall request on a short monitor: the size has to give, and the
+        // result still has to sit inside the usable band.
+        let monitor = egui::vec2(1280.0, 720.0);
+        let (size, pos) = fit_to_monitor(monitor, egui::vec2(1600.0, 1200.0));
+        let usable_h = 720.0 - TASKBAR_RESERVE;
+
+        assert_eq!(size.x, 1280.0, "width clamps to the monitor");
+        assert_eq!(size.y, usable_h, "height clamps to the usable band");
+        assert!(pos.y + size.y <= usable_h + 0.001);
+        assert!(pos.x >= 0.0);
+    }
+
+    #[test]
+    fn a_misreported_monitor_cannot_produce_a_negative_size() {
+        // Guards the floor: a 0-height or absurd monitor must not yield a
+        // negative size, which would be rejected by the viewport command.
+        for (mx, my) in [(0.0, 0.0), (1.0, 1.0), (800.0, 10.0)] {
+            let (size, pos) = fit_to_monitor(egui::vec2(mx, my), egui::vec2(1280.0, 800.0));
+            assert!(size.x >= 0.0 && size.y >= 0.0, "negative size at {mx}x{my}");
+            assert!(size.y <= MIN_USABLE_H.max(my - TASKBAR_RESERVE));
+            assert!(pos.x.is_finite() && pos.y.is_finite(), "non-finite at {mx}x{my}");
+        }
     }
 }

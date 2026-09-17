@@ -106,6 +106,15 @@ Current design (do not regress):
 - `key_to_bytes` maps special keys; plain chars arrive via `Event::Text`.
   `Event::Text` is suppressed for Ctrl combos by egui-winit, so no doubling.
 - `send_line()` is the entry point for scripted input (Run button).
+- **The accent dot in the header is the latch indicator, not decoration.**
+  When `Terminal::active` is true the header draws a filled accent circle
+  (`circle_filled`, r=3.5) in the slot where "click to type" otherwise sits;
+  the two are an `if`/`else` on the same state. It is the only confirmation
+  that keystrokes are going to the shell rather than to the editor, so do not
+  delete it as clutter — that was a wrong call made once by reading a
+  screenshot instead of the code. It is painted rather than typed because
+  egui's bundled fonts have no dependable bullet coverage and a missing glyph
+  renders as tofu. Measured: 9px wide, 15.2pt clear of the "+" button.
 
 ## Terminal tabs (multi-session)
 
@@ -361,14 +370,44 @@ the teal by drawing over it; if it clashes with the palette the fix is the user'
 system accent colour, not the app. The client rect starts one pixel *below* the
 window rect for the same reason.
 
-**A floating window can hide its own status bar.** The default inner size is
-1280x800 *logical*, which at 125% scaling is 1000 physical px tall against a
-1080p work area of 1020 — only 20px of slack. Windows placed this machine's
-window at y=160, so the bottom ~80px (the whole status bar, which is where the
-Dim Mode moon, its `Dim` label and any backend `notice` live) sat below the
-screen edge and appeared in no client-rect capture. Maximise before verifying
-anything that lives in the status bar. Note eframe is built without the
-`persistence` feature, so the position is the OS's choice, not a saved value.
+**The floating window is placed by us, on the first frame.** The default inner
+size is 1280x800 *logical*, which at 125% is 1600x1000 physical against a
+1080p work area of 1920x1020 — only 20px of vertical slack. `main.rs` sets no
+position, so Windows cascades the window wherever it likes; measured live it
+landed at y=96, putting the bottom 76px below the work area: the window
+covered the taskbar and its last 17px were off the screen entirely. A client
+capture of that state ends in 17 rows of pure black, which is the tell.
+
+A *decorated* window would have been clamped to the work area by the OS. This
+one is deliberately undecorated, so nothing does it for us —
+`SnorApp::fit_window_on_first_frame` runs once and sends `InnerSize` +
+`OuterPosition`. Rules:
+
+- **`monitor_size` is the whole monitor, not the work area.** egui has no
+  work-area field, so `TASKBAR_RESERVE` (48pt = the Windows default taskbar at
+  125%, and the same 48px at 100%) stands in for it. Centring on the full
+  monitor height would still tuck the bottom edge under the taskbar.
+- **Only the floating case.** Maximised or fullscreen is already placed by the
+  OS; moving it would fight the user.
+- **Do not latch the flag until the move is actually issued.** `monitor_size`
+  and the rects can be `None` on the first frame; a `None` must retry, not
+  give up permanently.
+- The maths is pure (`fit_to_monitor`) and tested three ways:
+  `floating_window_is_placed_fully_on_screen`,
+  `a_window_taller_than_the_monitor_is_shrunk_to_fit`, and
+  `a_misreported_monitor_cannot_produce_a_negative_size`.
+
+Verified by launching cold eight times
+(`tools/launch_check.py N`) — every run lands at (160,10)-(1760,1010),
+1600x1000, fully inside the work area.
+
+Note eframe is built without the `persistence` feature, so there is no saved
+position to respect and re-centring each launch costs nothing.
+
+**Verifying window placement needs the desktop, not a client capture.** A
+client-rect capture cannot show whether the taskbar is covered. `IsWindowVisible`
+on the taskbar stays true even when a window covers it, so compare the window
+rect against the monitor rect (`tools/screen_info.py`) instead.
 
 ## Dim Mode (`dim.rs`, `brightness.rs`)
 
@@ -401,7 +440,7 @@ Lowers the physical backlight so agents can keep running with the screen dark.
 
 ## Tests
 
-- `cargo test` must stay green (63 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (66 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -409,7 +448,10 @@ Lowers the physical backlight so agents can keep running with the screen dark.
   `tab_numbers_take_the_lowest_free_slot`), the grid-padding pair
   (`flow_pane_sizing_reserves_its_header` and its side-gap twin
   `flow_pane_sizing_reserves_its_side_gaps`),
-  `closing_the_last_tab_empties_the_list_without_underflow`, and
+  `closing_the_last_tab_empties_the_list_without_underflow`, the three
+  window-placement tests (`floating_window_is_placed_fully_on_screen`,
+  `a_window_taller_than_the_monitor_is_shrunk_to_fit`,
+  `a_misreported_monitor_cannot_produce_a_negative_size`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
 - Tab bookkeeping is tested through `Terminal::open_stub_tab` (a `#[cfg(test)]`
@@ -441,8 +483,25 @@ Lowers the physical backlight so agents can keep running with the screen dark.
     `drag`, `key`, `type`, `info`). It taps Alt before raising, because
     `SetForegroundWindow` fails while another app owns the foreground and the
     capture then grabs whatever is on top.
+  - **`PrintWindow` is the only capture that works on an occluded window.**
+    Both `snor_drive.py shot` and `ImageGrab` grab the *screen*, so they return
+    whatever is on top — three attempts to photograph Snor returned the user's
+    browser instead, and neither `SetForegroundWindow` nor
+    `SetWindowPos(HWND_TOPMOST)` won the foreground back. On a machine someone
+    else is using, render the window into a memory DC instead:
+    `GetWindowDC` -> `CreateCompatibleDC` -> `CreateCompatibleBitmap` ->
+    `SelectObject` -> `PrintWindow(hwnd, mdc, 2)` (PW_RENDERFULLCONTENT) ->
+    `GetDIBits` with a negative `biHeight` for a top-down 32-bit BGRA buffer ->
+    `Image.frombuffer(..., "BGRA", ...)`. Verified on this OpenGL window:
+    returns 1 with real content. Reach for it first; `desktop_shot.py` is only
+    for the one question it alone answers, whether a window covers the taskbar.
   - `desktop_shot.py` grabs the whole desktop, for anything about the window's
     own frame or the taskbar.
+  - `launch_check.py N` launches the app N times and reports the window rect
+    each time — the way the placement fix above was verified. **It opens and
+    kills the app N times a few seconds apart, which reads exactly like "Snor
+    keeps launching and closing on its own" to anyone watching.** Run it only
+    when nobody else is at the machine, and say what it was afterwards.
   - `screen_info.py` prints screen, work area, window rect, window style bits
     and taskbar in one go.
   - `ink_groups.py` finds glyph clusters in a band and prints their centres in
