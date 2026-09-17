@@ -16,3 +16,7 @@ Thumbs.db
 # fonts live in assets/fonts -- so nothing here is needed to build or run.
 # If a real PNG asset is ever added, negate it explicitly with `!path/to.png`.
 *.png
+
+# Curated README screenshots are the one exception: they are small, chosen,
+# and linked from README.md. Everything else PNG stays untracked.
+!docs/screenshots/*.png

@@ -59,6 +59,16 @@ without constantly switching tools.
 - ~11 MB release binary (strip + thin LTO). 66 tests, clippy clean on every
   commit, CI on `main` and `dev`.
 
+## Screenshots
+
+One calm workspace — explorer, editor, terminal:
+
+![Snor workspace: file tree, highlighted editor and a live shell](docs/screenshots/hero.png)
+
+Flow Mode — four agents supervised side by side:
+
+![Flow Mode: four live terminal panes](docs/screenshots/flow.png)
+
 ## Quickstart
 
 Prerequisites: Windows 10/11 and a stable Rust toolchain
