@@ -176,21 +176,24 @@ reader thread, `vt100::Parser` and query buffer. Rules that are load-bearing:
 - GUI behavior itself (clicks, drags, pixels) cannot be verified headlessly:
   after UI changes, rebuild, relaunch, and have a human confirm with a
   screenshot. Never claim a visual fix works without that.
-- `.workbuddy-ai/tools/snor_ui_probe.py` drives the real window through
-  user32: `info`, `shot`, `click`, `move`, `drag`, `place`, `maximize`, `type`,
-  `key`. Coordinates are egui points relative to the client area.
-  `key` accepts chords (`ctrl+tab`, `ctrl+b`) and holds the modifiers down
-  around the key — egui reads modifier state from the event itself, so sending
-  them as separate presses arrives as a bare key.
-- `.workbuddy-ai/tools/tab_bbox.py` reports the terminal tab strip's ink boxes
-  in points, which is how click targets are aimed instead of guessed — a click
-  that misses by a few points reads as "the feature is broken". Two traps it
-  handles: the explorer tree shares the header's rows to the left, and the
-  separator rule under the header out-inks the text row, so a naive
-  densest-row search locks onto the rule.
-- `.workbuddy-ai/tools/many_tabs.py` adds tabs one at a time and reports where
-  the "+" and the right-hand cluster actually are, which is how the overflow
-  behaviour above was measured.
+- GUI tooling lives in `.workbuddy-ai/tools/` in the local agent workspace. It
+  is gitignored and deliberately not part of the tree, so these paths will not
+  resolve in a fresh clone — the three worth knowing are:
+  - `snor_ui_probe.py` drives the real window through user32: `info`, `shot`,
+    `click`, `move`, `drag`, `place`, `maximize`, `type`, `key`. Coordinates
+    are egui points relative to the client area. `key` accepts chords
+    (`ctrl+tab`, `ctrl+b`) and holds the modifiers down around the key — egui
+    reads modifier state from the event itself, so sending them as separate
+    presses arrives as a bare key.
+  - `tab_bbox.py` reports the terminal tab strip's ink boxes in points, which
+    is how click targets are aimed instead of guessed — a click that misses by
+    a few points reads as "the feature is broken". Two traps it handles: the
+    explorer tree shares the header's rows to the left, and the separator rule
+    under the header out-inks the text row, so a naive densest-row search locks
+    onto the rule.
+  - `many_tabs.py` adds tabs one at a time and reports where the "+" and the
+    right-hand cluster actually are, which is how the overflow behaviour above
+    was measured.
 
 ## Conventions
 

@@ -5,11 +5,14 @@
 .DS_Store
 Thumbs.db
 
-# Verification captures and agent bookkeeping: regenerated every iteration and
-# large (the screenshot set alone runs ~10MB), so they are not worth tracking.
-# The measurement scripts under .workbuddy-ai/tools ARE tracked -- AGENTS.md
-# points at them and they are the only way to verify GUI behavior.
-# Exception: 2026-09-17.md is force-added, being the written verification record.
-.workbuddy-ai/screenshots/
-.workbuddy-ai/memory/
-.workbuddy-ai/verify/
+# Agent workspace: screenshot drivers, UI measurement scripts, verification
+# captures and the written pass log. Kept on disk because they are the only way
+# to verify GUI behaviour (AGENTS.md refers to the tools by name) -- but not
+# tracked. They are regenerated every iteration, the capture set alone runs to
+# tens of MB, and they are noise to anyone reading the repo.
+.workbuddy-ai/
+
+# Local reference images and scratch captures. Snor ships no raster assets --
+# fonts live in assets/fonts -- so nothing here is needed to build or run.
+# If a real PNG asset is ever added, negate it explicitly with `!path/to.png`.
+*.png
