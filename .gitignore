@@ -13,3 +13,8 @@ Thumbs.db
 .workbuddy-ai/screenshots/
 .workbuddy-ai/memory/
 .workbuddy-ai/verify/
+
+# Local reference images and agent workspace: ignore going forward.
+# Already-tracked files stay tracked; this only stops new ones.
+*.png
+.workbuddy-ai/
