@@ -13,17 +13,513 @@ const SCROLLBACK: usize = 1000;
 /// 20pt buttons plus their spacing about 110pt, and "click to type" 68pt.
 const TERM_HDR_RIGHT_W: f32 = 250.0;
 
-/// Tab label for the n-th shell ever spawned.
+/// Which shell a new tab starts.
 ///
-/// The first is bare "powershell"; later ones are numbered from 2, so a
-/// single tab never reads "powershell 1". Numbering counts shells spawned
-/// rather than tabs currently open, so closing and reopening does not reuse
-/// a label that is still on screen.
-fn shell_title(n: usize) -> String {
+/// Snor used to hardcode `powershell.exe -NoLogo -NoProfile -NoExit`. A good
+/// default is not the same thing as the only option: the agents people run
+/// here are as likely to be started from `pwsh`, and on Windows a lot of real
+/// work happens in WSL or Git Bash. Adding one is a few lines of
+/// `CommandBuilder`; what makes it worth having is that the tab title can then
+/// say which shell a tab is, so a window full of shells stays legible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ShellKind {
+    #[default]
+    PowerShell,
+    Pwsh,
+    Cmd,
+    GitBash,
+    Wsl,
+}
+
+impl ShellKind {
+    /// Menu order: the Windows default first, then the ones that are installed
+    /// on purpose.
+    pub const ALL: [ShellKind; 5] = [
+        ShellKind::PowerShell,
+        ShellKind::Pwsh,
+        ShellKind::Cmd,
+        ShellKind::GitBash,
+        ShellKind::Wsl,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShellKind::PowerShell => "PowerShell",
+            ShellKind::Pwsh => "PowerShell 7",
+            ShellKind::Cmd => "Command Prompt",
+            ShellKind::GitBash => "Git Bash",
+            ShellKind::Wsl => "WSL",
+        }
+    }
+
+    /// What a tab is called. Short, lower case, no version: the tab says which
+    /// shell it is, because with five of them available a bare "powershell 3"
+    /// is a guess about a shell the user picked deliberately.
+    fn title_name(self) -> &'static str {
+        match self {
+            ShellKind::PowerShell => "powershell",
+            ShellKind::Pwsh => "pwsh",
+            ShellKind::Cmd => "cmd",
+            ShellKind::GitBash => "bash",
+            ShellKind::Wsl => "wsl",
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            ShellKind::PowerShell => "powershell.exe",
+            ShellKind::Pwsh => "pwsh.exe",
+            ShellKind::Cmd => "cmd.exe",
+            ShellKind::GitBash => "bash.exe",
+            ShellKind::Wsl => "wsl.exe",
+        }
+    }
+
+    /// `-NoExit` for the PowerShell family so the window persists the way a
+    /// terminal is expected to; `-i -l` for Git Bash, which needs both to give
+    /// a login shell with its completion loaded.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            ShellKind::PowerShell | ShellKind::Pwsh => &["-NoLogo", "-NoProfile", "-NoExit"],
+            ShellKind::GitBash => &["-i", "-l"],
+            ShellKind::Cmd | ShellKind::Wsl => &[],
+        }
+    }
+
+    /// The shells this machine can plausibly start right now.
+    fn installed() -> Vec<ShellKind> {
+        installed_from(
+            &std::env::var("PATH").unwrap_or_default(),
+            std::env::var("COMSPEC").ok().as_deref(),
+        )
+    }
+}
+
+/// Which of [`ShellKind::ALL`] are actually present, decided by looking for the
+/// executable on `PATH`.
+///
+/// A lookup rather than a probe: launching `pwsh -c exit` to see whether it
+/// exists would spawn a process on every start, and spawning things to draw a
+/// menu is exactly what a lean app should not do. Split out from
+/// [`ShellKind::installed`] so the rule can be tested without planting executables
+/// on the machine running the tests.
+///
+/// `powershell.exe` is taken as present whatever the lookup says: it ships with
+/// Windows, and a machine with a trimmed `PATH` must not end up with no shell
+/// listed at all.
+fn installed_from(path_env: &str, comspec: Option<&str>) -> Vec<ShellKind> {
+    let dirs: Vec<&str> = path_env
+        .split(';')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .collect();
+    let on_path = |exe: &str| -> bool {
+        let exe = exe.to_lowercase();
+        dirs.iter().any(|dir| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .any(|e| e.file_name().to_string_lossy().to_lowercase() == exe)
+                })
+                .unwrap_or(false)
+        })
+    };
+    ShellKind::ALL
+        .iter()
+        .copied()
+        .filter(|shell| match shell {
+            ShellKind::PowerShell => true,
+            ShellKind::Cmd => {
+                comspec.is_some_and(|c| std::path::Path::new(c).is_file()) || on_path("cmd.exe")
+            }
+            ShellKind::Pwsh => on_path("pwsh.exe"),
+            ShellKind::GitBash => on_path("bash.exe"),
+            ShellKind::Wsl => on_path("wsl.exe"),
+        })
+        .collect()
+}
+
+/// Tab label for the n-th shell of its kind.
+///
+/// The first is bare ("powershell", "pwsh"); later ones are numbered from 2,
+/// so a single tab never reads "powershell 1".
+fn shell_title(n: usize, shell: ShellKind) -> String {
+    let name = shell.title_name();
     if n <= 1 {
-        "powershell".to_owned()
+        name.to_owned()
     } else {
-        format!("powershell {n}")
+        format!("{name} {n}")
+    }
+}
+
+/// What one read from a shell told us that is not screen content.
+///
+/// The two signals a shell has for "I am trying to get your attention": a bell
+/// (`BEL`) and a title assignment (`ESC ] 0 ; … BEL` or `ST`, which is how
+/// agents like opencode announce what they are doing). vt100 0.16 exposes
+/// neither, so they are read off the same bytes the parser is fed.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Notifications {
+    bell: bool,
+    title: Option<String>,
+}
+
+/// Longest tail kept for a sequence split across two reads. An OSC title is
+/// short; anything longer than this was not a title.
+const NOTIF_TAIL_MAX: usize = 512;
+
+/// Read a chunk for bells and title assignments, holding an unterminated
+/// escape in `tail` for the next chunk.
+///
+/// Chunk boundaries are wherever the pty reader happened to flush, so a title
+/// routinely arrives in two pieces. Keeping the tail — rather than scanning each
+/// chunk in isolation — is what makes a split sequence work; the tail is only
+/// ever kept from an incomplete `ESC` onward, so nothing is counted twice.
+fn scan_notifications(tail: &mut Vec<u8>, chunk: &[u8]) -> Notifications {
+    tail.extend_from_slice(chunk);
+    let mut out = Notifications::default();
+    let buf = std::mem::take(tail);
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x07 {
+            out.bell = true;
+            i += 1;
+            continue;
+        }
+        if buf[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        // An ESC with nothing after it is the first half of a sequence.
+        if i + 1 >= buf.len() {
+            break;
+        }
+        if buf[i + 1] != b']' {
+            // Some other escape (a colour, a cursor move). Skipped by one so the
+            // next byte is still examined — a BEL can follow immediately.
+            i += 1;
+            continue;
+        }
+        // OSC: `ESC ] Ps ; Pt (BEL | ESC \)`.
+        let body = i + 2;
+        let mut end = None;
+        let mut j = body;
+        while j < buf.len() {
+            if buf[j] == 0x07 {
+                end = Some((j, j + 1));
+                break;
+            }
+            if buf[j] == 0x1b && j + 1 < buf.len() && buf[j + 1] == b'\\' {
+                end = Some((j, j + 2));
+                break;
+            }
+            if buf[j] == 0x1b && j + 1 >= buf.len() {
+                break;
+            }
+            j += 1;
+        }
+        let Some((stop, resume)) = end else {
+            // Unterminated: keep from the ESC so the next chunk can finish it.
+            break;
+        };
+        let payload = String::from_utf8_lossy(&buf[body..stop]).to_string();
+        // `Ps;Pt`: 0 = icon and title, 1 = icon, 2 = title. Anything else is a
+        // sequence for a terminal emulator feature this app does not implement.
+        if let Some((ps, pt)) = payload.split_once(';')
+            && matches!(ps, "0" | "1" | "2")
+            && !pt.trim().is_empty()
+        {
+            out.title = Some(pt.to_string());
+        }
+        i = resume;
+    }
+    // Either the incomplete sequence, or nothing at all.
+    let keep_from = if i < buf.len() { i } else { buf.len() };
+    let kept = &buf[keep_from..];
+    let kept = if kept.len() > NOTIF_TAIL_MAX {
+        &kept[kept.len() - NOTIF_TAIL_MAX..]
+    } else {
+        kept
+    };
+    *tail = kept.to_vec();
+    out
+}
+
+/// A text selection over the *displayed* terminal grid, in cells.
+///
+/// Cells rather than characters because a cell is what the pty was sized to and
+/// what `term_job` walks. `anchor` is where the press landed and `head` is where
+/// the pointer is now, so a selection dragged up-and-left is the same thing as
+/// the one dragged down-and-right; normalisation happens at read time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Selection {
+    fn new(at: (u16, u16)) -> Self {
+        Self {
+            anchor: at,
+            head: at,
+        }
+    }
+
+    /// True while the press has not moved: a click, which must not leave a
+    /// one-cell selection behind for the next copy to pick up.
+    fn is_click(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// `(first, last)` in reading order.
+    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+}
+
+/// The copied form of a selection: one line per selected row, trailing blanks
+/// removed.
+///
+/// This trimming is the whole reason the selection is ours rather than egui's.
+/// The grid is a fixed-width rectangle, so every row is padded with spaces out
+/// to the last column for rendering, and a copy that kept that padding would
+/// paste a wall of trailing whitespace into whatever prompt it was aimed at.
+///
+/// Reads through `screen.cell`, which means it copies what is *on screen* —
+/// history when the terminal is scrolled back, which is the only thing the user
+/// could have meant by selecting it.
+fn selection_text(screen: &vt100::Screen, sel: Selection) -> String {
+    let (start, end) = sel.normalized();
+    let cols = screen.size().1;
+    let mut lines: Vec<String> = Vec::new();
+    for row in start.0..=end.0 {
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 {
+            end.1
+        } else {
+            cols.saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in first..=last {
+            if let Some(cell) = screen.cell(row, col) {
+                line.push_str(cell.contents());
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Text scale bounds for the terminal grid.
+const ZOOM_MIN: f32 = 0.6;
+const ZOOM_MAX: f32 = 2.4;
+
+/// Terminal-wide view state, shared by the tabbed layout and Flow Mode panes
+/// because both draw the same grid at the same scale.
+struct ViewState {
+    /// Multiplier on [`TERM_FONT_SIZE`]. 1.0 is the size the mock was measured
+    /// at, so nothing about the default layout moves.
+    zoom: f32,
+    /// Sub-row wheel remainder, in points.
+    ///
+    /// A trackpad delivers a few points per frame; converting each frame's delta
+    /// to whole rows on its own would round every one of them to nothing and a
+    /// slow two-finger scroll would do absolutely nothing.
+    wheel_acc: f32,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            wheel_acc: 0.0,
+        }
+    }
+}
+
+/// What the wheel over a terminal grid means.
+enum WheelIntent {
+    None,
+    /// Rows to move through history, positive for older output.
+    Scroll(i32),
+    /// A zoom factor to multiply by, straight from egui's own gesture handling.
+    Zoom(f32),
+}
+
+/// Translate the wheel over `rect` into history movement or a zoom.
+///
+/// egui computes the Ctrl-wheel zoom factor for us (`InputState::zoom_delta`,
+/// which is 1.0 when nothing was scrolled), so the speed and smoothing stay the
+/// window's own rather than a second invention here. Neither the scroll delta nor
+/// the zoom factor is used anywhere else in this app, so consuming the scroll
+/// delta is enough to stop anything else reacting to the same gesture.
+fn wheel_intent(
+    ui: &mut eframe::egui::Ui,
+    rect: eframe::egui::Rect,
+    cell_h: f32,
+    view: &mut ViewState,
+) -> WheelIntent {
+    if !ui.rect_contains_pointer(rect) {
+        return WheelIntent::None;
+    }
+    let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+    if (zoom - 1.0).abs() > 1e-4 {
+        ui.input_mut(|i| i.smooth_scroll_delta = eframe::egui::Vec2::ZERO);
+        return WheelIntent::Zoom(zoom);
+    }
+    if scroll == 0.0 {
+        return WheelIntent::None;
+    }
+    ui.input_mut(|i| i.smooth_scroll_delta = eframe::egui::Vec2::ZERO);
+    // Positive is content moving down, i.e. scrolling back into history.
+    let cell_h = cell_h.max(1.0);
+    view.wheel_acc += scroll;
+    let rows = (view.wheel_acc / cell_h).trunc();
+    view.wheel_acc -= rows * cell_h;
+    if rows == 0.0 {
+        return WheelIntent::None;
+    }
+    WheelIntent::Scroll(rows as i32)
+}
+
+/// Which cell of a grid the pointer is over, if it is over one at all.
+///
+/// Origin is the top-left of the drawn grid, not the pane: the grid is where
+/// the shell's cells are, and the header band above it is not selectable.
+fn cell_at_pos(
+    origin: eframe::egui::Pos2,
+    cell: (f32, f32),
+    pos: eframe::egui::Pos2,
+) -> (u16, u16) {
+    let col = ((pos.x - origin.x) / cell.0.max(1.0)).floor().max(0.0) as u16;
+    let row = ((pos.y - origin.y) / cell.1.max(1.0)).floor().max(0.0) as u16;
+    (row, col)
+}
+
+/// One find-in-terminal hit.
+///
+/// `offset` is how far back in the history it was found, which is also how
+/// jumping to a hit works: scrolling *to* a match and finding matches are the
+/// same question asked twice, so one number answers both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FindHit {
+    offset: usize,
+    row: u16,
+    col: u16,
+    cells: u16,
+}
+
+/// Most hits kept. A cap rather than "all of them" because the walk below is
+/// bounded work per keystroke; a shell that printed ten thousand matching lines
+/// is already beyond what anyone scrolls through by hand.
+const FIND_CAP: usize = 200;
+
+/// Find `query` in the visible screen and the whole scrollback.
+///
+/// vt100 has no search and no history-length getter, so this walks the offsets
+/// it can reach: asking for the oldest line and reading back where the grid put
+/// the view is how the size of the history is learned (the request is clamped),
+/// and then each screenful is read in turn. The walk is one pass per frame of
+/// history, which is why the caller only runs it when the query changes — not
+/// every frame — and why the result count is capped.
+///
+/// Leaves the screen at `at`, the offset the user was already looking at.
+/// Matches are non-overlapping and returned oldest first, so the last element is
+/// the most recent match — the one worth landing on by default.
+fn find_hits(screen: &mut vt100::Screen, query: &str, at: usize, cap: usize) -> Vec<FindHit> {
+    let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let (rows, cols) = screen.size();
+    screen.set_scrollback(usize::MAX);
+    let oldest = screen.scrollback();
+    let mut hits: Vec<FindHit> = Vec::new();
+    // One row per history offset, not a whole screenful.
+    //
+    // Every line of history is visible in `rows` different windows, at a
+    // different row in each, so scanning a full window per offset would report
+    // the same line up to 24 times — and "next" would step through one match 24
+    // times before moving on. Each offset adds exactly one line that the offset
+    // below it did not show, and that line is its row 0: the window at offset o
+    // covers the `rows` lines ending `o` above the bottom, so increasing the
+    // offset by one reveals the top row and drops the bottom one. The live
+    // screen is the final window, and is scanned whole at offset 0.
+    for offset in (1..=oldest).rev() {
+        screen.set_scrollback(offset);
+        scan_row(screen, 0, cols, &needle, offset, &mut hits);
+        if hits.len() >= cap {
+            break;
+        }
+    }
+    if hits.len() < cap {
+        screen.set_scrollback(0);
+        for row in 0..rows {
+            scan_row(screen, row, cols, &needle, 0, &mut hits);
+            if hits.len() >= cap {
+                break;
+            }
+        }
+    }
+    screen.set_scrollback(at);
+    hits
+}
+
+/// Push every non-overlapping match of `needle` found in one row.
+///
+/// Cells rather than a lower-cased copy of the row: a wide glyph's trailing half
+/// is then simply not a character, and the column arithmetic stays exact.
+fn scan_row(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    needle: &[char],
+    offset: usize,
+    hits: &mut Vec<FindHit>,
+) {
+    let mut col = 0;
+    while col < cols {
+        let mut wanted = 0;
+        let mut at_col = col;
+        while at_col < cols && wanted < needle.len() {
+            let text = screen
+                .cell(row, at_col)
+                .map(|cell| cell.contents())
+                .unwrap_or("");
+            let matches = text
+                .chars()
+                .next()
+                .map(|ch| ch.to_lowercase().next() == Some(needle[wanted]))
+                .unwrap_or(false);
+            if matches {
+                wanted += 1;
+                at_col += 1;
+            } else {
+                break;
+            }
+        }
+        if wanted == needle.len() {
+            hits.push(FindHit {
+                offset,
+                row,
+                col,
+                cells: (at_col - col).max(1),
+            });
+            // Non-overlapping, so a search for "aa" in "aaaa" is two hits and
+            // not three.
+            col = at_col;
+        } else {
+            col += 1;
+        }
     }
 }
 
@@ -71,46 +567,63 @@ fn vt_color(c: vt100::Color, is_bg: bool) -> eframe::egui::Color32 {
     }
 }
 
-fn term_job(screen: &vt100::Screen) -> eframe::egui::text::LayoutJob {
+/// Background of the block cursor, and the ink inside it.
+const CURSOR_BG: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(0xBC, 0xDF, 0x9C);
+const CURSOR_FG: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(0x10, 0x12, 0x17);
+/// Selection tint. Translucent on purpose: the shell's own colours have to
+/// stay readable through a selection, or reading output means deselecting first.
+///
+/// Functions rather than constants because `from_rgba_unmultiplied` is not a
+/// `const fn` in egui 0.36, and hand-premultiplying these into constants would
+/// trade a readable colour for a mystery one.
+fn selection_bg() -> eframe::egui::Color32 {
+    eframe::egui::Color32::from_rgba_unmultiplied(0xBC, 0xDF, 0x9C, 0x50)
+}
+/// Current find hit. Much stronger than the selection tint, because this one has
+/// to be findable at a glance across a screen of coloured output.
+fn search_bg() -> eframe::egui::Color32 {
+    eframe::egui::Color32::from_rgba_unmultiplied(0xE5, 0xC0, 0x7B, 0xC0)
+}
+const SEARCH_FG: eframe::egui::Color32 =
+    eframe::egui::Color32::from_rgb(0x10, 0x12, 0x17);
+
+/// How [`term_job`] should mark the grid up beyond what the shell itself said.
+#[derive(Clone, Copy)]
+struct Markup {
+    /// Cell size to draw at: [`TERM_FONT_SIZE`] scaled by the terminal's zoom.
+    font_size: f32,
+    /// Selection to tint, as `(row_from, col_from, row_to, col_to)` inclusive.
+    selection: Option<(u16, u16, u16, u16)>,
+    /// The current find hit, as `(row, col, cells)`.
+    search: Option<(u16, u16, u16)>,
+    /// Whether to draw the block cursor at all. False while scrolled back: the
+    /// live cursor is not in history, and painting it there would put a caret
+    /// over text the shell is not editing.
+    cursor: bool,
+}
+
+fn term_job(screen: &vt100::Screen, markup: Markup) -> eframe::egui::text::LayoutJob {
+    use eframe::egui::Color32;
     use eframe::egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
-    let mono = eframe::egui::FontId::monospace(TERM_FONT_SIZE);
+    let mono = eframe::egui::FontId::monospace(markup.font_size);
     // The screen's own size, not the 80x24 defaults: panes resize their
     // session, and the grid must render exactly what the shell owns.
     let (rows, cols) = screen.size();
     let (cur_row, cur_col) = screen.cursor_position();
+    // Runs are flushed on a *colour* change, so the overrides (cursor, selection,
+    // search) are resolved into the colour first and then compared. Deciding in
+    // `vt100::Color` space and converting afterwards meant the cursor had to be
+    // smuggled in as a fake RGB cell colour.
     for row in 0..rows {
         let mut run = String::new();
-        let mut run_fg = vt100::Color::Default;
-        let mut run_bg = vt100::Color::Default;
-        let mut run_bold = false;
+        let mut run_fg = Color32::TRANSPARENT;
+        let mut run_bg = Color32::TRANSPARENT;
         let mut started = false;
-        let flush = |job: &mut LayoutJob,
-                     run: &mut String,
-                     fg: vt100::Color,
-                     bg: vt100::Color,
-                     bold: bool| {
-            if run.is_empty() {
-                return;
-            }
-            let mut color = vt_color(fg, false);
-            if bold && matches!(fg, vt100::Color::Default | vt100::Color::Idx(0..=7)) {
-                color = eframe::egui::Color32::WHITE;
-            }
-            job.append(
-                run.as_str(),
-                0.0,
-                TextFormat {
-                    font_id: mono.clone(),
-                    color,
-                    background: vt_color(bg, true),
-                    ..Default::default()
-                },
-            );
-            run.clear();
-        };
         for col in 0..cols {
-            let (mut fg, mut bg, mut bold, mut text) = match screen.cell(row, col) {
+            let (fg, bg, bold, mut text) = match screen.cell(row, col) {
                 Some(cell) => (
                     cell.fgcolor(),
                     cell.bgcolor(),
@@ -127,33 +640,71 @@ fn term_job(screen: &vt100::Screen) -> eframe::egui::text::LayoutJob {
             if text.is_empty() {
                 text = " ".to_string();
             }
-            if row == cur_row && col == cur_col {
-                bg = vt100::Color::Rgb(0xBC, 0xDF, 0x9C);
-                fg = vt100::Color::Rgb(0x10, 0x12, 0x17);
-                bold = false;
+            let mut fg32 = vt_color(fg, false);
+            let mut bg32 = vt_color(bg, true);
+            // Bold on a plain or dim colour is how a shell asks for "bright".
+            if bold && matches!(fg, vt100::Color::Default | vt100::Color::Idx(0..=7)) {
+                fg32 = Color32::WHITE;
+            }
+            if markup.cursor && row == cur_row && col == cur_col {
+                bg32 = CURSOR_BG;
+                fg32 = CURSOR_FG;
+            } else if let Some((sr, sc, slen)) = markup.search
+                && row == sr
+                && col >= sc
+                && col < sc.saturating_add(slen)
+            {
+                bg32 = search_bg();
+                fg32 = SEARCH_FG;
+            } else if let Some((r0, c0, r1, c1)) = markup.selection
+                && (row > r0 || (row == r0 && col >= c0))
+                && (row < r1 || (row == r1 && col <= c1))
+            {
+                bg32 = selection_bg();
             }
             if !started {
-                run_fg = fg;
-                run_bg = bg;
-                run_bold = bold;
+                run_fg = fg32;
+                run_bg = bg32;
                 started = true;
             }
-            if fg != run_fg || bg != run_bg || bold != run_bold {
-                flush(&mut job, &mut run, run_fg, run_bg, run_bold);
-                run_fg = fg;
-                run_bg = bg;
-                run_bold = bold;
+            if fg32 != run_fg || bg32 != run_bg {
+                if !run.is_empty() {
+                    job.append(
+                        run.as_str(),
+                        0.0,
+                        TextFormat {
+                            font_id: mono.clone(),
+                            color: run_fg,
+                            background: run_bg,
+                            ..Default::default()
+                        },
+                    );
+                    run.clear();
+                }
+                run_fg = fg32;
+                run_bg = bg32;
             }
             run.push_str(&text);
         }
-        flush(&mut job, &mut run, run_fg, run_bg, run_bold);
+        if !run.is_empty() {
+            job.append(
+                run.as_str(),
+                0.0,
+                TextFormat {
+                    font_id: mono.clone(),
+                    color: run_fg,
+                    background: run_bg,
+                    ..Default::default()
+                },
+            );
+        }
         if row + 1 < rows {
             job.append(
                 "\n",
                 0.0,
                 TextFormat {
                     font_id: mono.clone(),
-                    color: eframe::egui::Color32::TRANSPARENT,
+                    color: Color32::TRANSPARENT,
                     ..Default::default()
                 },
             );
@@ -179,7 +730,15 @@ struct Session {
     cwd: PathBuf,
     /// Tab label. The first shell is just "powershell"; later ones are
     /// numbered from 2, so a single tab never reads "powershell 1".
+    ///
+    /// The auto-numbered name is kept even after a rename, because it is what
+    /// [`Terminal::next_free_title`] compares against to hand out unique
+    /// numbers; `custom_title` is what gets drawn.
     title: String,
+    /// A name the user gave this tab, which outranks the auto-numbered one.
+    custom_title: Option<String>,
+    /// Which shell this session is running, so a restart restarts the same one.
+    shell: ShellKind,
     /// Live terminal dimensions in cells. The pane on screen owns these:
     /// whenever its pixel rect implies different rows/columns,
     /// [`Session::apply_size`] resizes the parser *and* the real ConPTY, so
@@ -198,14 +757,36 @@ struct Session {
     total_chunks: u64,
     inq: Vec<u8>,
     started: bool,
+    /// How far back the view sits, in rows; 0 is the live screen.
+    ///
+    /// The offset itself lives in the vt100 grid (`set_scrollback`), which is
+    /// what makes `cell(row, col)` return history — so a scrolled-back terminal
+    /// renders through exactly the same loop as a live one. This copy is the
+    /// *intent*, because the grid clamps what it is given to the history it
+    /// actually has, and vt100 0.16 exposes no length to clamp against.
+    scroll: usize,
+    /// Text selection over the displayed grid, if the user has one.
+    selection: Option<Selection>,
+    /// The shell has rung the bell or retitled itself since this pane was last
+    /// focused. The one piece of state that makes several agents easier to
+    /// supervise than one: which of them wants me now.
+    attention: bool,
+    /// Last title the shell announced, for change detection. The *first* title a
+    /// PowerShell shell sends is its own name on startup, which must not count as
+    /// news or every new tab would open demanding attention.
+    last_title: Option<String>,
+    /// Tail of an escape sequence split across two reads.
+    notif_tail: Vec<u8>,
 }
 
 impl Session {
-    fn new(title: String, id: u64) -> Self {
+    fn new(title: String, id: u64, shell: ShellKind) -> Self {
         Self {
             id,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             title,
+            custom_title: None,
+            shell,
             parser: vt100::Parser::new(ROWS, COLS, SCROLLBACK),
             rx: None,
             writer: None,
@@ -217,9 +798,62 @@ impl Session {
             total_chunks: 0,
             inq: Vec::new(),
             started: false,
+            scroll: 0,
+            selection: None,
+            attention: false,
+            last_title: None,
+            notif_tail: Vec::new(),
             rows: ROWS,
             cols: COLS,
         }
+    }
+
+    /// What the tab strip and any other label should call this shell: the user's
+    /// name for it if there is one, the auto-numbered one otherwise.
+    fn label(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.title)
+    }
+
+    /// Put the grid at the scroll offset this session is scrolled to, and read
+    /// back what it granted.
+    ///
+    /// `set_scrollback` clamps to the history that exists, and the history is
+    /// not something vt100 0.16 exposes a length for, so asking and reading back
+    /// is both the clamp and the way to notice that output has pushed the oldest
+    /// line out of the buffer. Called each render, so a shell that keeps printing
+    /// cannot leave the view pinned above the oldest line there is.
+    fn apply_scroll(&mut self) {
+        self.parser.screen_mut().set_scrollback(self.scroll);
+        self.scroll = self.parser.screen().scrollback();
+    }
+
+    /// Move through history: positive is older output. Leaves the offset where
+    /// it lands, clamped by the grid itself.
+    fn scroll_by(&mut self, rows: i32) {
+        let want = (self.scroll as i32 + rows).max(0) as usize;
+        self.parser.screen_mut().set_scrollback(want);
+        self.scroll = self.parser.screen().scrollback();
+    }
+
+    /// Snap to the live screen. Any keystroke means the user is done reading
+    /// history — the alternative is typing into a shell whose output they are not
+    /// looking at.
+    fn scroll_to_bottom(&mut self) {
+        if self.scroll != 0 {
+            self.scroll = 0;
+            self.apply_scroll();
+        }
+    }
+
+    /// The selection as the renderer wants it: `(row_from, col_from, row_to,
+    /// col_to)`, inclusive and in reading order.
+    fn selection_range(&self) -> Option<(u16, u16, u16, u16)> {
+        let sel = self.selection?;
+        if sel.is_click() {
+            return None;
+        }
+        let ((r0, c0), (r1, c1)) = sel.normalized();
+        Some((r0, c0, r1, c1))
     }
 
     /// Resize this shell to `rows` x `cols` cells. True when something
@@ -291,12 +925,36 @@ pub struct Terminal {
     /// in the tab strip, and — in Flow Mode — in the status bar beside the
     /// "Flow" word; cleared by the next success.
     notice: Option<String>,
+    /// Which shell a newly opened tab starts.
+    shell: ShellKind,
+    /// The shells this machine can actually start, resolved once. Looked up
+    /// rather than probed so nothing is spawned to draw a menu, and cached
+    /// because it cannot change while the app runs.
+    shells: Vec<ShellKind>,
+    /// Text scale and wheel state, shared by the tabbed layout and Flow panes.
+    view: ViewState,
+    /// Tab being renamed: its session id and the text in the field. A modal
+    /// rather than an inline edit because the strip scrolls, and an inline field
+    /// in a scrolling row is a field that can scroll out of view mid-rename.
+    renaming: Option<(u64, String)>,
+    /// Find-in-terminal: open, what is being looked for, where it was found, and
+    /// which hit is current.
+    find_open: bool,
+    find_query: String,
+    find_hits: Vec<FindHit>,
+    find_pos: usize,
+    /// Focus the find field on the next frame — one-shot, so opening the bar
+    /// puts the caret in it and nothing re-steals focus afterwards.
+    find_focus_req: bool,
+    /// Same one-shot, for the rename field.
+    rename_focus: bool,
 }
 
 impl Terminal {
     pub fn new() -> Self {
+        let shell = ShellKind::default();
         Self {
-            sessions: vec![Session::new(shell_title(1), 1)],
+            sessions: vec![Session::new(shell_title(1, shell), 1, shell)],
             active_tab: 0,
             collapsed: false,
             fullscreen: false,
@@ -309,6 +967,58 @@ impl Terminal {
             flow_grid: FlowGrid::default(),
             flow_focus: None,
             notice: None,
+            shell,
+            shells: ShellKind::installed(),
+            view: ViewState::default(),
+            renaming: None,
+            find_open: false,
+            find_query: String::new(),
+            find_hits: Vec::new(),
+            find_pos: 0,
+            find_focus_req: false,
+            rename_focus: false,
+        }
+    }
+
+    /// Choose the shell for shells opened from now on. Live sessions are left
+    /// exactly as they are: this is not a restart, and an agent mid-task must
+    /// not be interrupted by a menu click.
+    fn choose_shell(&mut self, shell: ShellKind) {
+        self.shell = shell;
+    }
+
+    /// One zoom step, clamped.
+    ///
+    /// The new scale reaches the shells on the next frame, through the ordinary
+    /// sizing path — `term_cell_size` is read by both layouts before they resize
+    /// anything, so a zoom is indistinguishable from a window resize as far as
+    /// the ptys are concerned, which is exactly what makes it safe.
+    fn zoom_by(&mut self, factor: f32) {
+        self.view.zoom = (self.view.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /// Clear a session's attention flag: its bell or its title was noticed.
+    ///
+    /// Called wherever focus lands on a session, and only there. Clearing it on
+    /// *visibility* would defeat the feature in Flow Mode, where every pane is
+    /// on screen at once — the whole question is which one wants the user, not
+    /// which ones can be seen.
+    pub fn mark_seen(&mut self, id: u64) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.attention = false;
+        }
+    }
+
+    /// Name a tab, or hand it back to its automatic name.
+    ///
+    /// The auto-numbered `title` is deliberately untouched: that is what
+    /// [`Terminal::next_free_title`] compares against to hand out numbers that
+    /// do not collide, so renaming one tab cannot make the next shell reuse a
+    /// label that is already on screen.
+    pub fn rename_session(&mut self, id: u64, name: &str) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            let trimmed = name.trim();
+            session.custom_title = (!trimmed.is_empty()).then(|| trimmed.to_string());
         }
     }
 
@@ -322,7 +1032,7 @@ impl Terminal {
     fn next_free_title(&self) -> String {
         let mut n = 1;
         loop {
-            let candidate = shell_title(n);
+            let candidate = shell_title(n, self.shell);
             if !self.sessions.iter().any(|s| s.title == candidate) {
                 return candidate;
             }
@@ -343,7 +1053,7 @@ impl Terminal {
         self.notice = None;
         let id = self.next_session_id;
         self.next_session_id += 1;
-        let mut session = Session::new(self.next_free_title(), id);
+        let mut session = Session::new(self.next_free_title(), id, self.shell);
         session.cwd = cwd.clone();
         session.started = true;
         session.spawn(cwd);
@@ -383,7 +1093,8 @@ impl Terminal {
         self.notice = None;
         let id = self.next_session_id;
         self.next_session_id += 1;
-        self.sessions.push(Session::new(self.next_free_title(), id));
+        self.sessions
+            .push(Session::new(self.next_free_title(), id, self.shell));
         self.active_tab = self.sessions.len() - 1;
         self.active = true;
         self.collapsed = false;
@@ -499,13 +1210,13 @@ impl Session {
                 return;
             }
         };
-        let mut cmd = CommandBuilder::new("powershell.exe");
-        cmd.args(["-NoLogo", "-NoProfile", "-NoExit"]);
+        let mut cmd = CommandBuilder::new(self.shell.program());
+        cmd.args(self.shell.args());
         cmd.cwd(cwd);
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(e) => {
-                self.error = Some(format!("spawn powershell failed: {e}"));
+                self.error = Some(format!("spawn {} failed: {e}", self.shell.label()));
                 return;
             }
         };
@@ -547,6 +1258,9 @@ impl Session {
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {
+        // Typing means the user is done reading history: a shell whose output you
+        // cannot see must not be the one you are typing into.
+        self.scroll_to_bottom();
         if let Some(w) = self.writer.as_mut()
             && let Err(e) = w.write_all(bytes).and_then(|_| w.flush())
         {
@@ -600,7 +1314,11 @@ impl Terminal {
         use eframe::egui::Key;
         if modifiers.ctrl || modifiers.command {
             return match key {
-                Key::C => Some(&[0x03]),
+                // Ctrl+C interrupts — except with Shift held, which is the copy
+                // gesture every terminal shares. That one is handled by the
+                // terminal itself, so it must not reach the shell; Ctrl+Shift+V
+                // falls through to `None` for the same reason.
+                Key::C if !modifiers.shift => Some(&[0x03]),
                 Key::D => Some(&[0x04]),
                 Key::Z => Some(&[0x1a]),
                 Key::L => Some(&[0x0c]),
@@ -722,13 +1440,38 @@ impl Session {
         if chunks.is_empty() {
             return;
         }
-        {
-            for chunk in &chunks {
-                self.total_chunks += 1;
-                self.total_bytes += chunk.len() as u64;
-                self.parser.process(chunk);
-                self.respond_to_queries(chunk);
+        for chunk in &chunks {
+            self.ingest(chunk);
+        }
+    }
+
+    /// One read from the pty: parse it, answer any host query in it, and read it
+    /// a second time for the two things a shell uses to ask for attention.
+    ///
+    /// One method rather than a loop body in `poll` so the notification path can
+    /// be tested against a real parser with no pty behind it — which is the only
+    /// way to prove the bell/title rule without waiting on a child process.
+    fn ingest(&mut self, chunk: &[u8]) {
+        self.total_chunks += 1;
+        self.total_bytes += chunk.len() as u64;
+        self.parser.process(chunk);
+        self.respond_to_queries(chunk);
+        // vt100 parses neither of these, so they are taken off the same bytes.
+        // Reading them here rather than at render time is what makes an
+        // attention flag arrive from a tab that is in the background — the whole
+        // point of the flag.
+        let notes = scan_notifications(&mut self.notif_tail, chunk);
+        if notes.bell {
+            self.attention = true;
+        }
+        if let Some(title) = notes.title {
+            // Only a *change* of title is news. The first title a shell sends is
+            // its own name on startup, and treating that as an event would make
+            // every new tab open already demanding attention.
+            if self.last_title.as_deref().is_some_and(|t| t != title) {
+                self.attention = true;
             }
+            self.last_title = Some(title);
         }
     }
 }
@@ -751,7 +1494,14 @@ impl Terminal {
         // `self.sessions` for the tab strip while the same closure also wants
         // `&mut self` for close/new does not work, and cloning a handful of
         // short titles per frame is cheaper than restructuring around it.
-        let titles: Vec<String> = self.sessions.iter().map(|s| s.title.clone()).collect();
+        //
+        // `label()` rather than `title` because a renamed tab draws its own
+        // name; `title` stays the auto-numbered one for uniqueness checks.
+        let labels: Vec<String> = self.sessions.iter().map(|s| s.label().to_string()).collect();
+        // Bell/title flags and ids, so the strip can mark attention and a
+        // right-click can name a shell without holding a borrow of the list.
+        let attention: Vec<bool> = self.sessions.iter().map(|s| s.attention).collect();
+        let ids: Vec<u64> = self.sessions.iter().map(|s| s.id).collect();
         // Each tab's directory as well, for its hover hint. Auto context
         // switching makes the tab you click decide which project the explorer
         // shows, and "powershell 3" says nothing about which project that is —
@@ -765,6 +1515,11 @@ impl Terminal {
         let mut switch_to: Option<usize> = None;
         let mut close_tab: Option<usize> = None;
         let mut open_tab = false;
+        // A rename waiting to be opened, applied after the strip is built.
+        let mut rename: Option<(u64, String)> = None;
+        // A shell chosen from the picker, applied after the row is built so the
+        // default for new tabs cannot change mid-strip.
+        let mut pick_shell: Option<ShellKind> = None;
 
         ui.horizontal(|ui| {
             // One pill per shell, in a row that scrolls once there are more
@@ -781,7 +1536,7 @@ impl Terminal {
                 .max_width((ui.available_width() - TERM_HDR_RIGHT_W).max(140.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        for (idx, title) in titles.iter().enumerate() {
+                        for (idx, label) in labels.iter().enumerate() {
                             let active = idx == active_tab;
                             let pill = eframe::egui::Frame::NONE
                                 .fill(if active {
@@ -804,7 +1559,23 @@ impl Terminal {
                                                 .family(crate::theme::medium())
                                                 .color(accent),
                                         );
-                                        let label = eframe::egui::RichText::new(title)
+                                        // A shell that rang its bell or retitled
+                                        // itself since this tab was last looked
+                                        // at says so before its own name. Painted
+                                        // rather than typed for the usual reason:
+                                        // egui's bundled fonts have no dependable
+                                        // bullet coverage.
+                                        if attention.get(idx).copied().unwrap_or(false) {
+                                            let (dot, _) = ui.allocate_exact_size(
+                                                eframe::egui::vec2(10.0, 10.0),
+                                                eframe::egui::Sense::hover(),
+                                            );
+                                            if ui.is_rect_visible(dot) {
+                                                ui.painter_at(dot)
+                                                    .circle_filled(dot.center(), 3.0, accent);
+                                            }
+                                        }
+                                        let text = eframe::egui::RichText::new(label)
                                             .size(12.5)
                                             .color(if active {
                                                 crate::theme::text()
@@ -815,10 +1586,26 @@ impl Terminal {
                                         // text — see `widgets::clickable_label`
                                         // for the three separate things that
                                         // has to mean.
-                                        let resp = crate::widgets::clickable_label(ui, label)
+                                        let resp = crate::widgets::clickable_label(ui, text)
                                             .on_hover_text(
                                                 dirs.get(idx).cloned().unwrap_or_default(),
                                             );
+                                        // Rename and close, on the tab itself. The
+                                        // close cross is 16pt and sits inside a
+                                        // pill that scrolls; a right-click does
+                                        // not have to be aimed at it.
+                                        resp.context_menu(|ui| {
+                                            if ui.button("rename").clicked() {
+                                                if let Some(id) = ids.get(idx) {
+                                                    rename = Some((*id, label.clone()));
+                                                }
+                                                ui.close();
+                                            }
+                                            if ui.button("close").clicked() {
+                                                close_tab = Some(idx);
+                                                ui.close();
+                                            }
+                                        });
                                         if resp.clicked() {
                                             switch_to = Some(idx);
                                         }
@@ -870,6 +1657,13 @@ impl Terminal {
             if open_tab {
                 self.new_tab(cwd);
             }
+            if let Some(shell) = pick_shell {
+                self.choose_shell(shell);
+            }
+            if let Some((id, name)) = rename {
+                self.renaming = Some((id, name));
+                self.rename_focus = true;
+            }
 
             // A refused shell (the 4-terminal cap) says so here, small and
             // out of the way, while every live shell keeps running.
@@ -908,6 +1702,24 @@ impl Terminal {
                     {
                         let (rows, cols) = (session.rows, session.cols);
                         session.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+                        // A fresh parser has no history and no cursor at the old
+                        // offset, so the scroll state has to be reset with it or
+                        // the view would sit at a coordinate that no longer means
+                        // anything.
+                        session.scroll = 0;
+                        session.selection = None;
+                    }
+                    // Find in the shell's output, history included. An icon
+                    // rather than a chord: Ctrl+F is the editor's, and the whole
+                    // Ctrl+Shift family is Flow, Dim and the pane commands.
+                    if crate::icons::icon_button(ui, 20.0, "find in terminal", |p, r, c| {
+                        crate::icons::magnifier(p, r.shrink(2.0), c)
+                    })
+                    .clicked()
+                    {
+                        self.find_open = true;
+                        self.find_focus_req = true;
+                        self.recompute_find(true);
                     }
                     let fullscreen = self.fullscreen;
                     if crate::icons::icon_button(
@@ -946,21 +1758,50 @@ impl Terminal {
                             let (rows, cols) = (session.rows, session.cols);
                             session.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
                             session.error = None;
+                            session.scroll = 0;
+                            session.selection = None;
                         }
                         self.ensure_started();
                     }
-                    // Shell picker look, like the reference (single shell).
+                    // Shell picker: the pill names the shell of the tab you are
+                    // looking at, and the menu chooses which shell the next tab
+                    // starts — two different questions, which is why the pill
+                    // does not simply show the choice.
+                    //
+                    // This used to be a dead-looking chip reading "powershell"
+                    // because there was one shell. With five, a control that
+                    // cannot be clicked is the kind of static label that reads as
+                    // broken the moment it disagrees with what is running.
+                    let chosen = self.shell;
+                    let open_shell = self.session().map(|s| s.shell).unwrap_or(chosen);
+                    let shells = self.shells.clone();
                     eframe::egui::Frame::NONE
                         .fill(crate::theme::tab_active())
                         .stroke(eframe::egui::Stroke::new(1.0, crate::theme::hairline()))
                         .corner_radius(6.0)
                         .inner_margin(eframe::egui::Margin::symmetric(9, 3))
                         .show(ui, |ui| {
-                            ui.label(
-                                eframe::egui::RichText::new("powershell")
+                            let resp = crate::widgets::clickable_label(
+                                ui,
+                                eframe::egui::RichText::new(open_shell.label())
                                     .size(11.5)
                                     .color(crate::theme::dim_text()),
-                            );
+                            )
+                            .on_hover_text("choose the shell for new tabs");
+                            eframe::egui::Popup::menu(&resp).show(|ui| {
+                                ui.label(
+                                    eframe::egui::RichText::new("new tabs start")
+                                        .size(11.0)
+                                        .color(crate::theme::faint()),
+                                );
+                                for shell in shells.iter().copied() {
+                                    if ui.selectable_label(shell == chosen, shell.label()).clicked()
+                                    {
+                                        pick_shell = Some(shell);
+                                        ui.close();
+                                    }
+                                }
+                            });
                         });
                     // Collapse / expand.
                     //
@@ -989,6 +1830,21 @@ impl Terminal {
             );
         });
 
+        // The tab on screen is being watched, so its flag clears every frame:
+        // the mark exists to point at shells you are *not* looking at. In Flow
+        // Mode this is the focused pane instead — see `flow_ui` — because there
+        // every pane is visible and only one has your attention.
+        if let Some(id) = self.id_at(self.active_tab) {
+            self.mark_seen(id);
+        }
+
+        self.rename_modal(ui);
+        // Before the collapsed check on purpose: while the panel is a header
+        // strip is exactly when you might be reading output you cannot see the
+        // end of, and a search whose field is hidden is a search you cannot
+        // close.
+        self.find_bar(ui);
+
         if let Some(err) = &error {
             ui.colored_label(crate::theme::danger(), err);
         }
@@ -1004,10 +1860,6 @@ impl Terminal {
         // derived from it both shrink by this much and the PTY stays in step.
         ui.add_space(GRID_TOP_GAP);
 
-        let job = match self.session() {
-            Some(session) => term_job(session.parser.screen()),
-            None => return,
-        };
         // No input widget at all: the grid itself is the click-to-type area.
         // `active` latches on grid click. Forwarding is additionally gated on
         // no other widget holding keyboard focus, so keystrokes never leak
@@ -1028,35 +1880,156 @@ impl Terminal {
         // is told how many columns the padded grid can actually show, so the
         // last column does not wrap onto a row of its own.
         let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
-        let cell = term_cell_size(ui);
+        let cell = term_cell_size(ui, self.view.zoom);
         let (rows, cols) = term_size_for_pixels(grid_rect.width().max(0.0), grid_max, cell);
         if let Some(session) = self.session_mut() {
             session.apply_size(rows, cols);
         }
+        // Wheel over the grid reads history, or zooms the text with Ctrl held.
+        // Neither is the shell's business, and neither existed before this:
+        // the grid used to sit in a `ScrollArea` whose content was exactly one
+        // screenful, so scrolling it moved nothing at all.
+        match wheel_intent(ui, grid_rect, cell.1, &mut self.view) {
+            WheelIntent::Scroll(by) => {
+                if let Some(session) = self.session_mut() {
+                    session.scroll_by(by);
+                }
+            }
+            WheelIntent::Zoom(factor) => self.zoom_by(factor),
+            WheelIntent::None => {}
+        }
+        let zoom = self.view.zoom;
+        // The current find hit, if there is one. It is only painted when it sits
+        // at the offset being drawn — a hit found further back is not on screen,
+        // and tinting a cell on the live screen because of it would point at the
+        // wrong text entirely.
+        let search = self
+            .find_open
+            .then(|| self.find_hits.get(self.find_pos).copied())
+            .flatten();
+        let job = match self.session_mut() {
+            Some(session) => {
+                // Before the render, so what is drawn is what was asked for:
+                // the grid clamps the offset whenever output pushes it out of
+                // the buffer.
+                session.apply_scroll();
+                let markup = Markup {
+                    font_size: TERM_FONT_SIZE * zoom,
+                    selection: session.selection_range(),
+                    search: search
+                        .filter(|hit| hit.offset == session.scroll)
+                        .map(|hit| (hit.row, hit.col, hit.cells)),
+                    cursor: session.scroll == 0,
+                };
+                term_job(session.parser.screen(), markup)
+            }
+            None => return,
+        };
         let mut grid_clicked = false;
+        let mut drag_from: Option<(u16, u16)> = None;
+        let mut drag_to: Option<(u16, u16)> = None;
+        let mut drag_done = false;
+        let mut copy_clicked = false;
+        let mut paste_clicked = false;
+        // A plain scope, not a `ScrollArea`: history is shown by asking the vt100
+        // screen for it, so a second scroller inside the same rect would fight
+        // that — and it would eat the wheel events this now reads. The label is
+        // the only thing in here, and it is sized to fit exactly.
         ui.scope_builder(
             eframe::egui::UiBuilder::new()
                 .max_rect(grid_rect)
                 .layout(eframe::egui::Layout::top_down(eframe::egui::Align::LEFT)),
             |ui| {
-                eframe::egui::ScrollArea::vertical()
-                    .id_salt("snor_term_grid")
-                    .max_height(grid_max)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.push_id("snor_term_grid_label", |ui| {
-                            let resp = ui.add(
-                                eframe::egui::Label::new(job)
-                                    .extend()
-                                    .sense(eframe::egui::Sense::click()),
-                            );
-                            grid_clicked = resp.clicked();
-                        });
+                ui.push_id("snor_term_grid_label", |ui| {
+                    let resp = ui.add(
+                        eframe::egui::Label::new(job)
+                            .extend()
+                            // Selection is ours, not egui's: a `Label`'s own
+                            // selection copies the grid's full-width padding and
+                            // would fight the tint painted below.
+                            .selectable(false)
+                            .sense(eframe::egui::Sense::click_and_drag()),
+                    );
+                    grid_clicked = resp.clicked();
+                    let at = resp
+                        .interact_pointer_pos()
+                        .map(|pos| cell_at_pos(grid_rect.min, cell, pos));
+                    if resp.drag_started() {
+                        drag_from = at;
+                    } else if resp.dragged() {
+                        drag_to = at;
+                    }
+                    if resp.drag_stopped() {
+                        drag_done = true;
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("copy").clicked() {
+                            copy_clicked = true;
+                            ui.close();
+                        }
+                        if ui.button("paste").clicked() {
+                            paste_clicked = true;
+                            ui.close();
+                        }
                     });
+                });
             },
         );
         if grid_clicked {
             self.active = true;
+        }
+        let dragging = drag_from.is_some() || drag_to.is_some() || drag_done;
+        if dragging
+            && let Some(session) = self.session_mut()
+        {
+            if let Some(start) = drag_from {
+                session.selection = Some(Selection::new(start));
+            } else if let Some(head) = drag_to
+                && let Some(sel) = session.selection.as_mut()
+            {
+                sel.head = head;
+            }
+            // A press that never moved is a click, not a selection: leaving a
+            // one-cell selection behind would make the next copy take a single
+            // character the user never chose.
+            if drag_done && session.selection.is_some_and(|s| s.is_click()) {
+                session.selection = None;
+            }
+        }
+        // Ctrl+Shift+C copies rather than interrupts. The other terminal
+        // convention is the one everyone already has in their fingers, and it is
+        // the only way to keep Ctrl+C as SIGINT without a collision;
+        // `key_to_bytes` refuses the shifted form so it never reaches the shell.
+        let copy_key = ui.input_mut(|i| {
+            i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
+                eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
+                eframe::egui::Key::C,
+            ))
+        });
+        if copy_clicked || copy_key {
+            let text = self
+                .session()
+                .and_then(|s| s.selection.map(|sel| selection_text(s.parser.screen(), sel)));
+            if let Some(text) = text
+                && !text.is_empty()
+            {
+                ui.ctx().copy_text(text);
+            }
+        }
+        let paste_key = ui.input_mut(|i| {
+            i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
+                eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
+                eframe::egui::Key::V,
+            ))
+        });
+        if paste_clicked || paste_key {
+            // Asking the backend for the clipboard, which arrives as
+            // `Event::Paste` and is forwarded to the pty by `forward_events`
+            // like any other paste — egui has no direct clipboard read, and this
+            // is the path the shell already understands.
+            self.active = true;
+            ui.ctx()
+                .send_viewport_cmd(eframe::egui::ViewportCommand::RequestPaste);
         }
 
         // Type-directly-in-terminal is shared with Flow Mode panes: the
@@ -1067,6 +2040,174 @@ impl Terminal {
 }
 
 impl Terminal {
+    /// Run the search again, and land on a hit.
+    ///
+    /// `newest` decides which end to land on. When the query changes the newest
+    /// match is the interesting one — the traceback that just scrolled past —
+    /// and a step from there behaves like a step from anywhere else.
+    fn recompute_find(&mut self, newest: bool) {
+        let query = self.find_query.clone();
+        let mut hits = Vec::new();
+        if let Some(session) = self.session_mut() {
+            let at = session.scroll;
+            hits = find_hits(session.parser.screen_mut(), &query, at, FIND_CAP);
+        }
+        self.find_hits = hits;
+        self.find_pos = if newest && !self.find_hits.is_empty() {
+            self.find_hits.len() - 1
+        } else {
+            0
+        };
+        self.jump_to_hit();
+    }
+
+    /// Move to another hit, wrapping at both ends.
+    fn find_step(&mut self, dir: i32) {
+        if self.find_hits.is_empty() {
+            return;
+        }
+        let n = self.find_hits.len() as i32;
+        self.find_pos = (self.find_pos as i32 + dir).rem_euclid(n) as usize;
+        self.jump_to_hit();
+    }
+
+    /// Scroll the active shell to the current hit.
+    ///
+    /// The tint is the renderer's job: it reads `find_hits[find_pos]` and paints
+    /// it only when that offset is the screenful being drawn, which is what stops
+    /// a hit in history from tinting an unrelated cell of the live screen.
+    fn jump_to_hit(&mut self) {
+        let Some(hit) = self.find_hits.get(self.find_pos).copied() else {
+            return;
+        };
+        if let Some(session) = self.session_mut() {
+            session.parser.screen_mut().set_scrollback(hit.offset);
+            session.scroll = session.parser.screen().scrollback();
+            // A selection and a search are two readings of the same grid;
+            // leaving the old one tinted under the new hit is just noise.
+            session.selection = None;
+        }
+    }
+
+    /// The find bar: search the active shell's output, history included.
+    fn find_bar(&mut self, ui: &mut eframe::egui::Ui) {
+        if !self.find_open {
+            return;
+        }
+        let field = ui.make_persistent_id("snor_term_find");
+        if std::mem::take(&mut self.find_focus_req) {
+            ui.memory_mut(|m| m.request_focus(field));
+        }
+        let mut close = false;
+        let mut step = 0;
+        let mut requery = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                eframe::egui::TextEdit::singleline(&mut self.find_query)
+                    .id(field)
+                    .hint_text("find in terminal (history included)")
+                    .desired_width(240.0),
+            );
+            if resp.changed() {
+                requery = true;
+            }
+            let total = self.find_hits.len();
+            if total > 0 {
+                ui.label(
+                    eframe::egui::RichText::new(format!("{}/{}", self.find_pos + 1, total))
+                        .small()
+                        .color(crate::theme::dim_text()),
+                );
+                if ui.small_button("prev").clicked() {
+                    step = -1;
+                }
+                if ui.small_button("next").clicked() {
+                    step = 1;
+                }
+            } else if !self.find_query.trim().is_empty() {
+                ui.label(
+                    eframe::egui::RichText::new("no match")
+                        .small()
+                        .color(crate::theme::faint()),
+                );
+            }
+            if ui.small_button("x").clicked() {
+                close = true;
+            }
+            if ui.memory(|m| m.has_focus(field)) {
+                if ui.input(|i| i.key_pressed(eframe::egui::Key::Escape)) {
+                    close = true;
+                }
+                if ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
+                    step = if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
+                }
+            }
+        });
+        if requery {
+            self.recompute_find(true);
+        } else if close {
+            self.find_open = false;
+        } else if step != 0 {
+            self.find_step(step);
+        }
+    }
+
+    /// The rename box, if a tab is being renamed.
+    fn rename_modal(&mut self, ui: &eframe::egui::Ui) {
+        let Some((id, mut name)) = self.renaming.clone() else {
+            return;
+        };
+        let field = ui.make_persistent_id("snor_term_rename");
+        // Taken before the closure, so the caret lands in the field on the frame
+        // the box opens and is never re-stolen afterwards.
+        let focus = std::mem::take(&mut self.rename_focus);
+        let mut apply = false;
+        let mut cancel = false;
+        eframe::egui::Window::new("rename terminal")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                if focus {
+                    ui.memory_mut(|m| m.request_focus(field));
+                }
+                let resp = ui.add(
+                    eframe::egui::TextEdit::singleline(&mut name)
+                        .id(field)
+                        .desired_width(220.0)
+                        .hint_text("tab name"),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter)) {
+                    apply = true;
+                }
+                if ui.input(|i| i.key_pressed(eframe::egui::Key::Escape)) {
+                    cancel = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("rename").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.label(
+                    eframe::egui::RichText::new("an empty name restores the automatic one")
+                        .small()
+                        .color(crate::theme::faint()),
+                );
+            });
+        if cancel {
+            self.renaming = None;
+        } else if apply {
+            self.rename_session(id, &name);
+            self.renaming = None;
+        } else {
+            // Kept, so a click elsewhere in the window does not throw away what
+            // has been typed.
+            self.renaming = Some((id, name));
+        }
+    }
+
     /// Forward bytes to `target`, or to the active tab when `None`.
     fn send_bytes_to(&mut self, target: Option<u64>, bytes: &[u8]) {
         match target {
@@ -1437,9 +2578,9 @@ const PANE_GRID_PAD: f32 = 4.0;
 
 /// Pixels per terminal cell, measured off the live font. Panes divide their
 /// pixel rects by these to learn their real rows and columns.
-fn term_cell_size(ui: &eframe::egui::Ui) -> (f32, f32) {
+fn term_cell_size(ui: &eframe::egui::Ui, zoom: f32) -> (f32, f32) {
     use eframe::egui::{Color32, FontId};
-    let mono = FontId::monospace(TERM_FONT_SIZE);
+    let mono = FontId::monospace(TERM_FONT_SIZE * zoom);
     let w = ui
         .painter()
         .layout_no_wrap("MMMMMMMMMM".to_owned(), mono.clone(), Color32::WHITE)
@@ -1588,7 +2729,7 @@ impl Terminal {
             .unwrap_or_else(|| default_cwd.clone());
         let id = self.next_session_id;
         self.next_session_id += 1;
-        let mut session = Session::new(self.next_free_title(), id);
+        let mut session = Session::new(self.next_free_title(), id, self.shell);
         session.cwd = cwd.clone();
         session.started = true;
         session.spawn(&cwd);
@@ -1713,7 +2854,7 @@ impl Terminal {
         //
         // Measuring first closes that gap: any output the resize provokes is
         // drained by the `poll()` below, in the same frame it was asked for.
-        let cell = term_cell_size(ui);
+        let cell = term_cell_size(ui, self.view.zoom);
         self.size_panes(rect, cell);
 
         self.poll();
@@ -1729,18 +2870,20 @@ impl Terminal {
             flow_grid,
             flow_focus,
             active,
+            view,
             ..
         } = self;
         // The view borrows grid and sessions side by side; the scope ends
         // those borrows before input handling needs `self`.
         {
-            let mut view = FlowView {
+            let mut flow = FlowView {
                 grid: flow_grid,
                 sessions,
                 focus: flow_focus,
                 latched: active,
+                view,
             };
-            view.render(ui, rect);
+            flow.render(ui, rect);
         }
         // A refused creation is reported by the caller instead of here.
         //
@@ -1751,6 +2894,12 @@ impl Terminal {
         // travels out through `notice_text()` and the shell draws it in the
         // status bar, where "Flow" already lives and nothing can collide.
         let target = self.flow_target_id();
+        // Focused means watched: only the pane with focus clears its flag here.
+        // Every pane is visible in this mode, so clearing on visibility would
+        // clear all four and the mark would mean nothing when it mattered.
+        if let Some(id) = target {
+            self.mark_seen(id);
+        }
         self.forward_events(ui, target);
     }
 
@@ -1805,6 +2954,9 @@ struct FlowView<'a> {
     sessions: &'a mut Vec<Session>,
     focus: &'a mut Option<u64>,
     latched: &'a mut bool,
+    /// Terminal-wide view state: panes draw the same grid, so they share the
+    /// zoom with the tabbed layout rather than inventing a second one.
+    view: &'a mut ViewState,
 }
 
 impl<'a> FlowView<'a> {
@@ -1888,8 +3040,8 @@ impl<'a> FlowView<'a> {
         use eframe::egui::{Align, Layout};
         let focused = *self.focus == Some(id);
         // Snapshot the header first; the borrow ends before any widget.
-        let error = match self.sessions.iter().find(|s| s.id == id) {
-            Some(s) => s.error.clone(),
+        let (error, attention) = match self.sessions.iter().find(|s| s.id == id) {
+            Some(s) => (s.error.clone(), s.attention),
             None => return,
         };
         ui.scope_builder(
@@ -1926,6 +3078,23 @@ impl<'a> FlowView<'a> {
                     );
                     ui.painter().rect_filled(bar, 1.0, crate::theme::accent());
                 }
+                // This shell wants you: it rang, or it retitled itself, since
+                // the pane was last focused. Drawn whether or not the pane has
+                // focus — an unfocused pane is exactly the one that needs to be
+                // pointed at, and this is the whole reason Flow Mode can hold
+                // four agents without the user cycling through them to see who
+                // is waiting.
+                if attention {
+                    let dot = eframe::egui::pos2(
+                        rect.right() - 12.0,
+                        rect.top() + PANE_HEADER_H * 0.5,
+                    );
+                    let p = ui.painter_at(eframe::egui::Rect::from_center_size(
+                        dot,
+                        eframe::egui::vec2(9.0, 9.0),
+                    ));
+                    p.circle_filled(dot, 3.5, crate::theme::accent());
+                }
                 if let Some(err) = error {
                     ui.colored_label(crate::theme::danger(), err);
                 }
@@ -1941,33 +3110,58 @@ impl<'a> FlowView<'a> {
                 // before the ptys were drained — see `flow_ui`. Sizing here
                 // instead would resize the ConPTY after its output for this
                 // frame had been read, leaving a torn frame on screen.
-                let job = match self.sessions.iter().find(|s| s.id == id) {
-                    Some(s) => term_job(s.parser.screen()),
-                    None => return,
-                };
-                let grid_max = (ui.available_height() - 2.0).max(40.0);
-                let mut clicked = false;
                 // The grid is drawn into the side-inset rect, so the pane's own
                 // outline does not have the prompt's first glyph sitting on it.
+                let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
+                let cell = term_cell_size(ui, self.view.zoom);
+                // Wheel in a pane means the same as in the tabbed layout:
+                // history, or zoom with Ctrl. Both are handled before the label
+                // so the gesture never reaches the shell.
+                match wheel_intent(ui, grid_rect, cell.1, self.view) {
+                    WheelIntent::Scroll(by) => {
+                        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                            session.scroll_by(by);
+                        }
+                    }
+                    WheelIntent::Zoom(factor) => {
+                        self.view.zoom = (self.view.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                    }
+                    WheelIntent::None => {}
+                }
+                let job = match self.sessions.iter_mut().find(|s| s.id == id) {
+                    Some(s) => {
+                        s.apply_scroll();
+                        let markup = Markup {
+                            font_size: TERM_FONT_SIZE * self.view.zoom,
+                            // Panes have no drag selection of their own — the
+                            // tabbed grid is where selecting and copying lives —
+                            // but the field is carried through so both layouts
+                            // render through the same function.
+                            selection: s.selection_range(),
+                            search: None,
+                            cursor: s.scroll == 0,
+                        };
+                        term_job(s.parser.screen(), markup)
+                    }
+                    None => return,
+                };
+                let mut clicked = false;
+                // A plain scope, matching the tabbed layout: history is the
+                // vt100 screen's, so an inner scroller would only fight it.
                 ui.scope_builder(
                     eframe::egui::UiBuilder::new()
-                        .max_rect(inset_grid_sides(ui.available_rect_before_wrap()))
+                        .max_rect(grid_rect)
                         .layout(eframe::egui::Layout::top_down(eframe::egui::Align::LEFT)),
                     |ui| {
-                        eframe::egui::ScrollArea::vertical()
-                            .id_salt(("snor_flow_grid", id))
-                            .max_height(grid_max)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.push_id(("snor_flow_grid_label", id), |ui| {
-                                    let resp = ui.add(
-                                        eframe::egui::Label::new(job)
-                                            .extend()
-                                            .sense(eframe::egui::Sense::click()),
-                                    );
-                                    clicked = resp.clicked();
-                                });
-                            });
+                        ui.push_id(("snor_flow_grid_label", id), |ui| {
+                            let resp = ui.add(
+                                eframe::egui::Label::new(job)
+                                    .extend()
+                                    .selectable(false)
+                                    .sense(eframe::egui::Sense::click()),
+                            );
+                            clicked = resp.clicked();
+                        });
                     },
                 );
                 if clicked {
@@ -2010,7 +3204,11 @@ impl Drop for Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, Terminal, flow_shape, term_size_for_pixels};
+    use super::{
+        FIND_CAP, Notifications, Selection, Session, ShellKind, Terminal, cell_at_pos, find_hits,
+        flow_shape, installed_from, scan_notifications, selection_text, shell_title,
+        term_size_for_pixels,
+    };
     use eframe::egui::{Key, Modifiers};
 
     #[test]
@@ -2270,6 +3468,308 @@ mod tests {
             seen,
             "typed line never echoed — shell not responding to pty input"
         );
+    }
+
+    // --- Scrollback, selection, search, attention, shells ----------------
+
+    /// Hermetic: `ingest` is the same call `poll` makes, so these exercise the
+    /// real parser and the real notification scan with no pty behind them.
+    fn labels(t: &Terminal) -> Vec<&str> {
+        t.sessions.iter().map(|s| s.label()).collect()
+    }
+
+    /// History is the grid's, not a second buffer: the offset moves the vt100
+    /// screen, `cell(row, col)` returns what scrolled off, and the clamp is the
+    /// grid's own because vt100 0.16 exposes no history length to clamp against.
+    #[test]
+    fn wheel_history_holds_what_has_scrolled_off_the_screen() {
+        let mut t = Terminal::new();
+        for i in 0..40 {
+            sm(&mut t).ingest(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(s(&t).scroll, 0, "a live shell starts at the bottom");
+
+        sm(&mut t).scroll_by(5);
+        assert_eq!(s(&t).scroll, 5);
+        sm(&mut t).apply_scroll();
+        // Five rows back: nothing was drawn there before, and now it holds the
+        // line that scrolled off the top.
+        assert!(
+            s(&t).parser.screen().cell(0, 0).is_some(),
+            "the screen must still answer for rows in history"
+        );
+
+        // Asking for more than exists lands on the oldest line, not above it,
+        // and asking twice does not drift further.
+        sm(&mut t).scroll_by(10_000);
+        let oldest = s(&t).scroll;
+        assert!(oldest > 5, "40 lines through a 24-row screen is history");
+        sm(&mut t).scroll_by(10_000);
+        assert_eq!(s(&t).scroll, oldest, "the clamp must hold");
+
+        // Typing means the user is done reading history.
+        sm(&mut t).scroll_to_bottom();
+        assert_eq!(s(&t).scroll, 0);
+    }
+
+    /// A selection copies text, not a rectangle of trailing spaces. The grid is
+    /// padded to its full width for rendering, and that padding is exactly what
+    /// makes a copied line paste as garbage.
+    #[test]
+    fn a_selection_copies_without_the_grid_padding() {
+        let mut t = Terminal::new();
+        sm(&mut t).ingest(b"alpha beta\r\nsecond line\r\n");
+
+        let one = Selection {
+            anchor: (0, 0),
+            head: (0, 4),
+        };
+        assert_eq!(selection_text(s(&t).parser.screen(), one), "alpha");
+
+        let two = Selection {
+            anchor: (0, 6),
+            head: (1, 5),
+        };
+        assert_eq!(selection_text(s(&t).parser.screen(), two), "beta\nsecond");
+
+        // Blank rows at the end are dropped rather than copied as empty lines.
+        let trailing = Selection {
+            anchor: (0, 6),
+            head: (3, 0),
+        };
+        assert_eq!(
+            selection_text(s(&t).parser.screen(), trailing),
+            "beta\nsecond line"
+        );
+
+        // A press that never moves is a click, and leaves nothing to copy.
+        let click = Selection::new((1, 1));
+        assert!(click.is_click());
+        assert_eq!(click.normalized(), ((1, 1), (1, 1)));
+    }
+
+    /// Search reaches into the scrollback, reports cells rather than bytes, and
+    /// leaves the view where the user had it.
+    #[test]
+    fn find_reaches_into_the_scrollback_and_restores_the_view() {
+        let mut t = Terminal::new();
+        sm(&mut t).ingest(b"hello world\r\n");
+        let live = find_hits(sm(&mut t).parser.screen_mut(), "world", 0, FIND_CAP);
+        assert_eq!(
+            live,
+            vec![super::FindHit {
+                offset: 0,
+                row: 0,
+                col: 6,
+                cells: 5
+            }],
+            "a match on the live screen reports where the renderer must tint"
+        );
+
+        for i in 0..40 {
+            let line = if i == 3 {
+                format!("needle at {i}\r\n")
+            } else {
+                format!("line{i}\r\n")
+            };
+            sm(&mut t).ingest(line.as_bytes());
+        }
+        // The user is reading history, not the live screen.
+        sm(&mut t).scroll_by(7);
+        let viewed = s(&t).scroll;
+
+        let hits = find_hits(
+            sm(&mut t).parser.screen_mut(),
+            "needle",
+            viewed,
+            FIND_CAP,
+        );
+        assert_eq!(hits.len(), 1, "one match in the whole history");
+        assert!(
+            hits[0].offset > 0,
+            "the match has scrolled off the live screen"
+        );
+        assert_eq!(
+            s(&t).parser.screen().scrollback(),
+            viewed,
+            "searching must not move the view it was asked about"
+        );
+        assert_eq!(
+            find_hits(
+                sm(&mut t).parser.screen_mut(),
+                "NEEDLE",
+                viewed,
+                FIND_CAP
+            )
+            .len(),
+            1,
+            "case-insensitive"
+        );
+
+        // Jumping to a hit scrolls to it, so the tint and the view agree.
+        t.find_hits = hits;
+        t.find_pos = 0;
+        t.jump_to_hit();
+        assert_eq!(s(&t).scroll, t.find_hits[0].offset);
+    }
+
+    /// The rule that makes the flag worth having: a shell announcing its own name
+    /// at startup is not news, a shell retitling itself later is, and a bell
+    /// always is.
+    #[test]
+    fn a_bell_and_a_title_change_raise_attention_but_startup_titles_do_not() {
+        let mut t = Terminal::new();
+        sm(&mut t).ingest(b"\x1b]0;Windows PowerShell\x07");
+        assert!(
+            !s(&t).attention,
+            "the shell's own startup title must not demand attention"
+        );
+
+        sm(&mut t).ingest(b"\x1b]2;agent: reading src/main.rs\x07");
+        assert!(s(&t).attention, "an agent retitling itself is the point");
+
+        let id = s(&t).id;
+        t.mark_seen(id);
+        assert!(!s(&t).attention, "looking at it clears it");
+
+        sm(&mut t).ingest(b"\x07");
+        assert!(s(&t).attention, "a bell is unambiguous");
+    }
+
+    /// A title arrives in whatever pieces the pty reader flushed, so a sequence
+    /// split across two reads still has to be read exactly once.
+    #[test]
+    fn an_escape_split_across_reads_is_read_once() {
+        let mut tail = Vec::new();
+        assert_eq!(
+            scan_notifications(&mut tail, b"\x1b]2;agen"),
+            Notifications::default()
+        );
+        assert!(!tail.is_empty(), "the half sequence must be kept");
+
+        let notes = scan_notifications(&mut tail, b"t done\x07");
+        assert_eq!(notes.title.as_deref(), Some("agent done"));
+        assert!(
+            !notes.bell,
+            "the BEL that ends a title assignment is a terminator, not a bell"
+        );
+        assert!(tail.is_empty(), "nothing left over");
+
+        // The other terminator, and an ordinary bell with no title.
+        let mut tail = Vec::new();
+        let notes = scan_notifications(&mut tail, b"\x1b]2;x\x1b\\\x07");
+        assert_eq!(notes.title.as_deref(), Some("x"));
+        assert!(notes.bell);
+
+        // A title assignment for a feature this app does not implement ("11" is
+        // a window colour) is not a name.
+        let mut tail = Vec::new();
+        assert_eq!(
+            scan_notifications(&mut tail, b"\x1b]11;#282c34\x07"),
+            Notifications::default()
+        );
+        assert!(tail.is_empty());
+    }
+
+    /// Renaming changes what is drawn, never the auto-numbering: `title` is what
+    /// `next_free_title` compares against, so a renamed tab cannot make the next
+    /// shell reuse a name already on screen.
+    #[test]
+    fn renaming_a_tab_leaves_the_numbering_alone() {
+        let mut t = Terminal::new();
+        t.open_stub_tab();
+        let id = s(&t).id;
+
+        t.rename_session(id, "  agent-auth  ");
+        assert_eq!(labels(&t), ["powershell", "agent-auth"]);
+
+        t.open_stub_tab();
+        assert_eq!(
+            titles(&t),
+            ["powershell", "powershell 2", "powershell 3"],
+            "numbering must not care about names the user gave"
+        );
+
+        // An empty name hands the tab back to its automatic label.
+        t.rename_session(id, "   ");
+        assert_eq!(labels(&t)[1], "powershell 2");
+        // Renaming something that no longer exists is a no-op, not a panic.
+        t.rename_session(9_999, "ghost");
+        assert_eq!(labels(&t)[1], "powershell 2");
+    }
+
+    /// Shell detection is a lookup, not a probe: nothing is spawned to draw the
+    /// menu, and a machine with a trimmed PATH still gets a shell.
+    #[test]
+    fn shell_detection_lists_what_is_actually_installed() {
+        let dir = std::env::temp_dir().join("snor_shell_probe_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pwsh.exe"), b"").unwrap();
+        std::fs::write(dir.join("bash.exe"), b"").unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        let shells = installed_from(&path, None);
+        assert!(shells.contains(&ShellKind::PowerShell), "ships with Windows");
+        assert!(shells.contains(&ShellKind::Pwsh));
+        assert!(shells.contains(&ShellKind::GitBash));
+        assert!(!shells.contains(&ShellKind::Wsl), "not installed here");
+        assert!(
+            !shells.contains(&ShellKind::Cmd),
+            "cmd needs COMSPEC or its own entry on PATH"
+        );
+
+        // Windows filenames are case-insensitive, so the lookup must be too.
+        std::fs::write(dir.join("WSL.EXE"), b"").unwrap();
+        assert!(installed_from(&path, None).contains(&ShellKind::Wsl));
+
+        // A COMSPEC that exists is enough for cmd.
+        let cmd = dir.join("cmd.exe");
+        std::fs::write(&cmd, b"").unwrap();
+        let comspec = cmd.to_string_lossy().to_string();
+        assert!(installed_from(&path, Some(&comspec)).contains(&ShellKind::Cmd));
+
+        // The menu is never empty, whatever the environment says.
+        assert_eq!(installed_from("", None), vec![ShellKind::PowerShell]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every shell has to name a program to spawn: a variant with an empty
+    /// program would fail at spawn time, in a menu the user cannot debug.
+    #[test]
+    fn every_shell_names_a_program_and_a_tab_title() {
+        for shell in ShellKind::ALL {
+            assert!(shell.program().ends_with(".exe"), "{:?}", shell);
+            assert!(!shell.title_name().is_empty(), "{:?}", shell);
+            assert!(!shell.label().is_empty(), "{:?}", shell);
+            // Only Git Bash takes login/interactive flags; nothing here should
+            // start a shell that reads a profile and prints a banner over the
+            // grid on every new tab.
+            if shell != ShellKind::GitBash {
+                assert!(
+                    !shell.args().contains(&"-l"),
+                    "{:?} must not start a login shell",
+                    shell
+                );
+            }
+        }
+        // The tab title of the default shell is what every existing label,
+        // test and screenshot already says.
+        assert_eq!(shell_title(1, ShellKind::default()), "powershell");
+        assert_eq!(shell_title(2, ShellKind::Pwsh), "pwsh 2");
+    }
+
+    /// Pointer to cell, which is what selection starts from.
+    #[test]
+    fn a_pointer_lands_on_the_cell_under_it() {
+        use eframe::egui::pos2;
+        let origin = pos2(10.0, 20.0);
+        let cell = (8.0, 16.0);
+        assert_eq!(cell_at_pos(origin, cell, pos2(10.0, 20.0)), (0, 0));
+        assert_eq!(cell_at_pos(origin, cell, pos2(17.9, 35.9)), (0, 0));
+        assert_eq!(cell_at_pos(origin, cell, pos2(18.0, 36.0)), (1, 1));
+        // Above or left of the grid clamps rather than wrapping to the end.
+        assert_eq!(cell_at_pos(origin, cell, pos2(0.0, 0.0)), (0, 0));
     }
 
     // --- Flow Mode -----------------------------------------------------

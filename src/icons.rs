@@ -515,6 +515,21 @@ pub fn refresh(painter: &Painter, rect: Rect, color: Color32) {
     ));
 }
 
+/// Magnifier, for "find in this terminal".
+///
+/// A stroked glass with a handle: the one search glyph that still reads at 20pt
+/// without a second element to explain it.
+pub fn magnifier(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.5;
+    let glass = pos2(c.x - s * 0.2, c.y - s * 0.2);
+    let r = s * 0.5;
+    let stroke = Stroke::new(1.4, color);
+    painter.circle_stroke(glass, r, stroke);
+    let joint = pos2(glass.x + r * 0.72, glass.y + r * 0.72);
+    painter.line_segment([joint, pos2(c.x + s * 0.8, c.y + s * 0.8)], stroke);
+}
+
 /// Shorten `text` with a trailing ellipsis so it fits `max_w` in `font`.
 /// Cheap by design: one layout to measure, one estimate for the cut.
 pub fn truncate(painter: &Painter, text: &str, font: FontId, max_w: f32) -> String {
