@@ -41,7 +41,8 @@ otherwise `cargo build` fails with `os error 5`.
 | `app.rs` | Shell: title bar, left panel, status bar, center split (editor + terminal), global shortcuts (Ctrl+Tab terminal, Ctrl+B explorer), Run-button wiring (`editor.want_run` -> `terminal.send_line("cargo run")`). Owns `show_explorer` (the status-bar sidebar toggle). Editor renders before terminal every frame — terminal reads input events after the editor. |
 | `editor.rs` | Tabs (`OpenBuffer`), keyword-fallback highlighter, find (Ctrl+F), gutter, cursor readout (`cursor_line/col`), `want_run` flag. `ui(&mut self, ui, workdir)` — workdir seeds the `+` file picker. |
 | `file_tree.rs` | Explorer tree (depth cap 8, skips `target/.git/node_modules/.idea`, 2000-entry cap), create/rename/delete + confirm modal, `notify` watcher with 300ms debounce, `opened_file` handoff to the editor. |
-| `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback and query-responder buffer. Tab strip spawns/switches/closes shells; `collapsed`/`fullscreen`/`hidden` + drag height. |
+| `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback, selection, attention flag, shell and query-responder buffer. Tab strip spawns/switches/closes/renames shells; scrollback, copy, find, zoom and shell choice; `collapsed`/`fullscreen`/`hidden` + drag height. |
+| `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
 | `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
 | `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
@@ -115,6 +116,94 @@ Current design (do not regress):
   screenshot instead of the code. It is painted rather than typed because
   egui's bundled fonts have no dependable bullet coverage and a missing glyph
   renders as tofu. Measured: 9px wide, 15.2pt clear of the "+" button.
+
+## The terminal grid: history, selection, find, attention, shells
+
+Everything below lives in `terminal.rs` and is load-bearing in the same way the
+tab rules are — each one replaces something that looked like it worked.
+
+- **History belongs to the vt100 screen, not to a scroll container.**
+  `SCROLLBACK` was always 1000 rows, but `term_job` rendered `screen.size()` rows
+  of the live screen and the grid sat inside a `ScrollArea` whose content was
+exactly one screenful — so scrolling it moved nothing. `Session::scroll` is the
+intent, `Screen::set_scrollback` is the mechanism, and vt100 0.16 exposes no
+history length, so the offset is set and then read back (`apply_scroll`).
+- **Do not put the grid back inside a `ScrollArea`.** It would both fight the
+  screen's own offset and consume the wheel events that drive it.
+- **A history hit is scanned once per offset, at row 0.** Every line of history
+  is visible in `rows` different windows at a different row each, so scanning a
+  whole window per offset reported one line up to 24 times and "next" walked the
+  same match repeatedly. Each offset adds exactly one line — its row 0 — and the
+  live screen is scanned whole at offset 0. Guarded by
+  `find_reaches_into_the_scrollback_and_restores_the_view`.
+- **The block cursor is not drawn while scrolled back.** `Markup::cursor` is
+  `false` at any non-zero offset: the live cursor is not in history, so painting
+  it there puts a caret over text the shell is not editing.
+- **Selection is ours, so `Label::selectable(false)` stays.** egui's own label
+  selection would copy the grid's full-width padding (every line padded to the
+  last column) and fight the tint painted under it. `selection_text` trims each
+  row and drops trailing blank rows — that trimming is the entire reason for not
+  using the built-in. Ctrl+C stays SIGINT; `key_to_bytes` refuses the shifted
+  form so Ctrl+Shift+C reaches the app and never the shell.
+- **Attention is cleared on focus, never on visibility.** In Flow Mode every
+  pane is on screen at once, so clearing on visibility would clear all four and
+  the mark would mean nothing. Normal mode clears the visible tab each frame
+  (`id_at(self.active_tab)`), Flow Mode clears only the focused pane. The
+  *first* title a shell announces is its startup name and is deliberately not
+  news — otherwise every new tab opens demanding attention. Bell and title reach
+  us via `scan_notifications`, which reads the same chunk the parser gets, and
+  keeps an unterminated escape in `notif_tail` because a title routinely arrives
+  in two reads.
+- **Renaming touches `custom_title`, never `title`.** `next_free_title` compares
+  against `title`, so a renamed tab cannot make the next shell reuse a name that
+  is already on screen. An empty name hands the tab back to its automatic label.
+- **Zoom lives in `ViewState`, shared by both layouts.** `term_cell_size(ui,
+  zoom)` is read by `Terminal::ui`, `flow_ui` and `render_pane` — sizing happens
+  through the ordinary `apply_size` path, so a zoom is indistinguishable from a
+  window resize as far as the ptys are concerned. Ctrl+wheel comes from egui's
+  own `InputState::zoom_delta`, which nothing else in this app reads.
+- **Shell detection is a lookup, not a probe.** `installed_from` scans `PATH`
+  for the executable's filename and takes `COMSPEC` for `cmd`; spawning
+  `pwsh -c exit` to test for it would spawn a process on every start to draw a
+  menu. `powershell.exe` is reported present whatever the lookup says, so a
+  trimmed `PATH` cannot leave the menu empty. A window with no shell to start is
+  a dead end, which is why the fallback is unconditional.
+
+## The branch readout (`git.rs`)
+
+One file read, and the boundary is worth keeping: `.git/HEAD`, nothing else. No
+process, no crate, no index. It follows a `.git` *file* (`gitdir: …`, a worktree
+or submodule) because the path inside is relative to the directory holding it.
+
+It exists because the status bar used to show the literal `main` beside two
+literal `0`s with a sync dot and a change triangle drawn around them — four
+readouts that were never measured, and a repository on `dev` advertised `main`.
+The counts are gone rather than faked better: ahead/behind needs a git process or
+an index parse. `Terminal`/`SnorApp::poll_branch` re-reads every two seconds and
+immediately on a root change, because what changes a branch is usually a `git
+checkout` typed into one of our own shells, which nothing here watches.
+
+## Not losing the user's work (`editor.rs`, `app.rs`)
+
+- **Open buffers are compared against the disk once a second** (`poll_disk`,
+  `reconcile_with_disk`; split so the decision can be tested without sleeping).
+  Clean buffer: reload, and say so — text changing without a keystroke reads as a
+  bug otherwise. Dirty buffer: raise the conflict banner and touch nothing.
+  Reloading would throw away what the user typed; saving would throw away what
+  the agent wrote; the app cannot know which matters, so it asks.
+- **The stamp is length + mtime**, not a hash. A rewrite inside the same
+  timestamp tick that keeps the byte count is invisible; closing that would cost
+  re-reading every open file every second. A half-written file is self-healing:
+  the next tick sees the stamp move again and reloads the finished version.
+- **"Keep mine" moves the stamp up to what is on disk now**, so the banner does
+  not re-raise for the same change while the user's text stays in the buffer.
+- **A close is cancelled, then questioned.** eframe reports a close *request*
+  and only shuts down if the frame does not answer with `CancelClose` (verified
+  in `EpiIntegration::update`). `ViewportCommand::Close` — our own cross — arrives
+  as the same request, so `SnorApp::quit_guard` is the single place unsaved work
+  can be lost. A tab close has its own modal (`Editor::close_confirm_modal`),
+  reached through `request_close_tab`, which is why the tab strip never calls
+  `close_tab` directly.
 
 ## Terminal tabs (multi-session)
 
@@ -440,7 +529,7 @@ Lowers the physical backlight so agents can keep running with the screen dark.
 
 ## Tests
 
-- `cargo test` must stay green (66 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (82 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -454,6 +543,27 @@ Lowers the physical backlight so agents can keep running with the screen dark.
   `a_misreported_monitor_cannot_produce_a_negative_size`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
+- Hermetic twins for the newer behaviour, none of which needs a pty because
+  `Session::ingest` is the same call `poll` makes:
+  `wheel_history_holds_what_has_scrolled_off_the_screen`,
+  `a_selection_copies_without_the_grid_padding`,
+  `find_reaches_into_the_scrollback_and_restores_the_view`,
+  `a_bell_and_a_title_change_raise_attention_but_startup_titles_do_not`,
+  `an_escape_split_across_reads_is_read_once`,
+  `renaming_a_tab_leaves_the_numbering_alone`,
+  `shell_detection_lists_what_is_actually_installed`,
+  `every_shell_names_a_program_and_a_tab_title`,
+  `a_pointer_lands_on_the_cell_under_it`, plus `git::tests` (branch, detached
+  HEAD, worktree `gitdir:` file, and every unreadable case) and the editor's
+  `an_externally_rewritten_file_reloads_itself`,
+  `a_dirty_buffer_reports_a_conflict_instead_of_reloading`,
+  `closing_a_tab_with_unsaved_edits_asks_first`.
+- **Scrollback, selection, find, attention, zoom and the shell menu are all GUI
+  behaviour and cannot be verified headlessly.** The tests prove the state and
+  the parsing; whether the wheel actually moves the view, whether the tint lands
+  on the right cells and whether the attention dot is visible need a rebuilt app
+  and a human looking at it. A screenshot cannot show a cursor or a highlight
+  that was never painted.
 - Tab bookkeeping is tested through `Terminal::open_stub_tab` (a `#[cfg(test)]`
   twin of `new_tab` minus the pty) so the tests stay hermetic. It shares
   `next_free_title` with the real path, so a numbering change cannot pass the

@@ -32,11 +32,20 @@ without constantly switching tools.
 - Flow Mode (`Ctrl+Shift+F`): the whole window becomes live terminal panes —
   up to four shells side by side — for supervising agents. `Ctrl+Shift+H/V`
   splits, `Alt+arrows` moves focus between panes.
-- Multi-session terminal: real ConPTY `powershell.exe -NoLogo -NoProfile`
-  with colors and a block cursor behind a tab strip (`+` opens, click
-  switches, closing the last tab hides the panel, `Ctrl+Tab` brings it back).
-  Click any shell and type directly — Enter, arrows, Tab, Backspace, Ctrl+C
-  all reach it. It answers DSR/CPR/DA queries so PSReadLine never blocks.
+- Multi-session terminal: real ConPTY shells with colors and a block cursor
+  behind a tab strip (`+` opens, click switches, right-click renames, closing
+  the last tab hides the panel, `Ctrl+Tab` brings it back). Pick the shell new
+  tabs start — PowerShell, PowerShell 7, Command Prompt, Git Bash or WSL — and
+  each tab is named after the shell it runs. Click any shell and type directly —
+  Enter, arrows, Tab, Backspace, Ctrl+C all reach it. It answers DSR/CPR/DA
+  queries so PSReadLine never blocks.
+- Terminal history that is actually reachable: the wheel scrolls back through
+  1000 lines, find searches them (live output and history), and
+  `Ctrl+Shift+C` copies the selection with the grid's padding trimmed off so it
+  pastes cleanly. `Ctrl+wheel` zooms the grid text.
+- Attention flags: a shell that rings its bell or retitles itself since you
+  last focused it gets an accent mark on its tab or pane. That is the one piece
+  of state that makes four agents in four panes easier to supervise than one.
 - The explorer follows the focused shell: it re-roots at the focused
   terminal's directory, and any folder's context menu offers
   `open terminal here` — the fastest way to give each agent its own corner.
@@ -50,13 +59,18 @@ without constantly switching tools.
   large-file guard).
 - In-file find (`Ctrl+F`, Enter for next, Shift+Enter for previous),
   `Ctrl+S` to save, and a Run button that sends `cargo run` to the terminal.
+- Files changed from outside — by an agent in the terminal, most likely —
+  reload themselves while clean, and offer reload-or-keep-mine when the buffer
+  has edits of its own, so a save cannot silently revert what an agent wrote.
+  Closing a tab, or the window, with unsaved work asks first.
 - File tree with create/rename/delete, auto-refresh via a filesystem watcher,
   and a resizable, collapsible explorer (`Ctrl+B`).
 
 **Deliberately lean**
-- No git integration — use your own client. No telemetry, no accounts, no
-  cloud. No plugin system to feed.
-- ~11 MB release binary (strip + thin LTO). 66 tests, clippy clean on every
+- No git integration — use your own client. The status bar reads `.git/HEAD`
+  for the branch name, which is one 40-byte file and not a client. No
+  telemetry, no accounts, no cloud. No plugin system to feed.
+- ~11 MB release binary (strip + thin LTO). 82 tests, clippy clean on every
   commit, CI on `main` and `dev`.
 
 ## Screenshots
@@ -102,6 +116,11 @@ of choice inside (the author drives it with `opencode`).
 | `Ctrl+Shift+D` | Dim Mode |
 | `F11` | Fullscreen |
 | `Ctrl+S` / `Ctrl+F` | Save / find in file |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / paste into the terminal |
+| Wheel over a terminal | Scroll back through history |
+| `Ctrl+wheel` | Zoom the terminal text |
+| Right-click a terminal tab | Rename or close it |
+| Magnifier in the terminal header | Find in output and history (Enter / Shift+Enter) |
 
 ## Memory
 
@@ -141,7 +160,8 @@ Get-Process Snor | Select-Object Name, @{N='MB';E={[math]::Round($_.WorkingSet64
   multi-cursor power tools. If you live in those, keep living in them.
 - Not cross-platform yet. See the note at the top.
 - Not a git client, by design. That scope stays out so the memory number
-  stays down.
+  stays down; the branch in the status bar is read from `.git/HEAD` and nothing
+  else about the repository is touched.
 
 ## Roadmap
 
