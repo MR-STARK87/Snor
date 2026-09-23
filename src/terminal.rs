@@ -1839,10 +1839,9 @@ impl Terminal {
         }
 
         self.rename_modal(ui);
-        // Before the collapsed check on purpose: while the panel is a header
-        // strip is exactly when you might be reading output you cannot see the
-        // end of, and a search whose field is hidden is a search you cannot
-        // close.
+        // Drawn before the collapsed check on purpose: a collapsed panel is a
+        // header strip, and a search whose field is hidden with it is a search
+        // that cannot be closed.
         self.find_bar(ui);
 
         if let Some(err) = &error {
@@ -3080,9 +3079,9 @@ impl<'a> FlowView<'a> {
                 }
                 // This shell wants you: it rang, or it retitled itself, since
                 // the pane was last focused. Drawn whether or not the pane has
-                // focus — an unfocused pane is exactly the one that needs to be
-                // pointed at, and this is the whole reason Flow Mode can hold
-                // four agents without the user cycling through them to see who
+                // focus, because an unfocused pane is exactly the one that needs
+                // pointing at — and that is the whole reason Flow Mode can hold
+                // four agents without being cycled through to find out which one
                 // is waiting.
                 if attention {
                     let dot = eframe::egui::pos2(
