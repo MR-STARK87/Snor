@@ -395,21 +395,6 @@ pub fn branch(painter: &Painter, rect: Rect, color: Color32) {
     )));
 }
 
-/// Outlined triangle, the reference's "changed lines" marker.
-pub fn triangle_outline(painter: &Painter, rect: Rect, color: Color32) {
-    let c = rect.center();
-    let s = rect.width().min(rect.height()) * 0.5;
-    let pts = vec![
-        pos2(c.x, c.y - s * 0.8),
-        pos2(c.x + s * 0.85, c.y + s * 0.6),
-        pos2(c.x - s * 0.85, c.y + s * 0.6),
-    ];
-    painter.add(Shape::closed_line(
-        rounded_poly(&pts, s * 0.22),
-        Stroke::new(1.2, color),
-    ));
-}
-
 /// Two-lobed leaf for the title bar's tagline.
 pub fn leaf(painter: &Painter, rect: Rect, color: Color32) {
     let c = rect.center();

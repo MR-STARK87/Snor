@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::dim::DimManager;
 use crate::editor::Editor;
 use crate::file_tree::FileTree;
+use crate::git;
 use crate::icons;
 use crate::terminal::Terminal;
 use crate::theme;
@@ -166,6 +167,28 @@ pub struct SnorApp {
     /// first frame rather than in `main.rs`. See
     /// [`SnorApp::fit_window_on_first_frame`].
     window_fitted: bool,
+    /// Branch of the open project, re-read from `.git/HEAD` every couple of
+    /// seconds. `None` where there is no repository — the status bar then shows
+    /// no branch at all, rather than a plausible-looking guess. See
+    /// [`crate::git`].
+    branch: Option<String>,
+    /// The root the cached branch was read from, so re-rooting the tree
+    /// (auto context switching, the folder dialog) re-reads at once instead of
+    /// showing the previous project's branch for up to two seconds.
+    branch_root: PathBuf,
+    /// When the branch was last read, for the throttle in
+    /// [`SnorApp::poll_branch`].
+    branch_checked: Option<std::time::Instant>,
+    /// Unsaved-work guard: the quit confirm box is up.
+    ///
+    /// Set when a close is requested with anything unsaved, and cleared by
+    /// either answer. Both entry points route here — the title bar's cross and
+    /// the OS's own close (Alt+F4, the taskbar menu) — so there is one place
+    /// where work can be lost and one place that refuses to lose it.
+    quit_confirm: bool,
+    /// The user has answered the box and the close may proceed. Without it the
+    /// next frame would cancel the very close it just asked for.
+    allow_close: bool,
 }
 
 impl SnorApp {
@@ -185,6 +208,101 @@ impl SnorApp {
             ctx_session: None,
             restore_maximized: false,
             window_fitted: false,
+            branch: None,
+            branch_root: PathBuf::new(),
+            branch_checked: None,
+            quit_confirm: false,
+            allow_close: false,
+        }
+    }
+
+    /// Keep the status bar's branch honest, at most every couple of seconds.
+    ///
+    /// Polled rather than event-driven because what changes a branch is usually
+    /// a `git checkout` typed into one of our own shells, and this app watches
+    /// no repository state on purpose. Two seconds of staleness on a status-bar
+    /// label is invisible; a branch that never updates is the bug this
+    /// replaces, and a read per frame would be six file opens a second for a
+    /// word that changes twice a day.
+    ///
+    /// The root is compared before the clock: re-rooting the explorer — the
+    /// folder dialog, or auto context switching onto a terminal opened
+    /// elsewhere — has to re-read immediately, or the bar spends a moment
+    /// claiming the previous project's branch.
+    fn poll_branch(&mut self) {
+        const POLL: std::time::Duration = std::time::Duration::from_secs(2);
+        let due = self.branch_root != self.tree.root
+            || self.branch_checked.is_none_or(|at| at.elapsed() >= POLL);
+        if !due {
+            return;
+        }
+        self.branch_root = self.tree.root.clone();
+        self.branch_checked = Some(std::time::Instant::now());
+        self.branch = git::branch(&self.tree.root);
+    }
+
+    /// Unsaved work is never thrown away by a click on the cross, by Alt+F4, or
+    /// by the taskbar's own close.
+    ///
+    /// eframe reports a close *request* first and only really shuts down when
+    /// the frame does not answer it with `CancelClose` (verified in
+    /// `EpiIntegration::update`, which checks exactly that command in the frame's
+    /// viewport output), so the guard is one place: cancel, then ask.
+    ///
+    /// Owners of the decision: the title bar's cross and the OS's own close
+    /// both land on `close_requested`, because `ViewportCommand::Close` and a
+    /// window-manager close are the same event by the time egui sees them.
+    fn quit_guard(&mut self, ui: &egui::Ui) {
+        if ui.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && self.editor.has_unsaved()
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_confirm = true;
+        }
+        if !self.quit_confirm {
+            return;
+        }
+        let names = self.editor.unsaved_names();
+        let mut quit = false;
+        let mut stay = false;
+        egui::Window::new("unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label("These files have unsaved changes:");
+                for name in &names {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .small()
+                            .color(theme::dim_text()),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("discard and quit").clicked() {
+                        quit = true;
+                    }
+                    if ui.button("cancel").clicked() {
+                        stay = true;
+                    }
+                });
+                // Saving from inside this box would need a per-tab save path the
+                // editor already owns; pointing at it is honest, and the box is
+                // one keystroke from being gone.
+                ui.label(
+                    egui::RichText::new("Ctrl+S in the editor saves each tab")
+                        .small()
+                        .color(theme::faint()),
+                );
+            });
+        if quit {
+            self.quit_confirm = false;
+            self.allow_close = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if stay {
+            self.quit_confirm = false;
         }
     }
 
@@ -604,31 +722,30 @@ impl SnorApp {
                         }
                         ui.add_space(STATUS_GAP);
                     }
-                    let (branch, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    if ui.is_rect_visible(branch) {
-                        icons::branch(&ui.painter_at(branch), branch, theme::dim_text());
+                    // The branch — or nothing at all.
+                    //
+                    // This slot used to hold the literal string `main` beside a
+                    // filled sync dot and a change triangle, each labelled with a
+                    // literal `0`. None of the four was ever measured: no file
+                    // was read, and a repository sitting on `dev` advertised
+                    // `main`. The counts are gone rather than faked more
+                    // convincingly, because "commits ahead and behind" needs a
+                    // git process — or an index and pack parse — and this app has
+                    // neither. One readout that is true, or absent, is worth more
+                    // than four that are decorative.
+                    if let Some(branch) = self.branch.clone() {
+                        let (slot, _) =
+                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        if ui.is_rect_visible(slot) {
+                            icons::branch(&ui.painter_at(slot), slot, theme::dim_text());
+                        }
+                        ui.label(
+                            egui::RichText::new(branch)
+                                .size(12.5)
+                                .color(theme::dim_text()),
+                        )
+                        .on_hover_text("branch, read from .git/HEAD");
                     }
-                    ui.label(
-                        egui::RichText::new("main")
-                            .size(12.5)
-                            .color(theme::dim_text()),
-                    );
-                    // Sync indicator: a filled accent dot with a knocked-out centre.
-                    let (dot, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    if ui.is_rect_visible(dot) {
-                        let p = ui.painter_at(dot);
-                        p.circle_filled(dot.center(), 4.6, theme::accent());
-                        p.circle_filled(dot.center(), 1.6, theme::on_accent());
-                    }
-                    ui.label(egui::RichText::new("0").size(12.5).color(theme::dim_text()));
-                    let (tri, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    if ui.is_rect_visible(tri) {
-                        icons::triangle_outline(&ui.painter_at(tri), tri, theme::dim_text());
-                    }
-                    ui.label(egui::RichText::new("0").size(12.5).color(theme::dim_text()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Right-to-left, so the first thing added lands furthest
                         // right: the toggle goes in first to sit where the
@@ -942,6 +1059,10 @@ impl SnorApp {
 impl eframe::App for SnorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.fit_window_on_first_frame(ui.ctx());
+        // First, before any panel: a close request has to be answered in the same
+        // frame it arrives, and the guard needs the editor's state as it stands.
+        self.quit_guard(ui);
+        self.poll_branch();
         if let Some(opened) = self.tree.opened_file.take()
             && opened.is_file()
         {

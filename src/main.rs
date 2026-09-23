@@ -9,6 +9,7 @@ mod dim;
 mod editor;
 mod file_tree;
 mod fonts;
+mod git;
 mod icons;
 mod mascot;
 mod syntax;

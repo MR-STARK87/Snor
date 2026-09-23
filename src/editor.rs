@@ -413,6 +413,47 @@ pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
     job
 }
 
+/// How often the open buffers are compared against the disk.
+///
+/// Cheap enough to be boring: one `stat` per open tab per second, no file is
+/// re-read unless its stamp moved, and nothing on screen is touched unless it
+/// did. The alternative — the filesystem watcher the explorer already runs —
+/// only covers the workspace root, so a file opened from elsewhere through the
+/// dialog would be unwatched. Stat-ing every open buffer covers both cases with
+/// no second watcher to keep in step.
+const DISK_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a transient note ("reloaded foo.rs") stays on screen.
+const NOTE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// What a file looked like the last time we read or wrote it.
+///
+/// Length plus mtime is the dependency-free way to notice that somebody else —
+/// an agent in the terminal, most likely — has rewritten a file we hold in
+/// memory. It is not a hash, and the gap is worth stating: a rewrite that lands
+/// inside the same timestamp tick *and* keeps the byte count is invisible.
+/// NTFS timestamps are 100ns, so that is a theoretical miss rather than a
+/// practical one, and the price of closing it would be re-reading every open
+/// file every second to compare contents.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DiskStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// The current stamp of `path`, or `None` when it cannot be measured.
+///
+/// A `None` silences external-change detection for that buffer rather than
+/// making it fire on every tick: a file we cannot stat must not be reported as
+/// constantly changing.
+fn disk_stamp(path: &Path) -> Option<DiskStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DiskStamp {
+        len: meta.len(),
+        mtime: meta.modified().ok(),
+    })
+}
+
 pub struct OpenBuffer {
     pub path: PathBuf,
     pub lang: String,
@@ -420,6 +461,15 @@ pub struct OpenBuffer {
     pub dirty: bool,
     pub too_large: bool,
     lines: usize,
+    /// Stamp of the bytes we believe are on disk — written when the buffer is
+    /// opened and again on every save.
+    stamp: Option<DiskStamp>,
+    /// The file changed underneath us while this buffer had unsaved edits.
+    ///
+    /// Surfaced as a banner offering "reload from disk" or "keep mine", never
+    /// resolved silently: reloading throws away what the user typed, and saving
+    /// throws away what the agent wrote. Both are the user's to choose.
+    pub conflict: bool,
 }
 
 impl OpenBuffer {
@@ -430,11 +480,13 @@ impl OpenBuffer {
         let lang = language_for(&path).to_string();
         let lines = ropey::Rope::from_str(&text).len_lines();
         Ok(Self {
+            stamp: disk_stamp(&path),
             path,
             lang,
             text,
             dirty: false,
             too_large,
+            conflict: false,
             lines,
         })
     }
@@ -442,7 +494,36 @@ impl OpenBuffer {
     fn save(&mut self) -> anyhow::Result<()> {
         std::fs::write(&self.path, &self.text)?;
         self.dirty = false;
+        // Re-stamp from disk rather than assuming: the write is what we now
+        // believe is there, and reading the file back is what proves it. It
+        // also clears any pending conflict — this save is the resolution.
+        self.stamp = disk_stamp(&self.path);
+        self.conflict = false;
         Ok(())
+    }
+
+    /// Re-read this file, keeping the buffer's identity, cursor-friendly text
+    /// and place in the tab strip. Only ever called for a clean buffer: a dirty
+    /// one goes to the conflict banner instead.
+    fn reload(&mut self) -> bool {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return false;
+        };
+        self.text = text;
+        self.dirty = false;
+        self.conflict = false;
+        self.refresh_lines();
+        let stamp = disk_stamp(&self.path);
+        self.too_large = stamp.is_some_and(|s| s.len > LARGE_FILE_BYTES as u64);
+        self.stamp = stamp;
+        true
+    }
+
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     fn line_count(&self) -> usize {
@@ -491,6 +572,17 @@ pub struct Editor {
     /// all it should do — starting the create flow as well would put a text
     /// field in front of someone who asked to browse.
     pub want_workspace: bool,
+    /// When the open buffers were last compared against the disk. `None` until
+    /// the first frame, so the first check runs immediately rather than a
+    /// second after launch.
+    disk_checked: Option<std::time::Instant>,
+    /// Tab whose close is waiting on the user because it holds unsaved edits.
+    /// `Some` while the confirm box is up; only ever one at a time.
+    pending_close: Option<usize>,
+    /// A short-lived line of feedback beside the file's metadata, currently
+    /// only "reloaded <file>" — the one case where the editor changed the text
+    /// without the user typing, which is worth saying out loud.
+    note: Option<(String, std::time::Instant)>,
 }
 
 impl Editor {
@@ -510,6 +602,9 @@ impl Editor {
             want_run: false,
             want_new_file: false,
             want_workspace: false,
+            disk_checked: None,
+            pending_close: None,
+            note: None,
         }
     }
 
@@ -560,6 +655,144 @@ impl Editor {
             self.active = self.tabs.len() - 1;
         }
         true
+    }
+
+    /// Ask to close a tab, putting the question to the user when it has
+    /// unsaved edits.
+    ///
+    /// Returns the same thing [`Editor::close_tab`] does — `false` when the
+    /// list has just been emptied and the caller must stop drawing the frame —
+    /// and `true` while the confirm box is up, because nothing has been
+    /// removed yet and there is still a tab to draw.
+    fn request_close_tab(&mut self, idx: usize) -> bool {
+        if self.tabs.get(idx).is_some_and(|t| t.dirty) {
+            self.pending_close = Some(idx);
+            return true;
+        }
+        self.close_tab(idx)
+    }
+
+    /// True while any open buffer has unsaved edits. What the quit prompt and
+    /// the window's close button key off.
+    pub fn has_unsaved(&self) -> bool {
+        self.tabs.iter().any(|t| t.dirty)
+    }
+
+    /// Names of the files with unsaved edits, for the quit prompt. Capped so a
+    /// dozen modified files cannot turn the box into a wall of text.
+    pub fn unsaved_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|t| t.dirty)
+            .map(|t| t.name())
+            .take(6)
+            .collect()
+    }
+
+    /// Compare every open buffer against the disk, once a second.
+    ///
+    /// The timing lives here and the decision-making lives in
+    /// [`Editor::reconcile_with_disk`] so a test can prove the reload and the
+    /// conflict without sleeping for a second — a timing-dependent assertion is
+    /// one that fails on a loaded machine.
+    fn poll_disk(&mut self) {
+        let due = match self.disk_checked {
+            Some(at) => at.elapsed() >= DISK_POLL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.disk_checked = Some(std::time::Instant::now());
+        self.reconcile_with_disk();
+    }
+
+    /// Reconcile each open buffer with what is actually on disk.
+    ///
+    /// Clean buffer: reload it, and say so — text changing without a keystroke
+    /// is exactly the kind of thing that reads as a bug if it happens silently.
+    /// Dirty buffer: raise the conflict banner and touch nothing.
+    ///
+    /// A half-written file is self-healing rather than guarded against: if an
+    /// agent truncates and rewrites, we may catch the empty middle, and the next
+    /// tick sees a stamp that moved again and reloads the finished version.
+    fn reconcile_with_disk(&mut self) {
+        for i in 0..self.tabs.len() {
+            let Some(stamp) = disk_stamp(&self.tabs[i].path) else {
+                continue;
+            };
+            if self.tabs[i].stamp == Some(stamp) {
+                continue;
+            }
+            if self.tabs[i].dirty {
+                self.tabs[i].conflict = true;
+                continue;
+            }
+            if self.tabs[i].reload() {
+                let name = self.tabs[i].name();
+                self.note = Some((format!("reloaded {name}"), std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// The unsaved-changes confirm box for a tab close.
+    ///
+    /// A modal rather than an inline strip: the answer decides whether text the
+    /// user typed still exists, so it must not be possible to miss it or to
+    /// click past it while working.
+    fn close_confirm_modal(&mut self, ui: &egui::Ui) {
+        let Some(idx) = self.pending_close else {
+            return;
+        };
+        let Some(name) = self.tabs.get(idx).map(|t| t.name()) else {
+            self.pending_close = None;
+            return;
+        };
+        #[derive(PartialEq)]
+        enum Choice {
+            Save,
+            Discard,
+            Cancel,
+        }
+        let mut choice: Option<Choice> = None;
+        egui::Window::new("unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("{name} has unsaved changes."));
+                ui.horizontal(|ui| {
+                    if ui.button("save").clicked() {
+                        choice = Some(Choice::Save);
+                    }
+                    if ui.button("discard").clicked() {
+                        choice = Some(Choice::Discard);
+                    }
+                    if ui.button("cancel").clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                });
+            });
+        match choice {
+            Some(Choice::Save) => {
+                // `save_active` works off `active`, so point it at the tab being
+                // closed and put the selection back afterwards. If the save
+                // fails the box stays up and nothing is removed.
+                let previous = self.active;
+                self.active = idx;
+                self.save_active();
+                self.active = previous;
+                if !self.tabs.get(idx).is_some_and(|t| t.dirty) {
+                    self.pending_close = None;
+                    self.close_tab(idx);
+                }
+            }
+            Some(Choice::Discard) => {
+                self.pending_close = None;
+                self.close_tab(idx);
+            }
+            Some(Choice::Cancel) => self.pending_close = None,
+            None => {}
+        }
     }
 
     pub fn active_lang(&self) -> String {
@@ -727,6 +960,10 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, workdir: &std::path::Path) {
+        // Drawn before everything else, and outside the empty check below: the
+        // box outlives a frame that returns early, and the only way to lose it
+        // would be to draw it after the one path that skips the rest of `ui()`.
+        self.close_confirm_modal(ui);
         // Nothing open: draw none of the editor's own chrome. See
         // `empty_state` for why an empty tab strip and gutter are worse than
         // no editor at all.
@@ -735,6 +972,9 @@ impl Editor {
             self.empty_state(ui, workdir);
             return;
         }
+        // Files change under us while an agent runs in the terminal. One stat
+        // per open buffer per second, and a reload or a banner when one moved.
+        self.poll_disk();
 
         // Tab bar: lang badge + name pills, file picker, Run button.
         ui.horizontal(|ui| {
@@ -818,11 +1058,12 @@ impl Editor {
                 }
             });
             if let Some(idx) = close_idx {
-                // `false` means the list just went empty, so nothing is left to
-                // switch to. `tab_switched` deliberately stays as it is —
-                // `recompute_find()` below indexes the active tab, and the
-                // frame returns early right after this block anyway.
-                if self.close_tab(idx) {
+                // Asks instead of closing when the tab has unsaved edits, so a
+                // tab can survive the click. `false` means the list just went
+                // empty, so nothing is left to switch to — `recompute_find()`
+                // below indexes the active tab, and the frame returns early
+                // right after this block anyway.
+                if self.request_close_tab(idx) {
                     tab_switched = true;
                 }
             }
@@ -934,12 +1175,76 @@ impl Editor {
                     .small()
                     .color(crate::theme::dim_text()),
                 );
+                // Text the user did not type has just appeared, so it says so.
+                // Expires on its own; a note that has to be dismissed would be
+                // worse than the silence it replaces.
+                let note = self.note.as_ref().filter(|(_, at)| at.elapsed() < NOTE_TTL);
+                if let Some((text, _)) = note {
+                    ui.label(
+                        egui::RichText::new(text.as_str())
+                            .small()
+                            .color(crate::theme::accent()),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("save (Ctrl+S)").clicked() {
                         want_save = true;
                     }
                 });
             });
+        }
+        if self
+            .note
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= NOTE_TTL)
+        {
+            self.note = None;
+        }
+
+        // The file moved underneath us and this buffer has edits of its own.
+        //
+        // Nothing is decided for the user: reloading throws away what they
+        // typed and saving throws away what the agent wrote, and the app has no
+        // way to know which of the two is the work they care about.
+        if self.tabs.get(self.active).is_some_and(|b| b.conflict) {
+            let mut reload = false;
+            let mut keep = false;
+            egui::Frame::NONE
+                .fill(crate::theme::surface_title())
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("changed on disk while you were editing")
+                                .size(12.0)
+                                .color(crate::theme::danger()),
+                        );
+                        if ui.small_button("reload from disk").clicked() {
+                            reload = true;
+                        }
+                        if ui.small_button("keep mine").clicked() {
+                            keep = true;
+                        }
+                    });
+                });
+            if reload
+                && let Some(buf) = self.tabs.get_mut(self.active)
+                && buf.reload()
+            {
+                let name = self.tabs[self.active].name();
+                self.note = Some((format!("reloaded {name}"), std::time::Instant::now()));
+            }
+            if keep
+                && let Some(buf) = self.tabs.get_mut(self.active)
+            {
+                // Accepted as-is, so stop asking about *this* change: the
+                // stamp is moved up to what is on disk now, and the next
+                // external edit raises the banner again. Saving will still
+                // overwrite the file, which is what "keep mine" means.
+                buf.conflict = false;
+                buf.stamp = disk_stamp(&buf.path);
+            }
         }
 
         if ui.input_mut(|i| {
@@ -1173,5 +1478,111 @@ mod tests {
         let mut ed = Editor::new();
         ed.open_file(readme);
         assert!(ed.error.is_none(), "open README failed: {:?}", ed.error);
+    }
+
+    /// A clean buffer whose file changed on disk reloads itself, and says so.
+    /// This is the agent-in-the-terminal case: it rewrites a file the editor is
+    /// holding, and the alternative to reloading is showing stale text and then
+    /// silently reverting the agent on the next Ctrl+S.
+    #[test]
+    fn an_externally_rewritten_file_reloads_itself() {
+        let dir = std::env::temp_dir().join("snor_editor_reload_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        // Nothing moved: the check must stay quiet, or the note would fire on
+        // every tick and mean nothing.
+        ed.reconcile_with_disk();
+        assert_eq!(ed.tabs[0].text, "fn a() {}\n");
+        assert!(ed.note.is_none(), "an unchanged file must not report");
+
+        // The agent rewrites it. Different length as well as different mtime,
+        // so the assertion cannot depend on filesystem timestamp resolution.
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        ed.reconcile_with_disk();
+        assert_eq!(ed.tabs[0].text, "fn a() {}\nfn b() {}\n");
+        assert!(!ed.tabs[0].dirty);
+        assert!(ed.tabs[0].line_count() >= 2, "line count must follow the text");
+        assert!(
+            ed.note.as_ref().is_some_and(|(t, _)| t.contains("lib.rs")),
+            "a silent reload reads as a bug; the note is the receipt"
+        );
+
+        // Repeated checks with nothing moving do not re-report.
+        ed.note = None;
+        ed.reconcile_with_disk();
+        assert!(ed.note.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dirty buffer is never reloaded: the file changed, but so did the
+    /// buffer, and the app cannot know which of the two edits matters. It
+    /// raises the banner and leaves every byte alone.
+    #[test]
+    fn a_dirty_buffer_reports_a_conflict_instead_of_reloading() {
+        let dir = std::env::temp_dir().join("snor_editor_conflict_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("main.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        ed.tabs[0].text.push_str("// mine\n");
+        ed.tabs[0].dirty = true;
+        ed.tabs[0].refresh_lines();
+
+        std::fs::write(&path, "fn main() {}\n// agent\n").unwrap();
+        ed.reconcile_with_disk();
+
+        assert!(ed.tabs[0].conflict, "a dirty buffer must report, not reload");
+        assert!(
+            ed.tabs[0].text.contains("// mine") && !ed.tabs[0].text.contains("// agent"),
+            "the user's edits must survive the check untouched"
+        );
+        assert!(ed.has_unsaved());
+
+        // Saving is the resolution: the write is what we now believe is on
+        // disk, so the banner clears and does not come back for this change.
+        ed.save_active();
+        assert!(!ed.tabs[0].conflict);
+        ed.reconcile_with_disk();
+        assert!(!ed.tabs[0].conflict, "the banner must not re-raise on our own save");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("// mine"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing a tab with unsaved edits asks first, and nothing is removed
+    /// until the question is answered. A clean tab still closes on the click.
+    #[test]
+    fn closing_a_tab_with_unsaved_edits_asks_first() {
+        let dir = std::env::temp_dir().join("snor_editor_close_guard_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ed = Editor::new();
+        for i in 0..2 {
+            let path = dir.join(format!("g{i}.rs"));
+            std::fs::write(&path, "fn main() {}\n").unwrap();
+            ed.open_file(path);
+        }
+
+        // Clean: the close happens and the list is reported as non-empty.
+        assert!(ed.request_close_tab(0));
+        assert_eq!(ed.tabs.len(), 1);
+
+        // Dirty: the tab stays and the question is queued.
+        ed.tabs[0].text.push_str("// wip\n");
+        ed.tabs[0].dirty = true;
+        assert!(ed.request_close_tab(0));
+        assert_eq!(ed.tabs.len(), 1, "an unsaved tab must survive the click");
+        assert_eq!(ed.pending_close, Some(0));
+        assert_eq!(ed.unsaved_names(), vec!["g1.rs".to_string()]);
+
+        // "discard" is the only path that removes it.
+        ed.pending_close = None;
+        assert!(!ed.close_tab(0), "the last tab still reports the empty list");
+        assert!(!ed.has_unsaved());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
