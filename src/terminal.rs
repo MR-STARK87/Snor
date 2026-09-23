@@ -319,6 +319,25 @@ fn selection_text(screen: &vt100::Screen, sel: Selection) -> String {
     lines.join("\n")
 }
 
+/// A pane counts as working while it has written something in the last few
+/// seconds. Ten is long enough that a shell printing its prompt looks alive and
+/// a command that takes a moment to start does not look dead.
+const PANE_ACTIVE_SECS: u64 = 10;
+
+/// How long a pane has been quiet, in as few characters as still say something.
+///
+/// Coarse on purpose: the question is "is this agent working or waiting", and
+/// seconds only matter in the first minute after something happens.
+fn short_idle(idle: std::time::Duration) -> String {
+    let secs = idle.as_secs();
+    match secs {
+        0..=9 => "now".to_string(),
+        10..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
 /// Text scale bounds for the terminal grid.
 const ZOOM_MIN: f32 = 0.6;
 const ZOOM_MAX: f32 = 2.4;
@@ -775,6 +794,12 @@ struct Session {
     /// PowerShell shell sends is its own name on startup, which must not count as
     /// news or every new tab would open demanding attention.
     last_title: Option<String>,
+    /// The first title ever announced, kept so `pane_title` can tell "this shell
+    /// introduced itself" apart from "this shell has something to say".
+    first_title: Option<String>,
+    /// When this shell last wrote anything. A supervisor's most useful number:
+    /// a pane that has said nothing for two minutes is not one to wait on.
+    last_output: Option<std::time::Instant>,
     /// Tail of an escape sequence split across two reads.
     notif_tail: Vec<u8>,
 }
@@ -802,6 +827,8 @@ impl Session {
             selection: None,
             attention: false,
             last_title: None,
+            first_title: None,
+            last_output: None,
             notif_tail: Vec::new(),
             rows: ROWS,
             cols: COLS,
@@ -812,6 +839,32 @@ impl Session {
     /// name for it if there is one, the auto-numbered one otherwise.
     fn label(&self) -> &str {
         self.custom_title.as_deref().unwrap_or(&self.title)
+    }
+
+    /// A name for the pane, if the shell has renamed itself away from whatever it
+    /// called itself at startup.
+    ///
+    /// The startup title is not worth drawing: PowerShell and pwsh announce
+    /// "Windows PowerShell" / "PowerShell 7" by themselves, which is a brand on
+    /// every pane's header and no information at all. A *later* title is an agent
+    /// narrating its own work — `opencode` retitles the terminal as it edits — and
+    /// that is the one thing worth the header space.
+    ///
+    /// This is not the duplication the header is forbidden from making (see
+    /// `render_pane`): that bug was writing the shell's *path line* out a second
+    /// time, one row above the line the shell prints itself. A self-description
+    /// is a different fact.
+    fn pane_title(&self) -> Option<&str> {
+        let current = self.last_title.as_deref()?;
+        if current.trim().is_empty() || self.first_title.as_deref() == Some(current) {
+            return None;
+        }
+        Some(current)
+    }
+
+    /// How long since this shell last wrote anything, if it ever has.
+    fn idle_for(&self) -> Option<std::time::Duration> {
+        self.last_output.map(|at| at.elapsed())
     }
 
     /// Put the grid at the scroll offset this session is scrolled to, and read
@@ -1454,6 +1507,7 @@ impl Session {
     fn ingest(&mut self, chunk: &[u8]) {
         self.total_chunks += 1;
         self.total_bytes += chunk.len() as u64;
+        self.last_output = Some(std::time::Instant::now());
         self.parser.process(chunk);
         self.respond_to_queries(chunk);
         // vt100 parses neither of these, so they are taken off the same bytes.
@@ -1467,7 +1521,11 @@ impl Session {
         if let Some(title) = notes.title {
             // Only a *change* of title is news. The first title a shell sends is
             // its own name on startup, and treating that as an event would make
-            // every new tab open already demanding attention.
+            // every new tab open already demanding attention. It is remembered
+            // separately so `pane_title` can make the same distinction.
+            if self.first_title.is_none() {
+                self.first_title = Some(title.clone());
+            }
             if self.last_title.as_deref().is_some_and(|t| t != title) {
                 self.attention = true;
             }
@@ -1586,10 +1644,18 @@ impl Terminal {
                                         // text — see `widgets::clickable_label`
                                         // for the three separate things that
                                         // has to mean.
-                                        let resp = crate::widgets::clickable_label(ui, text)
-                                            .on_hover_text(
-                                                dirs.get(idx).cloned().unwrap_or_default(),
-                                            );
+                                        // The hover hint teaches the chord in the
+                                        // one place the mark actually appears.
+                                        let hint = if attention.get(idx).copied().unwrap_or(false) {
+                                            format!(
+                                                "{}\nwaiting for you (Ctrl+Shift+A)",
+                                                dirs.get(idx).cloned().unwrap_or_default()
+                                            )
+                                        } else {
+                                            dirs.get(idx).cloned().unwrap_or_default()
+                                        };
+                                        let resp =
+                                            crate::widgets::clickable_label(ui, text).on_hover_text(hint);
                                         // Rename and close, on the tab itself. The
                                         // close cross is 16pt and sits inside a
                                         // pill that scrolls; a right-click does
@@ -2820,6 +2886,60 @@ impl Terminal {
         self.active = true;
     }
 
+    /// Focus the next pane that wants attention, in grid order, wrapping.
+    ///
+    /// The keyboard counterpart to the attention mark. With four panes up, "who
+    /// needs me" is the question a supervisor actually has, and walking all four
+    /// to answer it is what this removes. Nothing happens and nothing is
+    /// reported when no pane is flagged: silence is the honest answer in the
+    /// common case where the pane you are already looking at is the only one with
+    /// news, and a notice on every press would be worse than no notice.
+    pub fn flow_step_attention(&mut self) {
+        let order: Vec<u64> = self
+            .flow_grid
+            .order
+            .iter()
+            .copied()
+            .filter(|id| self.index_of(*id).is_some())
+            .collect();
+        if order.is_empty() {
+            return;
+        }
+        // Search from the pane after the focused one, so repeated presses walk
+        // the flags in order instead of bouncing between two of them.
+        let start = self
+            .flow_target_id()
+            .and_then(|id| order.iter().position(|o| *o == id))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        for step in 0..order.len() {
+            let id = order[(start + step) % order.len()];
+            if self.sessions.iter().any(|s| s.id == id && s.attention) {
+                self.flow_focus = Some(id);
+                self.active = true;
+                return;
+            }
+        }
+    }
+
+    /// Focus the next tab that wants attention, wrapping around the strip. The
+    /// normal-mode half of the same question.
+    pub fn step_attention_tab(&mut self) {
+        let n = self.sessions.len();
+        if n == 0 {
+            return;
+        }
+        for step in 1..=n {
+            let i = (self.active_tab + step) % n;
+            if self.sessions[i].attention {
+                self.active_tab = i;
+                self.active = true;
+                self.reveal_active_tab = true;
+                return;
+            }
+        }
+    }
+
     /// Leave Flow Mode: land the tab strip on the focused pane. The layout
     /// itself is kept, so toggling back restores splits and sizes.
     pub fn flow_exit_sync(&mut self) {
@@ -3039,8 +3159,13 @@ impl<'a> FlowView<'a> {
         use eframe::egui::{Align, Layout};
         let focused = *self.focus == Some(id);
         // Snapshot the header first; the borrow ends before any widget.
-        let (error, attention) = match self.sessions.iter().find(|s| s.id == id) {
-            Some(s) => (s.error.clone(), s.attention),
+        let (error, attention, title, idle) = match self.sessions.iter().find(|s| s.id == id) {
+            Some(s) => (
+                s.error.clone(),
+                s.attention,
+                s.pane_title().map(str::to_owned),
+                s.idle_for(),
+            ),
             None => return,
         };
         ui.scope_builder(
@@ -3093,6 +3218,42 @@ impl<'a> FlowView<'a> {
                         eframe::egui::vec2(9.0, 9.0),
                     ));
                     p.circle_filled(dot, 3.5, crate::theme::accent());
+                }
+                // The header band, painted: what the shell says it is doing (if
+                // it has renamed itself away from its own startup name) on the
+                // left, and how long it has been quiet on the right. Both go into
+                // the band `size_panes` already reserves, so neither can move the
+                // grid below it — the same invariant the focus cue observes.
+                let font = eframe::egui::FontId::proportional(11.0);
+                if let Some(title) = title.as_deref() {
+                    let max_w = (rect.width() - 76.0).max(24.0);
+                    let text = crate::icons::truncate(ui.painter(), title, font.clone(), max_w);
+                    let galley = ui
+                        .painter()
+                        .layout_no_wrap(text, font.clone(), crate::theme::dim_text());
+                    let y = rect.top() + (PANE_HEADER_H - galley.size().y) * 0.5;
+                    ui.painter().galley(
+                        eframe::egui::pos2(rect.left() + 10.0, y),
+                        galley,
+                        crate::theme::dim_text(),
+                    );
+                }
+                if let Some(idle) = idle {
+                    // Accent while it is actually writing, faint once it stops.
+                    // One element rather than a dot plus a number: two marks a
+                    // few points apart in a 18pt band read as one confusing one.
+                    let color = if idle.as_secs() < PANE_ACTIVE_SECS {
+                        crate::theme::accent()
+                    } else {
+                        crate::theme::faint()
+                    };
+                    let galley = ui.painter().layout_no_wrap(short_idle(idle), font, color);
+                    let y = rect.top() + (PANE_HEADER_H - galley.size().y) * 0.5;
+                    // The attention dot's slot is reserved whether or not the dot
+                    // is drawn, so the number does not jump sideways when a shell
+                    // rings.
+                    let x = (rect.right() - 24.0 - galley.size().x).max(rect.left() + 4.0);
+                    ui.painter().galley(eframe::egui::pos2(x, y), galley, color);
                 }
                 if let Some(err) = error {
                     ui.colored_label(crate::theme::danger(), err);
@@ -3205,8 +3366,8 @@ impl Drop for Terminal {
 mod tests {
     use super::{
         FIND_CAP, Notifications, Selection, Session, ShellKind, Terminal, cell_at_pos, find_hits,
-        flow_shape, installed_from, scan_notifications, selection_text, shell_title,
-        term_size_for_pixels,
+        PANE_ACTIVE_SECS, flow_shape, installed_from, scan_notifications, selection_text,
+        shell_title, short_idle, term_size_for_pixels,
     };
     use eframe::egui::{Key, Modifiers};
 
@@ -3756,6 +3917,127 @@ mod tests {
         // test and screenshot already says.
         assert_eq!(shell_title(1, ShellKind::default()), "powershell");
         assert_eq!(shell_title(2, ShellKind::Pwsh), "pwsh 2");
+    }
+
+    /// A pane's own title is only worth drawing once the shell has renamed itself
+    /// away from the name it announced on startup — otherwise every pane would
+    /// carry a brand in its header.
+    #[test]
+    fn a_pane_shows_a_title_only_once_the_shell_renames_itself() {
+        let mut t = Terminal::new();
+        assert!(s(&t).pane_title().is_none(), "nothing said yet");
+
+        sm(&mut t).ingest(b"\x1b]0;Windows PowerShell\x07");
+        assert!(
+            s(&t).pane_title().is_none(),
+            "the shell introducing itself is not a title"
+        );
+
+        sm(&mut t).ingest(b"\x1b]0;opencode: editing src/main.rs\x07");
+        assert_eq!(
+            s(&t).pane_title(),
+            Some("opencode: editing src/main.rs"),
+            "an agent narrating its work is"
+        );
+
+        // A whitespace-only title never reaches the session — the scanner drops
+        // it — so the last real name stays on the header instead of blanking it.
+        sm(&mut t).ingest(b"\x1b]0;   \x07");
+        assert_eq!(s(&t).pane_title(), Some("opencode: editing src/main.rs"));
+    }
+
+    /// The number a supervisor actually reads: how long since this shell said
+    /// anything. Coarse, and "now" doubles as the definition of working.
+    #[test]
+    fn idle_time_reads_the_way_a_supervisor_thinks() {
+        use std::time::Duration;
+        assert_eq!(short_idle(Duration::from_secs(0)), "now");
+        assert_eq!(
+            short_idle(Duration::from_secs(PANE_ACTIVE_SECS - 1)),
+            "now",
+            "the whole active window must read as working"
+        );
+        assert_eq!(short_idle(Duration::from_secs(PANE_ACTIVE_SECS)), "10s");
+        assert_eq!(short_idle(Duration::from_secs(59)), "59s");
+        assert_eq!(short_idle(Duration::from_secs(60)), "1m");
+        assert_eq!(short_idle(Duration::from_secs(3599)), "59m");
+        assert_eq!(short_idle(Duration::from_secs(3600)), "1h");
+
+        // A shell that has not written yet reports nothing rather than "now".
+        let t = Terminal::new();
+        assert!(s(&t).idle_for().is_none());
+    }
+
+    /// "Who needs me" walks the flagged panes only, in grid order, and does
+    /// nothing at all when there is nothing to walk to.
+    #[test]
+    fn attention_navigation_visits_only_the_panes_that_want_you() {
+        let mut t = Terminal::new();
+        t.flow_add_stub();
+        t.flow_add_stub();
+        assert_eq!(t.sessions.len(), 3);
+
+        // Nothing flagged: the focus must not move.
+        let before = t.flow_target_id();
+        t.flow_step_attention();
+        assert_eq!(t.flow_target_id(), before, "silence is not a destination");
+
+        // Flag the first and third panes only.
+        let ids: Vec<u64> = t.sessions.iter().map(|s| s.id).collect();
+        for session in &mut t.sessions {
+            session.attention = session.id == ids[0] || session.id == ids[2];
+        }
+        t.flow_focus = Some(ids[0]);
+        t.flow_step_attention();
+        assert_eq!(t.flow_target_id(), Some(ids[2]), "skips the quiet pane");
+        // Wrapping: from the last flagged one, back to the first.
+        t.flow_step_attention();
+        assert_eq!(t.flow_target_id(), Some(ids[0]), "and wraps");
+
+        // The walk always starts *after* the pane that counts as focused, and an
+        // unfocused terminal already resolves to the first live pane — so from
+        // that default the first press leads to the third, not to the pane you
+        // are sitting on.
+        t.flow_focus = None;
+        assert_eq!(t.flow_target_id(), Some(ids[0]), "the default focus");
+        t.flow_step_attention();
+        assert_eq!(t.flow_target_id(), Some(ids[2]));
+    }
+
+    /// The tab strip's half of the same question.
+    #[test]
+    fn attention_navigation_switches_to_the_next_tab_that_wants_you() {
+        let mut t = Terminal::new();
+        t.open_stub_tab();
+        t.open_stub_tab();
+        t.active_tab = 0;
+
+        t.step_attention_tab();
+        assert_eq!(t.active_tab, 0, "no flags, no movement");
+
+        t.sessions[1].attention = true;
+        t.step_attention_tab();
+        assert_eq!(t.active_tab, 1);
+        assert!(t.active, "landing on a shell means it can be typed into");
+        assert!(t.reveal_active_tab, "and the strip scrolls it into view");
+
+        // Past the end it wraps to whatever is flagged behind it.
+        t.sessions[1].attention = false;
+        t.sessions[2].attention = true;
+        t.active_tab = 1;
+        t.step_attention_tab();
+        assert_eq!(t.active_tab, 2);
+        t.sessions[0].attention = true;
+        t.step_attention_tab();
+        assert_eq!(t.active_tab, 0, "wraps to the start");
+
+        // Clearing the flags takes them out of the rotation again, and the
+        // selection stays where it was rather than moving to an arbitrary tab.
+        t.sessions[0].attention = false;
+        t.sessions[2].attention = false;
+        let here = t.active_tab;
+        t.step_attention_tab();
+        assert_eq!(t.active_tab, here, "nothing flagged means no movement");
     }
 
     /// Pointer to cell, which is what selection starts from.

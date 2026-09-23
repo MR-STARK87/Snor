@@ -704,8 +704,9 @@ impl SnorApp {
                         .on_hover_text(
                             "Flow Mode — the window is yours, agents.\n\
                              Toggle: Ctrl+Shift+F · Add pane: Ctrl+Shift+H/V/T (max 4) · \
-                             Focus next/previous: Alt+Right/Left · Close pane: Ctrl+Shift+W · \
-                             Dividers drag — sizes stick.",
+                             Focus next/previous: Alt+Right/Left · \
+                             Next shell needing you: Ctrl+Shift+A · \
+                             Close pane: Ctrl+Shift+W · Dividers drag — sizes stick.",
                         );
                         // A refused pane creation reports here rather than in
                         // the grid: the grid's top-left corner is the first
@@ -1280,6 +1281,24 @@ impl eframe::App for SnorApp {
             })
         {
             self.terminal.flow_step_focus(-1);
+        }
+        // "Who needs me": jump straight to the next shell that raised its hand,
+        // rather than stepping through every pane to find it. The chord works in
+        // both layouts on purpose — attention is raised by tabs in normal mode
+        // and by panes in Flow Mode, and the question is the same either way.
+        // Ctrl+Shift+A is free: the rest of the family is Flow, Dim and the pane
+        // commands.
+        if ui.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::A,
+            ))
+        }) {
+            if self.flow {
+                self.terminal.flow_step_attention();
+            } else {
+                self.terminal.step_attention_tab();
+            }
         }
 
         // No title bar in fullscreen. Ours is drawn by us precisely because the
