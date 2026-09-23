@@ -145,6 +145,36 @@ history length, so the offset is set and then read back (`apply_scroll`).
   row and drops trailing blank rows — that trimming is the entire reason for not
   using the built-in. Ctrl+C stays SIGINT; `key_to_bytes` refuses the shifted
   form so Ctrl+Shift+C reaches the app and never the shell.
+- **The pane header draws two things, and neither may move the grid.** Both the
+  agent's self-reported title and the idle readout are *painted* into the band
+  `PANE_TOP_CHROME` reserves, exactly like the focus cue, so `size_panes` and the
+  PTY stay in step. The attention dot's slot is reserved whether or not the dot
+  is drawn, so the idle number does not jump sideways when a shell rings.
+- **A pane title is the shell's *second* name, never its first.** PowerShell and
+  pwsh announce "Windows PowerShell" / "PowerShell 7" on startup; drawing that
+  puts a brand in every header for no information. `Session::pane_title` returns
+  the current title only when it differs from `first_title`, which is the same
+  distinction `attention` makes. This is deliberately *not* the duplication the
+  header is forbidden from making: that bug was the shell's **path line** written
+  out a second time, one row above where the shell prints it itself. An agent
+  saying what it is doing is a different fact, so do not "fix" this by deleting
+  it.
+- **Quiet time is the supervisor's number.** `Session::last_output` is stamped in
+  `ingest`, `short_idle` formats it coarse ("now" / "12s" / "3m" / "2h"), and
+  "now" is exactly `PANE_ACTIVE_SECS` — the window in which a pane counts as
+  working, which is also the accent colour's condition. One element rather than a
+  dot plus a number: two marks a few points apart in an 18pt band read as one
+  confusing one.
+- **`Ctrl+Shift+A` walks the flagged panes only** (`flow_step_attention`,
+  `step_attention_tab`), starting *after* the focused one so repeated presses
+  tour the flags instead of bouncing between two. The start is resolved through
+  `flow_target_id`, which never returns `None` while a pane exists, so an
+  "unfocused" terminal still walks from the pane it treats as focused. Nothing is
+  reported when nothing is flagged: silence is the correct answer in the common
+  case, and a notice on every press would be worse than no notice. Landing on a
+  flagged pane clears it, because `flow_ui`/`ui` mark the focused session as seen
+  in the same frame the shortcut is applied — the shortcut block runs before the
+  panels.
 - **Attention is cleared on focus, never on visibility.** In Flow Mode every
   pane is on screen at once, so clearing on visibility would clear all four and
   the mark would mean nothing. Normal mode clears the visible tab each frame
@@ -529,7 +559,7 @@ Lowers the physical backlight so agents can keep running with the screen dark.
 
 ## Tests
 
-- `cargo test` must stay green (82 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (86 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -553,6 +583,10 @@ Lowers the physical backlight so agents can keep running with the screen dark.
   `renaming_a_tab_leaves_the_numbering_alone`,
   `shell_detection_lists_what_is_actually_installed`,
   `every_shell_names_a_program_and_a_tab_title`,
+  `a_pane_shows_a_title_only_once_the_shell_renames_itself`,
+  `idle_time_reads_the_way_a_supervisor_thinks`,
+  `attention_navigation_visits_only_the_panes_that_want_you`,
+  `attention_navigation_switches_to_the_next_tab_that_wants_you`,
   `a_pointer_lands_on_the_cell_under_it`, plus `git::tests` (branch, detached
   HEAD, worktree `gitdir:` file, and every unreadable case) and the editor's
   `an_externally_rewritten_file_reloads_itself`,

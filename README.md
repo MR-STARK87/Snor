@@ -44,8 +44,14 @@ without constantly switching tools.
   `Ctrl+Shift+C` copies the selection with the grid's padding trimmed off so it
   pastes cleanly. `Ctrl+wheel` zooms the grid text.
 - Attention flags: a shell that rings its bell or retitles itself since you
-  last focused it gets an accent mark on its tab or pane. That is the one piece
-  of state that makes four agents in four panes easier to supervise than one.
+  last focused it gets an accent mark on its tab or pane, and `Ctrl+Shift+A`
+  jumps straight to the next one — no cycling to find out who is waiting. That
+  is the one piece of state that makes four agents in four panes easier to
+  supervise than one.
+- Each Flow pane's header says what the shell last called itself (agents retitle
+  the terminal as they work) and how long it has been quiet — accent while it is
+  writing, faint once it stops. Whether an agent is working or waiting, without
+  interrupting it.
 - The explorer follows the focused shell: it re-roots at the focused
   terminal's directory, and any folder's context menu offers
   `open terminal here` — the fastest way to give each agent its own corner.
@@ -70,7 +76,7 @@ without constantly switching tools.
 - No git integration — use your own client. The status bar reads `.git/HEAD`
   for the branch name, which is one 40-byte file and not a client. No
   telemetry, no accounts, no cloud. No plugin system to feed.
-- ~11 MB release binary (strip + thin LTO). 82 tests, clippy clean on every
+- ~11 MB release binary (strip + thin LTO). 86 tests, clippy clean on every
   commit, CI on `main` and `dev`.
 
 ## Screenshots
@@ -116,6 +122,7 @@ of choice inside (the author drives it with `opencode`).
 | `Ctrl+Shift+D` | Dim Mode |
 | `F11` | Fullscreen |
 | `Ctrl+S` / `Ctrl+F` | Save / find in file |
+| `Ctrl+Shift+A` | Jump to the next shell (or tab) that needs attention |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / paste into the terminal |
 | Wheel over a terminal | Scroll back through history |
 | `Ctrl+wheel` | Zoom the terminal text |
