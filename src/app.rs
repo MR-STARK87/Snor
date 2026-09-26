@@ -444,7 +444,9 @@ impl SnorApp {
         let shells: Vec<ShellKind> = self.terminal.installed_shells().to_vec();
         let mut changed = false;
         let mut open = true;
-        egui::Window::new("settings")
+        // White title: a plain string would render in the theme's dark default
+        // label ink and vanish against the green bar (see `theme::apply_dark`).
+        egui::Window::new(egui::RichText::new("Settings").color(egui::Color32::WHITE))
             .collapsible(false)
             .resizable(false)
             .default_width(380.0)
@@ -454,9 +456,12 @@ impl SnorApp {
                     ui.label(egui::RichText::new(text).small().color(theme::dim_text()));
                 };
 
+                // Plain labels would render in the theme's dark default ink and
+                // vanish on the dark fill, so every row label carries `theme::text()`.
+                let row = |text: &str| egui::RichText::new(text).color(theme::text());
                 ui.label(egui::RichText::new("Terminal").size(12.5).color(theme::accent()));
                 ui.horizontal(|ui| {
-                    ui.label("shell");
+                    ui.label(row("shell"));
                     let current = self.settings.shell;
                     egui::ComboBox::from_id_salt("snor_settings_shell")
                         .selected_text(current.label())
@@ -486,7 +491,7 @@ impl SnorApp {
                         &mut self.settings.terminal_font,
                         crate::settings::TERMINAL_FONT_MIN..=crate::settings::TERMINAL_FONT_MAX,
                     )
-                    .text("font size"),
+                    .text(row("font size")),
                 );
                 if font.changed() {
                     // Straight at the terminal too, so the grid redraws while
@@ -501,7 +506,7 @@ impl SnorApp {
                             &mut self.settings.scrollback,
                             crate::settings::SCROLLBACK_MIN..=crate::settings::SCROLLBACK_MAX,
                         )
-                        .text("scrollback rows"),
+                        .text(row("scrollback rows")),
                     )
                     .changed();
                 hint(
@@ -517,7 +522,7 @@ impl SnorApp {
                             &mut self.settings.editor_font,
                             crate::settings::EDITOR_FONT_MIN..=crate::settings::EDITOR_FONT_MAX,
                         )
-                        .text("font size"),
+                        .text(row("font size")),
                     )
                     .changed();
 
@@ -541,11 +546,11 @@ impl SnorApp {
                             &mut self.settings.ui_scale,
                             crate::settings::UI_SCALE_MIN..=crate::settings::UI_SCALE_MAX,
                         )
-                        .text("ui scale"),
+                        .text(row("ui scale")),
                     )
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut self.settings.dim_level, 1..=100).text("dim level"))
+                    .add(egui::Slider::new(&mut self.settings.dim_level, 1..=100).text(row("dim level")))
                     .changed();
                 hint(ui, "Dim Mode dims to this percent (Ctrl+Shift+D).");
 

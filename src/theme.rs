@@ -23,6 +23,22 @@ pub fn apply_dark(ctx: &egui::Context) {
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x2D, 0x2B));
     visuals.widgets.noninteractive.bg_stroke =
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0x22, 0x2B, 0x29));
+    // Buttons (the shell picker, the sliders' value boxes) are painted from
+    // `weak_bg_fill`, whose dark defaults are neutral greys (#3C3C3C idle and
+    // friends) — the same family as the title bar's old #2D2D2D. Keep each
+    // state's button on its own green so no neutral mass survives.
+    visuals.widgets.noninteractive.weak_bg_fill = surface_body();
+    visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(0x1C, 0x25, 0x23);
+    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x23, 0x2E, 0x2B);
+    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0x2A, 0x36, 0x32);
+    // The settings `Window` title bar is painted from `widgets.open.weak_bg_fill`
+    // (see `egui::containers::window`), whose dark default is neutral grey
+    // #2D2D2D — the only neutral mass in this palette. Tint it to the selection
+    // green so the bar reads as part of the app.
+    visuals.widgets.open.weak_bg_fill = egui::Color32::from_rgb(0x25, 0x38, 0x2E);
+    // Same for the window's own outline: the dark default is neutral grey, so
+    // the settings frame gets the same green rather than a grey hairline.
+    visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x25, 0x38, 0x2E));
     for w in [
         &mut visuals.widgets.inactive,
         &mut visuals.widgets.hovered,
