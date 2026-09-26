@@ -44,7 +44,9 @@ otherwise `cargo build` fails with `os error 5`.
 | `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback, selection, attention flag, shell and query-responder buffer. Tab strip spawns/switches/closes/renames shells; scrollback, copy, find, zoom and shell choice; `collapsed`/`fullscreen`/`hidden` + drag height. |
 | `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
-| `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
+| `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). `mascot_fur()` is the one tone added for the footer creature. |
+| `mascot.rs` | Snorri, the footer sloth. `parts()` is the whole creature as data (normalised `Ellipse`/`Rounded`/`Arc` shapes in paint order); `paint` and `snorri` are the only things that touch a painter. See the module doc and the mascot section below before moving any number. |
+| `settings.rs` | The user's eight scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a ninth or wiring one.
 | `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
 
 ## Clickable labels — read this before making anything clickable
@@ -187,17 +189,59 @@ history length, so the offset is set and then read back (`apply_scroll`).
 - **Renaming touches `custom_title`, never `title`.** `next_free_title` compares
   against `title`, so a renamed tab cannot make the next shell reuse a name that
   is already on screen. An empty name hands the tab back to its automatic label.
-- **Zoom lives in `ViewState`, shared by both layouts.** `term_cell_size(ui,
-  zoom)` is read by `Terminal::ui`, `flow_ui` and `render_pane` — sizing happens
-  through the ordinary `apply_size` path, so a zoom is indistinguishable from a
-  window resize as far as the ptys are concerned. Ctrl+wheel comes from egui's
-  own `InputState::zoom_delta`, which nothing else in this app reads.
+- **The grid face lives in `ViewState`, shared by both layouts, and it is an
+  *absolute* point size — not a multiplier.** `term_cell_size(ui, font_size)` is
+  read by `Terminal::ui`, `flow_ui` and `render_pane`, and that same number is
+  what the settings panel shows and the file stores; "12.5 times 1.0" is a size
+  nobody typed. Sizing still happens through the ordinary `apply_size` path, so
+  changing the face is indistinguishable from a window resize as far as the
+  ptys are concerned. Ctrl+wheel comes from egui's own
+  `InputState::zoom_delta`, which nothing else in this app reads, and
+  `ZOOM_MIN`/`ZOOM_MAX` *are* the settings bounds rather than a second range
+  that happens to contain them.
 - **Shell detection is a lookup, not a probe.** `installed_from` scans `PATH`
   for the executable's filename and takes `COMSPEC` for `cmd`; spawning
   `pwsh -c exit` to test for it would spawn a process on every start to draw a
   menu. `powershell.exe` is reported present whatever the lookup says, so a
   trimmed `PATH` cannot leave the menu empty. A window with no shell to start is
   a dead end, which is why the fallback is unconditional.
+
+## The footer mascot (`mascot.rs`)
+
+Snorri is a sloth, drawn from scratch, and the shape list *is* the design: a
+pale face mask, two dark eye smudges with closed sleeping eyes inside them, a
+small nose over a content mouth, and three long claws on each of four paws.
+Five rules are load-bearing:
+
+- **The pose was chosen by looking at it, not by writing it down.**
+  `tools/mascot_design.py` holds three poses rasterised at the real footer size
+  — curled up, sitting hugging its knees (the shipped one), and hanging from a
+  branch. The rejected two are why the current one is shaped as it is: the ball
+  ran the face mask and the belly into one pale panel and lost the face
+  (hence `the_face_and_the_belly_stay_apart`), and the branch spent the top
+  third of the block on branch.
+- **The claws are the signifier.** Twelve of them, three per paw, all built by
+  one `claw_row` helper so the count and their geometry cannot drift apart
+  (`four_paws_carry_three_claws_each`). Take them away and it is a teddy bear;
+  take the eye smudges away and it is a mouse.
+- **The fur is the palette's green-grey, not a sloth's brown.** A warm brown
+  would be the only warm mass in a cool green window. `mascot_fur()` keeps the
+  value a sloth's fur reads at and drops the hue; the eye smudges are the only
+  new use of `pane_edge`.
+- **Every face feature has to land on the cream**
+  (`the_face_features_land_on_the_cream_not_the_fur`) — two smudges, two closed
+  eyes, a nose, two mouth strokes and two cheeks — and the closed eyes have to
+  sit inside their smudges, or the smudges read as holes.
+- **Cream must also stay on fur** (`the_cream_never_leaves_the_fur`). A patch
+  that misses paints a pale blob on the explorer panel, which a test that only
+  checks the block would not notice.
+
+Preview a change with `tools/mascot_design.py` (same shape list in Python, no
+rebuild) and check a real render with `tools/mascot_check.py` over a
+`win_shot.py` capture. That checker finds the ink as *enclosed holes* rather
+than by colour, because the ink is `surface_recessed` — the same tone as the
+panel it is painted on. A screenshot cannot tell you whether twelve claws drew;
+the region counts can.
 
 ## The branch readout (`git.rs`)
 
@@ -557,20 +601,93 @@ Lowers the physical backlight so agents can keep running with the screen dark.
   panel, so a dimmed screen looks identical in a PNG. Confirm the level by
   re-reading `CurrentBrightness` after the toggle, never by looking at a capture.
 
+## Settings (`settings.rs`)
+
+One file, `%APPDATA%\Snor\settings.toml`, holding eight scalars: the shell a new
+terminal tab starts, the terminal and editor faces, scrollback rows, hidden
+files, the context-follow switch, the dim level and the UI scale. `eframe` is
+built without the `persistence` feature, so before this module every one of
+those was either a constant or forgotten on exit — the window re-centred itself
+every launch and `Ctrl+wheel`'s zoom died with the process.
+
+- **Hand-rolled `key = value`, not a TOML crate.** Eight scalars, and every
+  field is *total*: a missing key, an unparseable value and an unknown key all
+  leave the default in place rather than failing the load. A parser dependency
+  would earn its keep on nothing. The `.toml` extension stays because the file
+  *is* TOML-shaped and a human can edit it as one; this reader is the subset
+  Snor writes.
+- **Every default is byte-identical to the constant it replaces.**
+  `TERMINAL_FONT_DEFAULT` *is* `terminal::TERM_FONT_SIZE` and `SCROLLBACK_DEFAULT`
+  *is* `terminal::SCROLLBACK`, so the existing suite is the proof that the
+  plumbing changed no behaviour.
+- **Clamping is not defensive padding.** These values reach a font id, a
+  `vt100` buffer size and a viewport command, and a settings file is a text file
+  a user edits by hand, so `clamped()` runs on everything loaded and again on
+  everything written.
+- **The panel applies as it is touched; there is no Apply button.** Snor has no
+  navigation and every knob is one scalar, so a half-applied state would be
+  worse than no panel. `SnorApp::settings_changed` re-applies the whole set —
+  each setter is idempotent, so there is nothing to diff — and sets
+  `settings_dirty`.
+- **The grid face is read *from* the terminal, never written to it.**
+  `Ctrl+wheel` changes it without touching the panel, so `settings_changed`
+  takes `terminal.font_size()` as the truth. Without that, moving any *other*
+  row would silently undo a zoom. `SnorApp::drop` writes the same value, which
+  is what makes the last wheel zoom the one that comes back.
+- **A slider drag is one write, not sixty.** The file is flushed from `ui` only
+  when `settings_dirty` is set *and* `pointer.any_down()` is false, so a value
+  still being dragged has no final number to store.
+- **Scrollback is deliberately not live.** `vt100::Parser`'s history depth is
+  fixed when it is built, so the row is labelled "next shell" rather than
+  silently rebuilding the parser and throwing the history away.
+- **`ui_scale` is `Context::set_zoom_factor`, and it re-runs the window fit.**
+  The logical window is a different size after a scale change, so
+  `window_fitted` is cleared — otherwise a grown window hangs off the screen it
+  was fitted to, which is the bug the placement code exists to prevent.
+- **An uninstalled shell stays selectable.** The menu offers the installed
+  shells *plus* whatever the file already names, so a settings file carried from
+  another machine does not silently revert its shell.
+- **A chosen shell reaches the startup tab, and only that tab is rewritten.**
+  `Terminal::new` builds tab 1 before the file is read, so `choose_shell` also
+  rewrites sessions that have not *started* — they have no process to interrupt
+  and no history to lose, so the pick is simply the shell they will run. A
+  started session is never touched, which is the same rule that keeps a menu
+  click from restarting an agent mid-task. Guarded by
+  `the_chosen_shell_reaches_the_startup_tab` and
+  `changing_the_shell_never_touches_a_started_tab`.
+- **The gear sits in the reference's far-right status-bar slot**, which the
+  terminal toggle had been filling because it was the only control there was.
+  Opening the panel is also where `settings.terminal_font` is reconciled with
+  the live grid, so the slider starts from what is actually on screen.
+
 ## Tests
 
-- `cargo test` must stay green (86 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (117 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
-  tests, the four terminal-tab tests (`tabs_spawn_and_switch`,
+  tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
   `closing_an_earlier_tab_keeps_the_same_shell_selected`,
-  `tab_numbers_take_the_lowest_free_slot`), the grid-padding pair
+  `tab_numbers_take_the_lowest_free_slot`,
+  `the_chosen_shell_reaches_the_startup_tab`,
+  `changing_the_shell_never_touches_a_started_tab`), the eight mascot geometry
+  tests
+  (`every_shape_stays_inside_the_block`, `the_creature_is_mirror_symmetric`,
+  `four_paws_carry_three_claws_each`,
+  `the_face_features_land_on_the_cream_not_the_fur`,
+  `the_sleeping_eyes_sit_inside_their_patches`,
+  `the_cream_never_leaves_the_fur`, `the_face_and_the_belly_stay_apart`,
+  `the_block_is_the_poses_footprint`), the grid-padding pair
   (`flow_pane_sizing_reserves_its_header` and its side-gap twin
   `flow_pane_sizing_reserves_its_side_gaps`),
   `closing_the_last_tab_empties_the_list_without_underflow`, the three
   window-placement tests (`floating_window_is_placed_fully_on_screen`,
   `a_window_taller_than_the_monitor_is_shrunk_to_fit`,
-  `a_misreported_monitor_cannot_produce_a_negative_size`), and
+  `a_misreported_monitor_cannot_produce_a_negative_size`), the sixteen
+  settings tests (round trip, missing/unknown/malformed keys, clamping,
+  the key list, a real save/reload), the three dim-level tests
+  (`changing_the_level_while_dimmed_applies_it_without_losing_the_restore`,
+  `changing_the_level_while_idle_touches_nothing`,
+  `a_level_outside_what_wmi_accepts_is_clamped`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
 - Hermetic twins for the newer behaviour, none of which needs a pty because

@@ -5,7 +5,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-const SCROLLBACK: usize = 1000;
+/// Rows of history a session keeps. `pub` because the settings file's default
+/// has to be this exact number — see [`crate::settings`].
+pub const SCROLLBACK: usize = 1000;
 
 /// Width reserved on the right of the terminal header for the status hint and
 /// the icon cluster, so the tab strip can be bounded and leave them on the
@@ -338,16 +340,28 @@ fn short_idle(idle: std::time::Duration) -> String {
     }
 }
 
-/// Text scale bounds for the terminal grid.
-const ZOOM_MIN: f32 = 0.6;
-const ZOOM_MAX: f32 = 2.4;
+/// Text scale bounds for the terminal grid, in points.
+///
+/// Deliberately the same bounds the settings file allows. They used to be a
+/// multiplier on [`TERM_FONT_SIZE`] that merely *contained* the settings range,
+/// which left an edge where a wheel zoom could sit at 30 while the file stored
+/// 28 — the live face and the persisted one disagreeing by two points with
+/// nothing to reconcile them. One range, named once, is the way out.
+const ZOOM_MIN: f32 = crate::settings::TERMINAL_FONT_MIN;
+const ZOOM_MAX: f32 = crate::settings::TERMINAL_FONT_MAX;
 
 /// Terminal-wide view state, shared by the tabbed layout and Flow Mode panes
 /// because both draw the same grid at the same scale.
 struct ViewState {
-    /// Multiplier on [`TERM_FONT_SIZE`]. 1.0 is the size the mock was measured
-    /// at, so nothing about the default layout moves.
-    zoom: f32,
+    /// Face the grid renders in, in points — **absolute**, not a multiplier.
+    ///
+    /// This used to be a zoom factor on a constant, which was fine while the
+    /// only way to set it was `Ctrl+wheel`. It became the wrong shape the
+    /// moment a settings file could name a size: a persisted absolute value has
+    /// to be the same number the settings panel shows, and "12.5 times 1.0" is
+    /// a size nobody typed. `Terminal::font_size`/`set_font_size` are the only
+    /// ways in.
+    font_size: f32,
     /// Sub-row wheel remainder, in points.
     ///
     /// A trackpad delivers a few points per frame; converting each frame's delta
@@ -359,7 +373,7 @@ struct ViewState {
 impl Default for ViewState {
     fn default() -> Self {
         Self {
-            zoom: 1.0,
+            font_size: TERM_FONT_SIZE,
             wheel_acc: 0.0,
         }
     }
@@ -611,7 +625,9 @@ const SEARCH_FG: eframe::egui::Color32 =
 /// How [`term_job`] should mark the grid up beyond what the shell itself said.
 #[derive(Clone, Copy)]
 struct Markup {
-    /// Cell size to draw at: [`TERM_FONT_SIZE`] scaled by the terminal's zoom.
+    /// Cell size to draw at, in points: whatever the view state currently is,
+    /// which is [`TERM_FONT_SIZE`] until the settings panel or `Ctrl+wheel`
+    /// says otherwise.
     font_size: f32,
     /// Selection to tint, as `(row_from, col_from, row_to, col_to)` inclusive.
     selection: Option<(u16, u16, u16, u16)>,
@@ -805,14 +821,14 @@ struct Session {
 }
 
 impl Session {
-    fn new(title: String, id: u64, shell: ShellKind) -> Self {
+    fn new(title: String, id: u64, shell: ShellKind, scrollback: usize) -> Self {
         Self {
             id,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             title,
             custom_title: None,
             shell,
-            parser: vt100::Parser::new(ROWS, COLS, SCROLLBACK),
+            parser: vt100::Parser::new(ROWS, COLS, scrollback),
             rx: None,
             writer: None,
             _child: None,
@@ -980,6 +996,10 @@ pub struct Terminal {
     notice: Option<String>,
     /// Which shell a newly opened tab starts.
     shell: ShellKind,
+    /// History rows a newly spawned `vt100::Parser` keeps. Set from the
+    /// settings file; see [`Terminal::set_scrollback`] for why live sessions
+    /// keep the value they were built with.
+    scrollback: usize,
     /// The shells this machine can actually start, resolved once. Looked up
     /// rather than probed so nothing is spawned to draw a menu, and cached
     /// because it cannot change while the app runs.
@@ -1007,7 +1027,7 @@ impl Terminal {
     pub fn new() -> Self {
         let shell = ShellKind::default();
         Self {
-            sessions: vec![Session::new(shell_title(1, shell), 1, shell)],
+            sessions: vec![Session::new(shell_title(1, shell), 1, shell, SCROLLBACK)],
             active_tab: 0,
             collapsed: false,
             fullscreen: false,
@@ -1021,6 +1041,7 @@ impl Terminal {
             flow_focus: None,
             notice: None,
             shell,
+            scrollback: SCROLLBACK,
             shells: ShellKind::installed(),
             view: ViewState::default(),
             renaming: None,
@@ -1036,8 +1057,39 @@ impl Terminal {
     /// Choose the shell for shells opened from now on. Live sessions are left
     /// exactly as they are: this is not a restart, and an agent mid-task must
     /// not be interrupted by a menu click.
+    ///
+    /// A session that has *not* started is the one exception, and it is less an
+    /// exception than the same rule read properly: it has no process to
+    /// interrupt and no history to preserve, so the shell the user picked is
+    /// simply the shell it will run. That is what lets the settings file's
+    /// `shell` reach the startup tab, which `Terminal::new` builds before the
+    /// file has been read — without it, `shell = gitbash` left tab 1 on
+    /// PowerShell while every later tab was bash.
     fn choose_shell(&mut self, shell: ShellKind) {
         self.shell = shell;
+        let mut n = self
+            .sessions
+            .iter()
+            .filter(|s| s.started && s.shell == shell)
+            .count()
+            + 1;
+        for session in &mut self.sessions {
+            if session.started {
+                continue;
+            }
+            session.shell = shell;
+            if session.custom_title.is_none() {
+                session.title = shell_title(n, shell);
+                n += 1;
+            }
+        }
+    }
+
+    /// Choose the shell a *new* tab starts, from outside this module. The
+    /// settings panel cannot reach `choose_shell` (private to the tab strip's
+    /// own menu), and the two must stay one setting, so this is the same write.
+    pub fn set_shell(&mut self, shell: ShellKind) {
+        self.choose_shell(shell);
     }
 
     /// One zoom step, clamped.
@@ -1047,7 +1099,49 @@ impl Terminal {
     /// anything, so a zoom is indistinguishable from a window resize as far as
     /// the ptys are concerned, which is exactly what makes it safe.
     fn zoom_by(&mut self, factor: f32) {
-        self.view.zoom = (self.view.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.set_font_size(self.view.font_size * factor);
+    }
+
+    /// The grid's face size, in points. This is also what the settings panel
+    /// persists.
+    pub fn font_size(&self) -> f32 {
+        self.view.font_size
+    }
+
+    /// Set the grid's face size, clamped to the same range `Ctrl+wheel` uses.
+    ///
+    /// Absolute, not relative: a settings file names a size, and applying it
+    /// must land on that size whatever the wheel had done before. Larger values
+    /// are *not* applied to the ptys here — the next frame's ordinary sizing
+    /// pass notices the cells grew and resizes every shell, which is the same
+    /// path a window resize takes.
+    pub fn set_font_size(&mut self, points: f32) {
+        self.view.font_size = points.clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /// How many history rows a *newly spawned* shell will keep.
+    ///
+    /// Deliberately not applied to live sessions: `vt100::Parser`'s scrollback
+    /// is fixed at construction, so resizing it would mean rebuilding the
+    /// parser and throwing away the history it already holds. The panel says
+    /// "next session" for this one.
+    pub fn set_scrollback(&mut self, rows: usize) {
+        self.scrollback = rows;
+    }
+
+    /// The shells this machine can start, for the settings panel's menu.
+    ///
+    /// The same list the tab strip's own menu draws from, exposed rather than
+    /// re-derived: probing twice could disagree with itself, and the panel has
+    /// to offer exactly what a tab can actually open.
+    pub fn installed_shells(&self) -> &[ShellKind] {
+        &self.shells
+    }
+
+    /// The shell a new tab will start. The settings file records this, so the
+    /// shell picked in the tab strip's own menu is not lost on the next launch.
+    pub fn shell(&self) -> ShellKind {
+        self.shell
     }
 
     /// Clear a session's attention flag: its bell or its title was noticed.
@@ -1106,7 +1200,7 @@ impl Terminal {
         self.notice = None;
         let id = self.next_session_id;
         self.next_session_id += 1;
-        let mut session = Session::new(self.next_free_title(), id, self.shell);
+        let mut session = Session::new(self.next_free_title(), id, self.shell, self.scrollback);
         session.cwd = cwd.clone();
         session.started = true;
         session.spawn(cwd);
@@ -1147,7 +1241,7 @@ impl Terminal {
         let id = self.next_session_id;
         self.next_session_id += 1;
         self.sessions
-            .push(Session::new(self.next_free_title(), id, self.shell));
+            .push(Session::new(self.next_free_title(), id, self.shell, self.scrollback));
         self.active_tab = self.sessions.len() - 1;
         self.active = true;
         self.collapsed = false;
@@ -1760,6 +1854,7 @@ impl Terminal {
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
+                    let scrollback = self.scrollback;
                     if crate::icons::icon_button(ui, 20.0, "clear screen", |p, r, c| {
                         crate::icons::trash(p, r, c)
                     })
@@ -1767,7 +1862,10 @@ impl Terminal {
                         && let Some(session) = self.session_mut()
                     {
                         let (rows, cols) = (session.rows, session.cols);
-                        session.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+                        // The session's own history depth, not the constant: a
+                        // cleared screen must not also quietly shrink a
+                        // scrollback the user widened in the settings panel.
+                        session.parser = vt100::Parser::new(rows, cols, scrollback);
                         // A fresh parser has no history and no cursor at the old
                         // offset, so the scroll state has to be reset with it or
                         // the view would sit at a coordinate that no longer means
@@ -1808,6 +1906,7 @@ impl Terminal {
                     // An icon, not a `small_button`: the reference's terminal
                     // header is icons only, and a default-chrome text button
                     // between two flat glyphs read as bolted on.
+                    let scrollback = self.scrollback;
                     if crate::icons::icon_button(ui, 20.0, "restart powershell", |p, r, c| {
                         crate::icons::refresh(p, r.shrink(2.0), c)
                     })
@@ -1822,7 +1921,7 @@ impl Terminal {
                             session._child = None;
                             session._master = None;
                             let (rows, cols) = (session.rows, session.cols);
-                            session.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
+                            session.parser = vt100::Parser::new(rows, cols, scrollback);
                             session.error = None;
                             session.scroll = 0;
                             session.selection = None;
@@ -1945,7 +2044,7 @@ impl Terminal {
         // is told how many columns the padded grid can actually show, so the
         // last column does not wrap onto a row of its own.
         let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
-        let cell = term_cell_size(ui, self.view.zoom);
+        let cell = term_cell_size(ui, self.view.font_size);
         let (rows, cols) = term_size_for_pixels(grid_rect.width().max(0.0), grid_max, cell);
         if let Some(session) = self.session_mut() {
             session.apply_size(rows, cols);
@@ -1963,7 +2062,7 @@ impl Terminal {
             WheelIntent::Zoom(factor) => self.zoom_by(factor),
             WheelIntent::None => {}
         }
-        let zoom = self.view.zoom;
+        let font_size = self.view.font_size;
         // The current find hit, if there is one. It is only painted when it sits
         // at the offset being drawn — a hit found further back is not on screen,
         // and tinting a cell on the live screen because of it would point at the
@@ -1979,7 +2078,7 @@ impl Terminal {
                 // the buffer.
                 session.apply_scroll();
                 let markup = Markup {
-                    font_size: TERM_FONT_SIZE * zoom,
+                    font_size,
                     selection: session.selection_range(),
                     search: search
                         .filter(|hit| hit.offset == session.scroll)
@@ -2589,8 +2688,9 @@ impl FlowGrid {
 }
 
 /// Face every terminal grid renders in, measured and painted from the same
-/// constant so the two can never disagree about how big a cell is.
-const TERM_FONT_SIZE: f32 = 12.5;
+/// constant so the two can never disagree about how big a cell is. `pub`
+/// because it is also the settings file's default; see [`crate::settings`].
+pub const TERM_FONT_SIZE: f32 = 12.5;
 
 /// Height of a Flow pane's header row — the focus band and its marker. No
 /// text: the shell prints its own prompt, so naming the pane here only ever
@@ -2643,9 +2743,9 @@ const PANE_GRID_PAD: f32 = 4.0;
 
 /// Pixels per terminal cell, measured off the live font. Panes divide their
 /// pixel rects by these to learn their real rows and columns.
-fn term_cell_size(ui: &eframe::egui::Ui, zoom: f32) -> (f32, f32) {
+fn term_cell_size(ui: &eframe::egui::Ui, font_size: f32) -> (f32, f32) {
     use eframe::egui::{Color32, FontId};
-    let mono = FontId::monospace(TERM_FONT_SIZE * zoom);
+    let mono = FontId::monospace(font_size);
     let w = ui
         .painter()
         .layout_no_wrap("MMMMMMMMMM".to_owned(), mono.clone(), Color32::WHITE)
@@ -2794,7 +2894,7 @@ impl Terminal {
             .unwrap_or_else(|| default_cwd.clone());
         let id = self.next_session_id;
         self.next_session_id += 1;
-        let mut session = Session::new(self.next_free_title(), id, self.shell);
+        let mut session = Session::new(self.next_free_title(), id, self.shell, self.scrollback);
         session.cwd = cwd.clone();
         session.started = true;
         session.spawn(&cwd);
@@ -2973,7 +3073,7 @@ impl Terminal {
         //
         // Measuring first closes that gap: any output the resize provokes is
         // drained by the `poll()` below, in the same frame it was asked for.
-        let cell = term_cell_size(ui, self.view.zoom);
+        let cell = term_cell_size(ui, self.view.font_size);
         self.size_panes(rect, cell);
 
         self.poll();
@@ -3273,7 +3373,7 @@ impl<'a> FlowView<'a> {
                 // The grid is drawn into the side-inset rect, so the pane's own
                 // outline does not have the prompt's first glyph sitting on it.
                 let grid_rect = inset_grid_sides(ui.available_rect_before_wrap());
-                let cell = term_cell_size(ui, self.view.zoom);
+                let cell = term_cell_size(ui, self.view.font_size);
                 // Wheel in a pane means the same as in the tabbed layout:
                 // history, or zoom with Ctrl. Both are handled before the label
                 // so the gesture never reaches the shell.
@@ -3284,7 +3384,10 @@ impl<'a> FlowView<'a> {
                         }
                     }
                     WheelIntent::Zoom(factor) => {
-                        self.view.zoom = (self.view.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+                        // Same clamp as `Terminal::zoom_by`, inlined because the
+                        // borrow of `self.sessions` above is still live here.
+                        self.view.font_size =
+                            (self.view.font_size * factor).clamp(ZOOM_MIN, ZOOM_MAX);
                     }
                     WheelIntent::None => {}
                 }
@@ -3292,7 +3395,7 @@ impl<'a> FlowView<'a> {
                     Some(s) => {
                         s.apply_scroll();
                         let markup = Markup {
-                            font_size: TERM_FONT_SIZE * self.view.zoom,
+                            font_size: self.view.font_size,
                             // Panes have no drag selection of their own — the
                             // tabbed grid is where selecting and copying lives —
                             // but the field is carried through so both layouts
@@ -3524,6 +3627,33 @@ mod tests {
         assert!(t.sessions.is_empty());
         t.open_stub_tab();
         assert_eq!(titles(&t), ["powershell"], "numbering must restart");
+    }
+
+    /// The settings file's `shell` has to reach the *startup* tab, not just the
+    /// second one. `Terminal::new` builds tab 1 before the settings file is
+    /// read, so this only works because the tab is lazy — and the title has to
+    /// follow the shell, or the tab says "powershell" while running bash.
+    #[test]
+    fn the_chosen_shell_reaches_the_startup_tab() {
+        let mut t = Terminal::new();
+        assert_eq!(titles(&t), ["powershell"]);
+        t.set_shell(ShellKind::GitBash);
+        assert_eq!(t.sessions[0].shell, ShellKind::GitBash);
+        assert_eq!(titles(&t), ["bash"]);
+    }
+
+    /// ...and it must never touch a shell that is already running: an agent
+    /// mid-task is not restarted by a menu click or a settings save.
+    #[test]
+    fn changing_the_shell_never_touches_a_started_tab() {
+        let mut t = Terminal::new();
+        t.sessions[0].started = true;
+        t.set_shell(ShellKind::Cmd);
+        assert_eq!(t.sessions[0].shell, ShellKind::PowerShell);
+        assert_eq!(titles(&t), ["powershell"]);
+        // The choice still applies to the next tab.
+        t.open_stub_tab();
+        assert_eq!(titles(&t), ["powershell", "cmd"]);
     }
 
     fn titles(t: &Terminal) -> Vec<&str> {

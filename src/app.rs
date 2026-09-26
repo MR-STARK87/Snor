@@ -6,7 +6,8 @@ use crate::editor::Editor;
 use crate::file_tree::FileTree;
 use crate::git;
 use crate::icons;
-use crate::terminal::Terminal;
+use crate::settings::Settings;
+use crate::terminal::{ShellKind, Terminal};
 use crate::theme;
 
 /// Height of the editor/terminal divider's grab band.
@@ -189,19 +190,57 @@ pub struct SnorApp {
     /// The user has answered the box and the close may proceed. Without it the
     /// next frame would cancel the very close it just asked for.
     allow_close: bool,
+    /// The user's settings, as loaded and as last written. Owned here because
+    /// this is the one place every setting can be applied from: the terminal,
+    /// the editor, the tree and the dim backend are all fields of this struct.
+    settings: Settings,
+    /// The settings panel is up.
+    settings_open: bool,
+    /// Something in the panel moved and the file has not caught up yet. Flushed
+    /// once the pointer is off whatever was being dragged — see [`SnorApp::ui`].
+    settings_dirty: bool,
+    /// The UI scale moved, so the window has to be re-fitted to the monitor.
+    ///
+    /// Deferred to the same moment the file is written, on purpose: a scale
+    /// change re-sizes the logical window, and re-placing it on every frame of
+    /// a slider drag would make the window jump under the hand that is
+    /// dragging.
+    refit_pending: bool,
+    /// A failed write, shown in the panel so a toggle that will not persist
+    /// says so instead of looking like it worked.
+    settings_error: Option<String>,
 }
 
 impl SnorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::fonts::install(&cc.egui_ctx);
         crate::theme::apply_dark(&cc.egui_ctx);
+        // Load before anything is built, so each component is born at the size
+        // or shell the user chose rather than being corrected on frame one — a
+        // grid that resized under the first prompt would look like a bug.
+        let settings = Settings::load();
+        cc.egui_ctx.set_zoom_factor(settings.ui_scale);
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let tree = FileTree::new(root);
+        let mut tree = FileTree::new(root);
+        tree.set_show_hidden(settings.show_hidden);
+        let mut editor = Editor::new();
+        editor.set_font_size(settings.editor_font);
+        let mut terminal = Terminal::new();
+        terminal.set_shell(settings.shell);
+        terminal.set_font_size(settings.terminal_font);
+        terminal.set_scrollback(settings.scrollback);
+        let mut dim = DimManager::new();
+        dim.set_dim_level(settings.dim_level);
         Self {
             tree,
-            editor: Editor::new(),
-            terminal: Terminal::new(),
-            dim: DimManager::new(),
+            editor,
+            terminal,
+            dim,
+            settings,
+            settings_open: false,
+            settings_dirty: false,
+            refit_pending: false,
+            settings_error: None,
             flow: false,
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
@@ -349,6 +388,184 @@ impl SnorApp {
         let (fitted, pos) = fit_to_monitor(monitor, size);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fitted));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+    }
+
+    /// Push the settings at the things they configure. The file is not written
+    /// here; [`SnorApp::ui`] flushes it once the pointer is off the control.
+    ///
+    /// Re-applies everything rather than diffing each row: every setter here is
+    /// idempotent, so one pass is both the simplest and the cheapest correct
+    /// answer, and it cannot leave a row applied and another forgotten.
+    ///
+    /// The grid face and the shell are read *from* the terminal rather than
+    /// written to it. `Ctrl+wheel` changes the face and the tab strip's own
+    /// menu changes the shell, both without touching the panel; the panel's own
+    /// controls push their changes straight at the terminal. Reading back is
+    /// what stops a change on any other row from silently reverting either, and
+    /// it is what makes the wheel's size and the chosen shell the ones that
+    /// persist.
+    fn settings_changed(&mut self, ui: &egui::Ui) {
+        self.settings.terminal_font = self.terminal.font_size();
+        self.settings.shell = self.terminal.shell();
+        self.settings = self.settings.clone().clamped();
+        self.terminal.set_scrollback(self.settings.scrollback);
+        self.editor.set_font_size(self.settings.editor_font);
+        self.tree.set_show_hidden(self.settings.show_hidden);
+        self.dim.set_dim_level(self.settings.dim_level);
+        self.dim.reapply(crate::brightness::set_brightness);
+        // Only when it actually moved. `set_zoom_factor` is the app-wide point
+        // scale, so rewriting it every frame would fight anything else that
+        // touched it, and re-centre the window each time.
+        if (ui.ctx().zoom_factor() - self.settings.ui_scale).abs() > 0.001 {
+            ui.ctx().set_zoom_factor(self.settings.ui_scale);
+            // The logical window is a different size now, so the one-shot
+            // placement has to run again or a grown window hangs off the screen
+            // it was fitted to. Deferred: see [`SnorApp::refit_pending`].
+            self.refit_pending = true;
+        }
+        self.settings_dirty = true;
+    }
+
+    /// The settings panel.
+    ///
+    /// A modal window rather than a page: Snor has no navigation, and every
+    /// knob here is one scalar. Each control takes effect as it is touched, so
+    /// there is no separate Apply that could be missed and no state where the
+    /// panel and the app disagree.
+    ///
+    /// The knob that cannot be live is labelled rather than hidden: a parser's
+    /// scrollback is fixed when the `vt100::Parser` is built, so the row says
+    /// "next shell" instead of pretending to resize a session already on
+    /// screen.
+    fn settings_window(&mut self, ui: &egui::Ui) {
+        if !self.settings_open {
+            return;
+        }
+        let shells: Vec<ShellKind> = self.terminal.installed_shells().to_vec();
+        let mut changed = false;
+        let mut open = true;
+        egui::Window::new("settings")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                let hint = |ui: &mut egui::Ui, text: &str| {
+                    ui.label(egui::RichText::new(text).small().color(theme::dim_text()));
+                };
+
+                ui.label(egui::RichText::new("Terminal").size(12.5).color(theme::accent()));
+                ui.horizontal(|ui| {
+                    ui.label("shell");
+                    let current = self.settings.shell;
+                    egui::ComboBox::from_id_salt("snor_settings_shell")
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            // The installed shells, plus whatever the file
+                            // already names. A shell chosen on another machine
+                            // has to stay selectable rather than silently
+                            // reverting because it is not installed here.
+                            let mut shown = shells.clone();
+                            if !shown.contains(&current) {
+                                shown.push(current);
+                            }
+                            for shell in shown {
+                                if ui.selectable_label(shell == current, shell.label()).clicked() {
+                                    self.settings.shell = shell;
+                                    // Pushed straight at the terminal, like the
+                                    // font slider: the terminal is the truth
+                                    // `settings_changed` reads back.
+                                    self.terminal.set_shell(shell);
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+                let font = ui.add(
+                    egui::Slider::new(
+                        &mut self.settings.terminal_font,
+                        crate::settings::TERMINAL_FONT_MIN..=crate::settings::TERMINAL_FONT_MAX,
+                    )
+                    .text("font size"),
+                );
+                if font.changed() {
+                    // Straight at the terminal too, so the grid redraws while
+                    // the slider is still moving. `settings_changed` reads this
+                    // value back out of the terminal afterwards.
+                    self.terminal.set_font_size(self.settings.terminal_font);
+                    changed = true;
+                }
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.scrollback,
+                            crate::settings::SCROLLBACK_MIN..=crate::settings::SCROLLBACK_MAX,
+                        )
+                        .text("scrollback rows"),
+                    )
+                    .changed();
+                hint(
+                    ui,
+                    "scrollback applies to the next shell; a live session keeps the history it was built with.",
+                );
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Editor").size(12.5).color(theme::accent()));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.editor_font,
+                            crate::settings::EDITOR_FONT_MIN..=crate::settings::EDITOR_FONT_MAX,
+                        )
+                        .text("font size"),
+                    )
+                    .changed();
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Explorer").size(12.5).color(theme::accent()));
+                changed |= ui
+                    .checkbox(&mut self.settings.show_hidden, "show hidden files")
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.settings.follow_terminal,
+                        "follow the focused terminal's folder",
+                    )
+                    .changed();
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Window").size(12.5).color(theme::accent()));
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.ui_scale,
+                            crate::settings::UI_SCALE_MIN..=crate::settings::UI_SCALE_MAX,
+                        )
+                        .text("ui scale"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut self.settings.dim_level, 1..=100).text("dim level"))
+                    .changed();
+                hint(ui, "Dim Mode dims to this percent (Ctrl+Shift+D).");
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(Settings::path().display().to_string())
+                        .small()
+                        .color(theme::faint()),
+                );
+                if let Some(err) = &self.settings_error {
+                    ui.label(egui::RichText::new(err).small().color(theme::danger()));
+                }
+            });
+        if !open {
+            self.settings_open = false;
+        }
+        if changed {
+            self.settings_changed(ui);
+        }
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
@@ -749,11 +966,27 @@ impl SnorApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Right-to-left, so the first thing added lands furthest
-                        // right: the toggle goes in first to sit where the
-                        // reference's own status-bar icon does, with the readouts
-                        // marching away to its left. An icon rather than a
-                        // `small_button` — a filled pill among flat text was the
-                        // same "bolted on" problem as the old open-folder button.
+                        // right. That slot is the settings gear the reference
+                        // mock drew there and Snor filled with the terminal
+                        // toggle because it had nothing else to put in it; the
+                        // gear takes it back, with the toggle just inside.
+                        if icons::icon_button(ui, 20.0, "settings", |p, r, c| {
+                            icons::gear(p, r.shrink(3.0), c)
+                        })
+                        .clicked()
+                        {
+                            // Opening is where the stored face is reconciled
+                            // with the live one: `Ctrl+wheel` changes the grid
+                            // without telling the panel, so the slider has to
+                            // start from what is actually on screen.
+                            self.settings.terminal_font = self.terminal.font_size();
+                            self.settings_error = None;
+                            self.settings_open = true;
+                        }
+                        ui.add_space(STATUS_GAP);
+                        // An icon rather than a `small_button` — a filled pill
+                        // among flat text was the same "bolted on" problem as
+                        // the old open-folder button.
                         let open = !self.terminal.hidden;
                         if icons::icon_button(ui, 20.0, "toggle terminal (Ctrl+Tab)", |p, r, c| {
                             icons::panel_bottom(p, r.shrink(4.0), c, open)
@@ -1004,6 +1237,13 @@ impl SnorApp {
     /// it. Following a `cd` needs OSC 7 emitted by the shell and parsed in
     /// `terminal.rs`, which PowerShell does not do by default.
     fn sync_context_root(&mut self) {
+        // The setting is honoured here rather than by not drawing the explorer:
+        // the tree still follows a manual re-root from the header's dialog, and
+        // a user who turned this off is asking for the folder *they* picked to
+        // stay put while focus moves between shells.
+        if !self.settings.follow_terminal {
+            return;
+        }
         let Some((id, cwd)) = self.terminal.context_session(self.flow) else {
             return;
         };
@@ -1353,6 +1593,32 @@ impl eframe::App for SnorApp {
             self.tree_grip(ui, rect);
         }
 
+        // Above every panel, below the window's own edge and the dim badge.
+        self.settings_window(ui);
+
+        // Write the file once the hand is off the control. A write per frame of
+        // a drag would be sixty files a second for a value the user has not
+        // settled on yet, and a slider that is still moving has no final value
+        // to store. The deferred window re-fit rides along with it, for the
+        // same reason: both want a value the user has stopped changing.
+        // The tab strip's own shell menu changes the shell without the panel,
+        // so pick that up too: the file should record whichever shell the user
+        // last chose, not whichever control they happened to choose it in.
+        if self.settings.shell != self.terminal.shell() {
+            self.settings.shell = self.terminal.shell();
+            self.settings_dirty = true;
+        }
+        if !ui.input(|i| i.pointer.any_down()) {
+            if self.refit_pending {
+                self.window_fitted = false;
+                self.refit_pending = false;
+            }
+            if self.settings_dirty {
+                self.settings_error = self.settings.save().err();
+                self.settings_dirty = false;
+            }
+        }
+
         // After every panel: the resize bands own the outermost points of the
         // window, and nothing else may claim them.
         Self::window_resize_bands(ui);
@@ -1388,6 +1654,11 @@ impl Drop for SnorApp {
         // Best effort by design: shutdown must never panic or hang waiting
         // on display control, and terminals are reaped by their own `Drop`.
         self.dim.restore_on_exit(crate::brightness::set_brightness);
+        // The grid face as it actually stands. `Ctrl+wheel` changes it without
+        // the panel, so this is the one setting whose last value is only known
+        // at exit; every other one is already written when it is touched.
+        self.settings.terminal_font = self.terminal.font_size();
+        let _ = self.settings.save();
     }
 }
 

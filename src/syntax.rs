@@ -115,7 +115,11 @@ thread_local! {
 
 /// Tree-sitter highlight to LayoutJob. Returns None if unsupported/over limit/failed
 /// so the caller can fall back to the keyword highlighter.
-pub fn ts_job(text: &str, lang: &str) -> Option<egui::text::LayoutJob> {
+///
+/// `font_size` is threaded in rather than fixed here: the editor's face is a
+/// setting, and a highlighted buffer whose spans were laid out at a different
+/// size from the plain-text fallback would change size as you typed.
+pub fn ts_job(text: &str, lang: &str, font_size: f32) -> Option<egui::text::LayoutJob> {
     use egui::text::{LayoutJob, TextFormat};
     if text.len() > TS_LIMIT_BYTES || !text.is_char_boundary(text.len()) {
         return None;
@@ -127,7 +131,7 @@ pub fn ts_job(text: &str, lang: &str) -> Option<egui::text::LayoutJob> {
             let highlights = highlighter
                 .highlight(config, text.as_bytes(), None, None, |_| None)
                 .ok()?;
-            let mono = egui::FontId::monospace(13.0);
+            let mono = egui::FontId::monospace(font_size);
             let mut job = LayoutJob::default();
             let mut stack: Vec<(egui::Color32, bool)> = Vec::new();
             let normal = (egui::Color32::from_rgb(0xD5, 0xDA, 0xE2), false);

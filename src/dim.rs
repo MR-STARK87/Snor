@@ -44,6 +44,29 @@ impl DimManager {
         self.dim_level
     }
 
+    /// Set the level Dim Mode dims to, clamped to what WMI accepts.
+    ///
+    /// A plain setter rather than one that takes a backend: this module never
+    /// holds a display handle of its own, and [`DimManager::reapply`] is the
+    /// call that pushes a changed level at a screen that is dimmed right now.
+    pub fn set_dim_level(&mut self, level: u8) {
+        self.dim_level = crate::brightness::clamp_level(level);
+    }
+
+    /// Push the current level at the display, if it is dimmed right now.
+    ///
+    /// Without this the settings panel's level would be a control that only
+    /// takes effect the *next* time Dim Mode is toggled, while the screen in
+    /// front of the user stays at the old one.
+    pub fn reapply(&mut self, set: impl Fn(u8) -> Result<(), String>) {
+        if !self.is_active() {
+            return;
+        }
+        if let Err(e) = set(self.dim_level) {
+            self.notice = Some(e);
+        }
+    }
+
     /// A non-blocking status message from the last failed backend call, if
     /// any. The UI shows it in the status bar; it clears on the next toggle.
     pub fn notice(&self) -> Option<&str> {
@@ -244,6 +267,38 @@ mod tests {
         dim.deactivate(|v| fake.set(v));
         assert!(dim.is_active());
         assert!(dim.notice().is_some());
+    }
+
+    #[test]
+    fn changing_the_level_while_idle_touches_nothing() {
+        let fake = Fake::new(&[80]);
+        let mut dim = DimManager::new();
+        dim.set_dim_level(30);
+        dim.reapply(|v| fake.set(v));
+        assert!(fake.sets.borrow().is_empty(), "an idle screen must not move");
+        assert_eq!(dim.dim_level(), 30);
+    }
+
+    #[test]
+    fn changing_the_level_while_dimmed_applies_it_without_losing_the_restore() {
+        let fake = Fake::new(&[80]);
+        let mut dim = DimManager::new();
+        dim.activate(|| fake.get(), |v| fake.set(v));
+        dim.set_dim_level(30);
+        dim.reapply(|v| fake.set(v));
+        assert_eq!(*fake.sets.borrow(), vec![10, 30]);
+        // The way back is still the level from *before* Dim Mode, not 30.
+        dim.deactivate(|v| fake.set(v));
+        assert_eq!(*fake.sets.borrow(), vec![10, 30, 80]);
+    }
+
+    #[test]
+    fn a_level_outside_what_wmi_accepts_is_clamped() {
+        let mut dim = DimManager::new();
+        dim.set_dim_level(0);
+        assert_eq!(dim.dim_level(), 1, "0 would black the screen out");
+        dim.set_dim_level(200);
+        assert_eq!(dim.dim_level(), 100);
     }
 
     #[test]

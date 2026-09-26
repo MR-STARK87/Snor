@@ -40,7 +40,7 @@ without constantly switching tools.
   Enter, arrows, Tab, Backspace, Ctrl+C all reach it. It answers DSR/CPR/DA
   queries so PSReadLine never blocks.
 - Terminal history that is actually reachable: the wheel scrolls back through
-  1000 lines, find searches them (live output and history), and
+  1000 lines by default, find searches them (live output and history), and
   `Ctrl+Shift+C` copies the selection with the grid's padding trimmed off so it
   pastes cleanly. `Ctrl+wheel` zooms the grid text.
 - Attention flags: a shell that rings its bell or retitles itself since you
@@ -58,6 +58,12 @@ without constantly switching tools.
 - Dim Mode (`Ctrl+Shift+D`): lowers the physical backlight so long agent
   sessions can run with the screen dark. A moon in the status bar shows while
   active; machines without brightness control just get a notice.
+- A settings panel (the gear at the far right of the status bar) with eight
+  knobs: the shell a new tab starts, the terminal and editor font sizes,
+  scrollback rows, showing hidden files, whether the explorer follows the
+  focused shell, the dim level and the UI scale. It applies as you touch it and
+  writes `%APPDATA%\Snor\settings.toml`, so the sizes and zoom you chose come
+  back on the next launch.
 
 **A calm editor underneath**
 - Badge tabs, line-number gutter, tree-sitter highlighting (rust/json/js/toml
@@ -76,7 +82,7 @@ without constantly switching tools.
 - No git integration — use your own client. The status bar reads `.git/HEAD`
   for the branch name, which is one 40-byte file and not a client. No
   telemetry, no accounts, no cloud. No plugin system to feed.
-- ~11 MB release binary (strip + thin LTO). 86 tests, clippy clean on every
+- ~11 MB release binary (strip + thin LTO). 117 tests, clippy clean on every
   commit, CI on `main` and `dev`.
 
 ## Screenshots
@@ -190,7 +196,7 @@ PRs welcome. The rules are short:
 
 - One logical change per commit, `fix:` / `feat:` prefixes.
 - `cargo clippy --all-targets -- -D warnings` clean and `cargo test` green —
-  CI enforces both, and the bar is 66 passing tests.
+  CI enforces both, and the bar is 117 passing tests.
 - Keep it lean: no git integration, no telemetry, no emojis in code, commits,
   or docs.
 - GUI behavior can't be verified headlessly — rebuild, relaunch, confirm by

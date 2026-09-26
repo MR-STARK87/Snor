@@ -491,6 +491,32 @@ pub fn moon(painter: &Painter, rect: Rect, color: Color32) {
     painter.add(Shape::closed_line(pts, stroke));
 }
 
+/// Gear, for the settings panel.
+///
+/// The reference mock draws a settings gear in the far-right slot of its own
+/// status bar; Snor filled that slot with the terminal toggle, because the
+/// toggle was the only control it had. This is the glyph the slot was designed
+/// for, and it now sits beside that toggle.
+///
+/// A ring, eight radial teeth and a solid hub rather than a filled cog: at 20pt
+/// a filled gear closes its own notches up into a disc, and the ring keeps the
+/// middle visible over whatever the status bar is painted on.
+pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.5;
+    let stroke = Stroke::new(1.3, color);
+    let ring = s * 0.62;
+    let outer = s * 0.86;
+    let teeth = 8;
+    painter.circle_stroke(c, ring, stroke);
+    for i in 0..teeth {
+        let a = std::f32::consts::TAU * (i as f32 / teeth as f32) + std::f32::consts::FRAC_PI_8;
+        let dir = vec2(a.cos(), a.sin());
+        painter.line_segment([c + dir * (ring * 0.92), c + dir * outer], stroke);
+    }
+    painter.circle_filled(c, s * 0.17, color);
+}
+
 /// Circular arrow for "rescan the tree".
 pub fn refresh(painter: &Painter, rect: Rect, color: Color32) {
     let c = rect.center();

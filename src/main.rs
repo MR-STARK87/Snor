@@ -12,6 +12,7 @@ mod fonts;
 mod git;
 mod icons;
 mod mascot;
+mod settings;
 mod syntax;
 mod terminal;
 mod theme;

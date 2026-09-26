@@ -283,7 +283,7 @@ pub struct FileNode {
     pub children: Vec<FileNode>,
 }
 
-fn build_nodes(dir: &Path, depth: usize) -> Vec<FileNode> {
+fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
     if depth > 8 {
         return Vec::new();
     }
@@ -301,10 +301,16 @@ fn build_nodes(dir: &Path, depth: usize) -> Vec<FileNode> {
         if should_skip(&name) {
             continue;
         }
+        // Dotfiles are hidden by default, but only that: the skip list above is
+        // a performance decision (it is what keeps a `target/` out) and stays
+        // skipped even when the user asks to see hidden entries.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
         let path = entry.path();
         let is_dir = path.is_dir();
         if is_dir {
-            let children = build_nodes(&path, depth + 1);
+            let children = build_nodes(&path, depth + 1, show_hidden);
             dirs.push(FileNode {
                 path,
                 name,
@@ -339,6 +345,9 @@ pub struct FileTree {
     pub root: PathBuf,
     pub nodes: Vec<FileNode>,
     pub selected: Option<PathBuf>,
+    /// Show dotfiles in the listing. `target`/`.git`/`node_modules`/`.idea`
+    /// stay skipped either way — see [`build_nodes`].
+    pub show_hidden: bool,
     expanded: HashSet<PathBuf>,
     _watcher: Option<notify::RecommendedWatcher>,
     rx: Option<Receiver<notify::Result<notify::Event>>>,
@@ -388,12 +397,13 @@ impl FileTree {
             }
             Err(_) => None,
         };
-        let nodes = build_nodes(&root, 0);
+        let nodes = build_nodes(&root, 0, false);
         let mut expanded = HashSet::new();
         expanded.insert(root.clone());
         Self {
             root: root.clone(),
             nodes,
+            show_hidden: false,
             selected: None,
             expanded,
             _watcher: watcher,
@@ -470,8 +480,21 @@ impl FileTree {
         );
     }
 
+    /// Show or hide dotfiles, rebuilding only when the answer actually changed.
+    ///
+    /// Called from the settings panel every time it is touched, so the guard
+    /// matters: a rebuild re-reads the whole tree, and the panel is redrawn
+    /// every frame it is open.
+    pub fn set_show_hidden(&mut self, show: bool) {
+        if self.show_hidden == show {
+            return;
+        }
+        self.show_hidden = show;
+        self.refresh();
+    }
+
     pub fn refresh(&mut self) {
-        self.nodes = build_nodes(&self.root, 0);
+        self.nodes = build_nodes(&self.root, 0, self.show_hidden);
         self.needs_refresh = false;
         self.last_event = None;
     }
@@ -1105,7 +1128,7 @@ mod tests {
     #[test]
     fn lists_project_root() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let nodes = build_nodes(&root, 0);
+        let nodes = build_nodes(&root, 0, false);
         let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"Cargo.toml"), "names: {names:?}");
         assert!(names.contains(&"src"), "names: {names:?}");

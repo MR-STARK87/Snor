@@ -11,6 +11,16 @@ const PLAIN_HIGHLIGHT_BYTES: usize = 200_000;
 /// close to 1.2x, which is why our code looked cramped beside the mock.
 const CODE_LINE_H: f32 = 22.0;
 
+/// Code line spacing at a given face size.
+///
+/// [`CODE_LINE_H`] is the leading at the settings default; scaling it keeps the
+/// 1.6x ratio the reference measured at (27.5px between lines against a 17px
+/// ink height) when the panel changes the face, instead of a bigger font
+/// crowding its own rows together.
+fn code_line_h(font_size: f32) -> f32 {
+    CODE_LINE_H * (font_size / crate::settings::EDITOR_FONT_DEFAULT)
+}
+
 fn language_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -251,7 +261,12 @@ fn prompt_button_at(
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
+/// Keyword fallback highlighter.
+///
+/// `font_size` is threaded in rather than fixed here: the editor face is a
+/// setting, and this job is what `syntax::ts_job`'s spans are compared against,
+/// so a hardcoded size would make an unsupported file change size on open.
+pub fn highlight_job(text: &str, lang: &str, font_size: f32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
     if text.len() > PLAIN_HIGHLIGHT_BYTES {
@@ -260,14 +275,14 @@ pub fn highlight_job(text: &str, lang: &str) -> egui::text::LayoutJob {
             0.0,
             TextFormat {
                 color: color_normal(),
-                font_id: egui::FontId::monospace(13.0),
+                font_id: egui::FontId::monospace(font_size),
                 ..Default::default()
             },
         );
         return job;
     }
     let kw = keywords(lang);
-    let mono = egui::FontId::monospace(13.0);
+    let mono = egui::FontId::monospace(font_size);
     let fmt_normal = TextFormat {
         color: color_normal(),
         font_id: mono.clone(),
@@ -583,6 +598,8 @@ pub struct Editor {
     /// only "reloaded <file>" — the one case where the editor changed the text
     /// without the user typing, which is worth saying out loud.
     note: Option<(String, std::time::Instant)>,
+    /// Code face, in points. A setting; see [`Editor::set_font_size`].
+    font_size: f32,
 }
 
 impl Editor {
@@ -605,7 +622,21 @@ impl Editor {
             disk_checked: None,
             pending_close: None,
             note: None,
+            font_size: crate::settings::EDITOR_FONT_DEFAULT,
         }
+    }
+
+    /// Set the code face, clamped to the range the settings file allows.
+    ///
+    /// The leading follows the face through [`code_line_h`], so a larger font
+    /// gets proportionally more room and does not set its rows on top of each
+    /// other. Nothing is re-laid out here: the text edit's layouter is rebuilt
+    /// every frame, so the next frame already draws at the new size.
+    pub fn set_font_size(&mut self, points: f32) {
+        self.font_size = points.clamp(
+            crate::settings::EDITOR_FONT_MIN,
+            crate::settings::EDITOR_FONT_MAX,
+        );
     }
 
     pub fn open_file(&mut self, path: PathBuf) {
@@ -1267,6 +1298,12 @@ impl Editor {
         let line_count = buf.line_count();
         let editor_id = ui.make_persistent_id("snor_editor_text");
         let mut text_changed = false;
+        // Read once, before the closures below. `buf` holds a mutable borrow of
+        // `self.tabs`, so `self` cannot be asked for these later — and the
+        // gutter and the code have to agree on the face or the numbers drift
+        // off their rows.
+        let font_size = self.font_size;
+        let line_h = code_line_h(font_size);
         // Gutter + code share one vertical scroll so numbers stay glued to
         // rows; the code scrolls horizontally on its own. Wrapping is off
         // (one buffer line == one visual row) so the gutter can't drift.
@@ -1284,14 +1321,14 @@ impl Editor {
                             egui::UiBuilder::new()
                                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
                             |ui| {
-                                let mono = egui::FontId::monospace(13.0);
+                                let mono = egui::FontId::monospace(font_size);
                                 // The gutter has to advance in step with the
-                                // code, whose rows are forced to CODE_LINE_H.
+                                // code, whose rows are forced to `line_h`.
                                 // A label's own height comes from the font, so
                                 // the difference goes into the item spacing.
                                 let row = ui.ctx().fonts_mut(|f| f.row_height(&mono));
                                 ui.style_mut().spacing.item_spacing =
-                                    egui::vec2(0.0, (CODE_LINE_H - row).max(0.0));
+                                    egui::vec2(0.0, (line_h - row).max(0.0));
                                 for n in 1..=line_count {
                                     ui.label(
                                         egui::RichText::new(format!("{n:>4} "))
@@ -1309,8 +1346,11 @@ impl Editor {
                         .show(ui, |ui| {
                             let mut layouter =
                                 |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
-                                    let mut job = crate::syntax::ts_job(text.as_str(), &lang)
-                                        .unwrap_or_else(|| highlight_job(text.as_str(), &lang));
+                                    let mut job =
+                                        crate::syntax::ts_job(text.as_str(), &lang, font_size)
+                                            .unwrap_or_else(|| {
+                                                highlight_job(text.as_str(), &lang, font_size)
+                                            });
                                     job.wrap.max_width = f32::INFINITY;
                                     // The reference sets 27.5px between code
                                     // lines against a 17px ink height, i.e. a
@@ -1319,7 +1359,7 @@ impl Editor {
                                     // it. Set per section because that is where
                                     // the layout actually reads it from.
                                     for section in &mut job.sections {
-                                        section.format.line_height = Some(CODE_LINE_H);
+                                        section.format.line_height = Some(line_h);
                                     }
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
@@ -1464,15 +1504,17 @@ mod tests {
         // on .md files (README has an em-dash). Must survive multi-byte text.
         let text = "# title — with em-dash\ncafé \"naïve 🎉\" '#hash' // cömment\nlet x = 123;\nemoji 🎉 test — ok\n";
         for lang in ["md", "rust", "toml", "txt", "py", "js"] {
-            let job = highlight_job(text, lang);
+            let job = highlight_job(text, lang, crate::settings::EDITOR_FONT_DEFAULT);
             assert!(!job.sections.is_empty(), "empty job for {lang}");
         }
         // The real project README previously crashed the app on click.
         let readme = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
         if let Ok(contents) = std::fs::read_to_string(&readme) {
-            let _ = highlight_job(&contents, "md");
-            let _ = crate::syntax::ts_job(&contents, "md")
-                .unwrap_or_else(|| highlight_job(&contents, "md"));
+            let _ = highlight_job(&contents, "md", crate::settings::EDITOR_FONT_DEFAULT);
+            let _ = crate::syntax::ts_job(&contents, "md", crate::settings::EDITOR_FONT_DEFAULT)
+                .unwrap_or_else(|| {
+                    highlight_job(&contents, "md", crate::settings::EDITOR_FONT_DEFAULT)
+                });
         }
         // Opening it as a buffer must not error either.
         let mut ed = Editor::new();
