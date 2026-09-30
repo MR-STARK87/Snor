@@ -42,13 +42,13 @@ otherwise `cargo build` fails with `os error 5`.
 | `fonts.rs` | Vendors Space Grotesk (three static weights under `assets/fonts/`) and registers it as the *proportional* family, with egui's built-ins kept as fallbacks. Monospace is deliberately untouched — the gutter and the terminal grid depend on a fixed advance width. `MEDIUM`/`BOLD` are exposed as named families because `RichText::strong()` only swaps colour in egui, never the face. |
 | `app.rs` | Shell: title bar, left panel, status bar, center split (editor + terminal), global shortcuts (Ctrl+Tab terminal, Ctrl+B explorer), Run-button wiring (`editor.want_run` -> `terminal.send_line("cargo run")`). Owns `show_explorer` (the status-bar sidebar toggle). Editor renders before terminal every frame — terminal reads input events after the editor. |
 | `editor.rs` | Tabs (`OpenBuffer`), keyword-fallback highlighter, find (Ctrl+F), gutter, cursor readout (`cursor_line/col`), `want_run` flag. `ui(&mut self, ui, workdir)` — workdir seeds the `+` file picker. |
-| `file_tree.rs` | Explorer tree (depth cap 8, skips `target/.git/node_modules/.idea`, 2000-entry cap), create/rename/delete + confirm modal, `notify` watcher with 300ms debounce, `opened_file` handoff to the editor. |
+| `file_tree.rs` | Explorer tree (depth cap 8, skips `target/.git/node_modules/.idea`, 2000-entry cap), create/rename/delete + confirm modal, `notify` watcher with 300ms debounce, `opened_file` handoff to the editor. `empty()` is the no-folder state: nothing listed and nothing watched. |
 | `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback, selection, attention flag, shell and query-responder buffer. Tab strip spawns/switches/closes/renames shells; scrollback, copy, find, zoom and shell choice; `collapsed`/`fullscreen`/`hidden` + drag height. |
-| `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. |
+| `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. An empty root names no repository, which is load-bearing (see the folder section below). |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
 | `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
 | `settings.rs` | The user's nine scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a tenth or wiring one. `last_folder` is the ninth, and the only one the app writes itself.
-| `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
+| `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. Also the prompt buttons (accent primary against an outlined alternative), which the editor's empty state and the first-run screen both draw — one implementation, because two is how they drift. |
 
 ## The installer (`installer/`)
 
@@ -118,6 +118,12 @@ maximise and no resize bands — there is nothing to resize.
 `ui::primary_button` pairs `accent` with `on_accent` (the tab badges' pair)
 and keys its cursor off `contains_pointer` for the same long-press reason as
 `widgets::clickable_label`.
+
+The "Open Snor" hand-off sets the child's working directory to the install
+folder, which used to be how the app decided its workspace. It no longer is —
+the app asks for a folder on a first run and remembers it (see the folder
+section above) — so that directory is only where a shell starts before any
+folder has been chosen, which is a role the install folder fills perfectly.
 
 The wizard's own behaviour — pixels, the folder dialog, PowerShell's real
 output — needs a human look after a rebuild, like everything else GUI here.
@@ -666,7 +672,8 @@ with the process.
   asking of a path is answered where it is used — `is_dir`, in
   `resolve_workspace`. It is written even when empty, because `render` writes
   every key: "written as empty" is how the file says "none chosen" without a
-  second format, and the rendered header says clearing it starts over.
+  second format, and the rendered header tells a hand-editing user that clearing
+  it brings the first-run screen back.
 - **The panel applies as it is touched; there is no Apply button.** Snor has no
   navigation and every knob is one scalar, so a half-applied state would be
   worse than no panel. `SnorApp::settings_changed` re-applies the whole set —
@@ -703,9 +710,65 @@ with the process.
   Opening the panel is also where `settings.terminal_font` is reconciled with
   the live grid, so the slider starts from what is actually on screen.
 
+## The remembered folder and the first-run screen
+
+Snor used to open `std::env::current_dir()` as its workspace, and that is the
+bug this replaced: a working directory is a property of *how the process was
+started*, not of the user's work. A developer double-clicking `snor.exe` out of
+a build tree got that tree, and an installed user launched by the installer got
+the install folder. The rules that replaced it are all load-bearing:
+
+- **`last_folder` is the remembered choice; `tree.root` is not.** The explorer
+  is re-rooted on purpose by auto context switching, so `SnorApp::folder` is a
+  separate `Option<PathBuf>` and only a folder the *user* picked is written to
+  the file. An agent that `cd`s around must not rewrite what comes back next
+  launch.
+- **`resolve_workspace` is pure and has three outcomes**: a folder that is still
+  a directory reopens; one that has been moved or deleted asks again *and names
+  it* (`lost_folder`); nothing remembered asks. It never falls back to the
+  working directory — that fallback *is* the bug, and a test says so.
+- **`workdir()` is for commands, not for the workspace.** Shells, the Run
+  button and the file dialogs take the folder when there is one and the launch
+  directory when there is not, because a shell has to start somewhere. Nothing
+  that decides *what the user is working on* may read it. It returns an owned
+  `PathBuf` because a borrow taken from `self` cannot coexist with the mutable
+  borrow of the field being called on — `self.terminal.reveal(self.workdir())`
+  is E0502, and the old `&self.tree.root` only worked because two *disjoint
+  fields* can be borrowed at once.
+- **No folder means no tree at all.** `FileTree::empty()` lists nothing and,
+  the part that costs something every frame, *watches* nothing: the watch is
+  recursive from the root, so a placeholder root would watch an install folder
+  or an entire build tree for a window that is not showing either.
+- **Which is why `set_root` has to be able to *build* a watcher**
+  (`start_watching`, with the sender kept on the struct). A `set_root` that
+  only moved an existing watch would list the folder the user had just opened
+  and then never notice a file changing in it — the tree would go quiet exactly
+  when it started being useful. Guarded by
+  `opening_a_folder_from_the_first_run_screen_starts_a_watch`.
+- **`sync_context_root` returns early when there is no folder.**
+  `context_session` reports the first session on the first frame, so without
+  that guard the first-run screen would last exactly one frame before a shell's
+  directory replaced it: the same bug arriving by another door.
+- **An empty root names no repository** (`git::git_dir`).
+  `Path::new("").join(".git")` is the *relative* path `.git`, which the
+  filesystem resolves against the process working directory — which is how the
+  status bar briefly reported the branch of wherever the app had been launched
+  from, right next to a window claiming no folder was open.
+- **One funnel.** The explorer's header button and the first-run screen both go
+  through `open_folder` → `set_folder`, which is the only place that sets
+  `folder`, moves the tree, reveals the panel and marks the settings dirty. A
+  second path that forgets the last step is exactly the bug this shape exists to
+  prevent.
+
+The screen itself keeps the shell — an agent-driven workspace is useless
+without a way to run things — and gives way everywhere else: the editor, and
+the explorer, which is hidden outright rather than left empty. Its two actions
+are the app's own prompt buttons, lifted from the editor's empty state into
+`widgets` for exactly this reason.
+
 ## Tests
 
-- `cargo test` must stay green (110 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (115 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -750,8 +813,14 @@ with the process.
   HEAD, worktree `gitdir:` file, and every unreadable case) and the editor's
   `an_externally_rewritten_file_reloads_itself`,
   `a_dirty_buffer_reports_a_conflict_instead_of_reloading`,
-  `closing_a_tab_with_unsaved_edits_asks_first`. `a_folder_that_is_still_there_is_reopened`
-  is the same kind — a temp directory and a pure function.
+  `closing_a_tab_with_unsaved_edits_asks_first`. The remembered folder's own
+  tests are the same kind — `a_folder_that_is_still_there_is_reopened`,
+  `a_remembered_folder_that_is_gone_asks_again_by_name`,
+  `a_first_run_asks_rather_than_guessing_a_directory`,
+  `a_tree_with_no_folder_lists_nothing_and_watches_nothing`,
+  `opening_a_folder_from_the_first_run_screen_starts_a_watch` and
+  `an_empty_root_names_no_repository` — pure or temp-directory, none of them
+  needing a window.
 - **Scrollback, selection, find, attention, zoom and the shell menu are all GUI
   behaviour and cannot be verified headlessly.** The tests prove the state and
   the parsing; whether the wheel actually moves the view, whether the tint lands

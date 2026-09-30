@@ -47,6 +47,97 @@ pub fn clickable_label(ui: &mut egui::Ui, text: egui::RichText) -> egui::Respons
     resp
 }
 
+/// Padding and face for a prompt button, shared by the measuring pass and the
+/// painting pass so the two cannot drift apart.
+const PROMPT_PAD_X: f32 = 16.0;
+const PROMPT_PAD_Y: f32 = 7.0;
+const PROMPT_FONT: f32 = 13.0;
+
+/// Width a prompt button will occupy, so a row of them can be centred before
+/// any of them has been laid out.
+pub fn prompt_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(PROMPT_FONT),
+        egui::Color32::WHITE,
+    );
+    PROMPT_PAD_X * 2.0 + galley.size().x
+}
+
+/// Height of a prompt button. Both take this so the pair line up.
+pub fn prompt_button_height(ui: &egui::Ui) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        "X".to_owned(),
+        egui::FontId::proportional(PROMPT_FONT),
+        egui::Color32::WHITE,
+    );
+    PROMPT_PAD_Y * 2.0 + galley.size().y
+}
+
+/// One action in an empty state, painted into a rect the caller has already
+/// reserved.
+///
+/// The rect is passed in rather than allocated here because buttons are
+/// centred as a *pair*. Laying them out with
+/// `Layout::left_to_right(Align::Center)` looks like the obvious way to do
+/// that, but egui sizes such a frame to the whole available height
+/// (`Layout::next_frame_ignore_wrap`: a horizontal layout whose vertical align
+/// is `Center` fills the height) and then `Placer::advance_after_rects`
+/// expands the parent to the whole frame. The row therefore sank to the middle
+/// of the pane and swallowed the space the tertiary link below it needed, so
+/// the link was laid out past the bottom and clipped away. Reserving one rect
+/// and dividing it keeps the row's height exactly the button height.
+///
+/// `primary` fills with the accent and knocks the label out of it; the other is
+/// outlined. That asymmetry is the point — the two are a recommendation and an
+/// alternative, not two equal choices.
+///
+/// Lives here rather than in the editor because the first-run screen draws the
+/// same pair, and two implementations of one button is how the two drift.
+pub fn prompt_button_at(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    primary: bool,
+) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(label), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let color = if primary {
+            crate::theme::on_accent()
+        } else {
+            crate::theme::text()
+        };
+        let fill = if primary {
+            if resp.hovered() {
+                crate::theme::accent().gamma_multiply(1.18)
+            } else {
+                crate::theme::accent()
+            }
+        } else if resp.hovered() {
+            egui::Color32::from_rgb(0x25, 0x38, 0x2E)
+        } else {
+            crate::theme::tab_active()
+        };
+        painter.rect_filled(rect, 7.0, fill);
+        if !primary {
+            painter.rect_stroke(
+                rect,
+                7.0,
+                egui::Stroke::new(1.0, crate::theme::hairline()),
+                egui::StrokeKind::Middle,
+            );
+        }
+        let galley = painter.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(PROMPT_FONT),
+            color,
+        );
+        painter.galley(rect.center() - galley.size() * 0.5, galley, color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

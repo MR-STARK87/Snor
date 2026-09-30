@@ -61,7 +61,7 @@ enum Startup {
     /// The remembered folder is still a directory: reopen it.
     Folder(PathBuf),
     /// A folder was remembered but is not there any more — moved, deleted,
-    /// renamed, or on a drive that is not mounted.
+    /// renamed, or on a drive that is not mounted. Ask, and say which one.
     Missing(PathBuf),
     /// Nothing has ever been opened, or the key was cleared by hand.
     FirstRun,
@@ -73,8 +73,10 @@ enum Startup {
 /// The working directory is a property of how the process happened to be
 /// started, not of the user's work: a developer double-clicking `snor.exe` out
 /// of a build tree got that tree as their workspace, and an installed user
-/// launched by the installer got the install folder. The remembered folder is
-/// the only answer available that is about the user.
+/// launched by the installer got the install folder. Worse, `FileTree` watches
+/// its root recursively, so the first case also meant watching a whole build
+/// tree. The remembered folder is the only answer available that is about the
+/// user.
 ///
 /// Pure, so every branch is testable without a window, a settings file, or a
 /// directory that has to exist beforehand.
@@ -165,6 +167,27 @@ const RESIZE_BAND: f32 = 5.0;
 
 pub struct SnorApp {
     tree: FileTree,
+    /// The folder the user opened, and the only one that is remembered.
+    ///
+    /// `None` is the first-run state: the centre of the window is an
+    /// invitation to pick one and the explorer is not drawn at all.
+    ///
+    /// Deliberately *not* `tree.root`. That is the explorer's live root, which
+    /// the focused terminal re-roots on purpose (see
+    /// [`SnorApp::sync_context_root`]), so it says where the app is looking
+    /// right now — not what the user chose, and not what should come back.
+    folder: Option<PathBuf>,
+    /// A remembered folder that was not a directory at startup, kept so the
+    /// first-run screen can name the one it is asking about instead of asking
+    /// a question it cannot explain.
+    lost_folder: Option<PathBuf>,
+    /// The directory this process was started in, read once at startup.
+    ///
+    /// A fallback for *commands* only — see [`SnorApp::workdir`]. Captured
+    /// rather than re-read because a `cwd` is a property of how the process was
+    /// started, and the one thing this change exists to stop is treating it as
+    /// a statement about the user's work.
+    start_cwd: PathBuf,
     editor: Editor,
     terminal: Terminal,
     /// Dim Mode: lowers the display backlight while agents keep running.
@@ -251,16 +274,21 @@ impl SnorApp {
         // grid that resized under the first prompt would look like a bug.
         let settings = Settings::load();
         cc.egui_ctx.set_zoom_factor(settings.ui_scale);
-        // Reopen the folder from last time when there is one. With nothing
-        // remembered this is the launch directory, which is what this app has
-        // always done — the point of `last_folder` is that the guess stops
-        // mattering from the second launch onwards.
         let start_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let folder = match resolve_workspace(settings.last_folder.as_deref()) {
-            Startup::Folder(path) => Some(path),
-            Startup::Missing(_) | Startup::FirstRun => None,
+        // The remembered folder, or the invitation to pick one. See
+        // `resolve_workspace` for why this is not the working directory.
+        let (folder, lost_folder) = match resolve_workspace(settings.last_folder.as_deref()) {
+            Startup::Folder(path) => (Some(path), None),
+            Startup::Missing(path) => (None, Some(path)),
+            Startup::FirstRun => (None, None),
         };
-        let mut tree = FileTree::new(folder.clone().unwrap_or_else(|| start_cwd.clone()));
+        // No folder means no tree at all: nothing listed and, deliberately,
+        // nothing watched (`FileTree::empty`). A placeholder root here would be
+        // watching a directory the window is not showing.
+        let mut tree = match &folder {
+            Some(root) => FileTree::new(root.clone()),
+            None => FileTree::empty(),
+        };
         tree.set_show_hidden(settings.show_hidden);
         let mut editor = Editor::new();
         editor.set_font_size(settings.editor_font);
@@ -272,6 +300,9 @@ impl SnorApp {
         dim.set_dim_level(settings.dim_level);
         Self {
             tree,
+            folder,
+            lost_folder,
+            start_cwd,
             editor,
             terminal,
             dim,
@@ -308,13 +339,15 @@ impl SnorApp {
     /// elsewhere — has to re-read immediately, or the bar spends a moment
     /// claiming the previous project's branch.
     /// Adopt a folder the user picked: point the tree at it, show the panel,
-    /// and remember it for next launch.
+    /// and remember it.
     fn set_folder(&mut self, dir: PathBuf) {
+        self.folder = Some(dir.clone());
+        self.lost_folder = None;
         self.tree.set_root(dir.clone());
         // A user who has just chosen a folder wants to see it. This is also why
         // the flag is not merely left alone: `Ctrl+B` hides the explorer, and
-        // opening a folder has to bring it back or the choice looks like it did
-        // nothing.
+        // opening a folder from the first-run screen has to bring it back or
+        // the choice looks like it did nothing.
         self.show_explorer = true;
         // Written by the existing flush rather than here: a folder is a discrete
         // event, and `settings_dirty` is cleared once the pointer is off
@@ -324,19 +357,44 @@ impl SnorApp {
     }
 
     /// Ask for a folder. The one funnel for every entry point — the explorer's
-    /// header button and anything added later — so that "opening a folder" means
-    /// the same thing everywhere: the tree moves, the panel appears, and the
-    /// choice is remembered for next time. A second path that forgets the last
-    /// step is the bug this shape exists to prevent.
+    /// header button, the first-run screen, and anything added later — so that
+    /// "opening a folder" means the same thing everywhere: the tree moves, the
+    /// panel appears, and the choice is remembered for next time.
     fn open_folder(&mut self) {
+        // Copied out rather than borrowed through the call: the `FileDialog`
+        // temporary would otherwise live to the end of the `if let` and keep
+        // `&self` borrowed across `set_folder`.
+        let start = self.workdir().to_path_buf();
         if let Some(dir) = rfd::FileDialog::new()
-            .set_directory(self.tree.root.clone())
+            .set_directory(start)
             .pick_folder()
         {
             self.set_folder(dir);
         }
     }
 
+    /// Where a shell, a dialog or the Run button starts: the folder when there
+    /// is one, and the launch directory when there is not.
+    ///
+    /// That fallback is right for a *command* — a shell has to start somewhere,
+    /// and the install folder is a perfectly good somewhere — and it is exactly
+    /// why it must never reach the explorer. "A sensible directory to run a
+    /// command in" and "the user's project" are different questions, and
+    /// conflating them is what this change is about.
+    ///
+    /// Owned rather than borrowed, which is not a style choice: a `&PathBuf`
+    /// taken from `self` cannot coexist with the mutable borrow of the field
+    /// being called on (`self.terminal.reveal(self.workdir())` is E0502 — the
+    /// receiver's borrow of `self.terminal` and the argument's borrow of all of
+    /// `self` overlap, and two-phase borrows do not rescue it). The old code got
+    /// away with `&self.tree.root` only because two *disjoint fields* can be
+    /// borrowed at once, and a method call is not a field.
+    ///
+    /// One `PathBuf` clone per action, and one per frame for the two panes that
+    /// always draw — nothing next to the copy a single pty spawn costs.
+    fn workdir(&self) -> PathBuf {
+        self.folder.clone().unwrap_or_else(|| self.start_cwd.clone())
+    }
     fn poll_branch(&mut self) {
         const POLL: std::time::Duration = std::time::Duration::from_secs(2);
         let due = self.branch_root != self.tree.root
@@ -1071,7 +1129,8 @@ impl SnorApp {
                             // entirely, so un-hiding has to ask for a shell rather
                             // than just flipping a flag.
                             if self.terminal.hidden {
-                                self.terminal.reveal(&self.tree.root);
+                                let workdir = self.workdir();
+                                self.terminal.reveal(&workdir);
                             } else {
                                 self.terminal.hidden = true;
                             }
@@ -1142,6 +1201,115 @@ impl SnorApp {
     /// requested, so a short editor used to collapse the column and leave the
     /// divider stranded at the top — dragging it changed the terminal height
     /// while the divider itself never moved.
+    /// What the window shows until a folder has been chosen.
+    ///
+    /// The shell stays. An agent-driven workspace is useless without a way to
+    /// run things, and someone who has not picked a folder yet can still be
+    /// typing. Everything else gives way — the editor, the explorer — because a
+    /// tree of one folder and a prompt to pick a folder are two answers to the
+    /// same question and only one of them is true.
+    ///
+    /// Laid out like the editor's empty state (a third down, one reserved rect
+    /// for the button row, the shared prompt buttons) because it is the same
+    /// screen asking a different question, and two layouts for one position is
+    /// how they drift apart.
+    fn first_run(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::both()
+            .id_salt("snor_first_run")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    // Roughly a third down, which reads as centred without
+                    // needing the content's measured height.
+                    ui.add_space((ui.available_height() * 0.3).max(24.0));
+
+                    let (glyph, _) =
+                        ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                    if ui.is_rect_visible(glyph) {
+                        crate::icons::folder_open(
+                            &ui.painter_at(glyph),
+                            egui::Rect::from_center_size(glyph.center(), egui::vec2(30.0, 26.0)),
+                            theme::faint(),
+                        );
+                    }
+
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("Open a folder")
+                            .size(17.0)
+                            .family(theme::medium())
+                            .color(theme::text()),
+                    );
+                    ui.add_space(8.0);
+                    // Two different situations, so two different explanations. A
+                    // first run has nothing to explain; a lost folder is only
+                    // confusing if the app does not say which one went missing.
+                    match &self.lost_folder {
+                        Some(path) => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "The folder Snor remembered is not there any more.",
+                                )
+                                .size(12.5)
+                                .color(theme::dim_text()),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(path.display().to_string())
+                                    .size(12.0)
+                                    .color(theme::faint()),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Pick the project you want to work in. Snor will open the same \
+                                     one next time.",
+                                )
+                                .size(12.5)
+                                .color(theme::dim_text()),
+                            );
+                        }
+                    }
+                    ui.add_space(22.0);
+
+                    let gap = 10.0;
+                    let w_folder = crate::widgets::prompt_button_width(ui, "Open Folder…");
+                    let w_file = crate::widgets::prompt_button_width(ui, "Open a file instead…");
+                    let h = crate::widgets::prompt_button_height(ui);
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(w_folder + gap + w_file, h),
+                        egui::Sense::hover(),
+                    );
+                    let folder_rect = egui::Rect::from_min_size(row.min, egui::vec2(w_folder, h));
+                    let file_rect = egui::Rect::from_min_size(
+                        egui::pos2(row.min.x + w_folder + gap, row.min.y),
+                        egui::vec2(w_file, h),
+                    );
+                    if crate::widgets::prompt_button_at(ui, folder_rect, "Open Folder…", true)
+                        .clicked()
+                    {
+                        self.open_folder();
+                    }
+                    if crate::widgets::prompt_button_at(ui, file_rect, "Open a file instead…", false)
+                        .clicked()
+                    {
+                        // A file is not a folder, and pretending otherwise would be
+                        // worse than saying so: the file opens, the tree stays
+                        // empty and nothing is remembered — so the next launch
+                        // asks again, which is the truth.
+                        let start = self.workdir().to_path_buf();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_directory(start)
+                            .pick_file()
+                        {
+                            self.editor.open_file(path);
+                        }
+                    }
+                });
+            });
+    }
+
     fn workspace(&mut self, ui: &mut egui::Ui) {
         if self.flow {
             self.flow_workspace(ui);
@@ -1151,6 +1319,9 @@ impl SnorApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             let column = ui.available_rect_before_wrap();
+            // One read of the working directory for the whole column: the two
+            // panes below both need it, and reading it per pane is a clone each.
+            let workdir = self.workdir();
             // No quote rail. The reference parks two aphorisms in a 147pt
             // column down the right-hand edge, but a whole column of chrome
             // for decoration is not worth the horizontal space an editor
@@ -1203,7 +1374,15 @@ impl SnorApp {
                     egui::UiBuilder::new()
                         .max_rect(editor_rect)
                         .layout(top_down),
-                    |ui| self.editor.ui(ui, &self.tree.root),
+                    |ui| {
+                        // With no folder there is no editor inviting anyone into
+                        // an empty tab strip; the first-run screen replaces it.
+                        if self.folder.is_some() {
+                            self.editor.ui(ui, &workdir);
+                        } else {
+                            self.first_run(ui);
+                        }
+                    },
                 );
             }
             if show_term {
@@ -1214,7 +1393,7 @@ impl SnorApp {
                     .rect_filled(term_rect, 0.0, theme::surface_recessed());
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(term_rect).layout(top_down),
-                    |ui| self.terminal.ui(ui, &self.tree.root),
+                    |ui| self.terminal.ui(ui, &workdir),
                 );
             }
         });
@@ -1262,8 +1441,8 @@ impl SnorApp {
     /// sits untouched in `self`, so leaving restores the exact arrangement.
     fn flow_workspace(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            let root = self.tree.root.clone();
-            self.terminal.flow_ui(ui, &root);
+            let workdir = self.workdir();
+            self.terminal.flow_ui(ui, &workdir);
         });
     }
 
@@ -1277,8 +1456,8 @@ impl SnorApp {
 
     fn enter_flow(&mut self) {
         self.flow = true;
-        let root = self.tree.root.clone();
-        self.terminal.flow_enter(&root);
+        let workdir = self.workdir();
+        self.terminal.flow_enter(&workdir);
     }
 
     fn exit_flow(&mut self) {
@@ -1316,6 +1495,15 @@ impl SnorApp {
         // a user who turned this off is asking for the folder *they* picked to
         // stay put while focus moves between shells.
         if !self.settings.follow_terminal {
+            return;
+        }
+        // No folder means there is nothing to follow *to*. The first-run screen
+        // is the answer, and a shell spawning in the launch directory must not
+        // silently replace it with a tree of wherever the process was started —
+        // which is the bug this whole change is about, arriving by another
+        // door: `context_session` reports the first session on the first frame,
+        // so without this guard the welcome screen would last one frame.
+        if self.folder.is_none() {
             return;
         }
         let Some((id, cwd)) = self.terminal.context_session(self.flow) else {
@@ -1384,7 +1572,8 @@ impl eframe::App for SnorApp {
             self.editor.open_file(opened);
         }
         if std::mem::take(&mut self.editor.want_run) {
-            self.terminal.send_line("cargo run", &self.tree.root);
+            let workdir = self.workdir();
+            self.terminal.send_line("cargo run", &workdir);
         }
         // The empty editor's two actions. The editor has no handle on the file
         // tree, so it raises a flag and the shell does the work. Both reveal
@@ -1421,7 +1610,8 @@ impl eframe::App for SnorApp {
             // tab takes the whole section away, and this brings it back with a
             // fresh shell rather than an empty strip.
             if self.terminal.hidden {
-                self.terminal.reveal(&self.tree.root);
+                let workdir = self.workdir();
+                self.terminal.reveal(&workdir);
             } else {
                 self.terminal.hidden = true;
             }
@@ -1535,8 +1725,8 @@ impl eframe::App for SnorApp {
             ))
         }) {
             self.enter_flow();
-            let root = self.tree.root.clone();
-            self.terminal.flow_add_pane(&root);
+            let workdir = self.workdir();
+            self.terminal.flow_add_pane(&workdir);
         }
         if ui.input_mut(|i| {
             i.consume_shortcut(&egui::KeyboardShortcut::new(
@@ -1545,8 +1735,8 @@ impl eframe::App for SnorApp {
             ))
         }) {
             self.enter_flow();
-            let root = self.tree.root.clone();
-            self.terminal.flow_add_pane(&root);
+            let workdir = self.workdir();
+            self.terminal.flow_add_pane(&workdir);
         }
         // New terminal pane. Flow-only: normal mode already grows shells
         // through the tab strip's `+`, and this must not invent a second
@@ -1559,8 +1749,8 @@ impl eframe::App for SnorApp {
                 ))
             })
         {
-            let root = self.tree.root.clone();
-            self.terminal.flow_add_pane(&root);
+            let workdir = self.workdir();
+            self.terminal.flow_add_pane(&workdir);
         }
         // Close the focused pane. Flow-only: outside Flow Mode Ctrl+W-family
         // chords belong to shells and the editor, not to us.
@@ -1633,8 +1823,8 @@ impl eframe::App for SnorApp {
         self.status_bar(ui);
 
         // The header's folder button, through the one funnel — so a folder
-        // opened from here is remembered exactly like one opened anywhere else,
-        // and there is no second path that can forget.
+        // opened from here is remembered exactly like one opened from the
+        // first-run screen, and there is no second path that can forget.
         if self.tree.take_open_request() {
             self.open_folder();
         }
@@ -1642,7 +1832,12 @@ impl eframe::App for SnorApp {
         let mut panel_rect = None;
         // The explorer hides with everything else in Flow Mode; the flag
         // and width are left alone so the panel returns exactly as it was.
-        if self.show_explorer && !self.flow {
+        //
+        // And it is hidden outright while no folder is open: a tree with no
+        // root has nothing to say, and the first-run screen in the centre owns
+        // the question. `Ctrl+B` still moves the flag, so the panel comes back
+        // at its old width the moment a folder is opened.
+        if self.show_explorer && !self.flow && self.folder.is_some() {
             let panel = egui::Panel::left("snor_tree")
                 .exact_size(self.tree_w)
                 .resizable(false)
@@ -1758,6 +1953,23 @@ mod tests {
             Startup::Folder(dir.clone())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Moved, deleted, or on a drive that is not mounted. Ask again, and the
+    /// first-run screen names the one it is asking about.
+    #[test]
+    fn a_remembered_folder_that_is_gone_asks_again_by_name() {
+        let gone = std::env::temp_dir().join("snor-app-no-such-folder");
+        let _ = std::fs::remove_dir_all(&gone);
+        assert_eq!(resolve_workspace(Some(&gone)), Startup::Missing(gone));
+    }
+
+    /// A first run asks. It must *not* fall back to the working directory:
+    /// that fallback is what put a developer's build tree, and an installed
+    /// user's install folder, on screen as "the workspace".
+    #[test]
+    fn a_first_run_asks_rather_than_guessing_a_directory() {
+        assert_eq!(resolve_workspace(None), Startup::FirstRun);
     }
 
     /// The live numbers this was written against: a 1920x1080 monitor at 125%

@@ -247,7 +247,7 @@ impl Settings {
         out.push_str("# Snor settings. Edit freely; the app rewrites this file.\n");
         out.push_str("# Ranges: terminal_font 8-28, editor_font 9-28, ");
         out.push_str("scrollback 100-100000, ui_scale 0.8-1.6, dim_level 1-100.\n\n");
-        out.push_str("# last_folder is the folder Snor reopens; clear it to start over.\n\n");
+        out.push_str("# last_folder is written when you open a folder; clear it to be asked again.\n\n");
         for key in KEYS {
             if let Some(value) = self.value_for(key) {
                 out.push_str(&format!("{key} = {value}\n"));

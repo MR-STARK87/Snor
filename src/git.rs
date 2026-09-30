@@ -27,6 +27,16 @@ const HEAD: &str = "HEAD";
 /// directory holding the file — which is why it is resolved here rather than
 /// handed to the filesystem as-is.
 fn git_dir(root: &Path) -> Option<PathBuf> {
+    // An empty root names no directory, and this is not a defensive nicety:
+    // `Path::new("").join(".git")` is the *relative* path `.git`, which the
+    // filesystem resolves against the process working directory. With no folder
+    // open the tree's root is empty, and the status bar duly reported the branch
+    // of whatever directory the app happened to be launched from — the same
+    // working-directory leak this whole change exists to close, arriving through
+    // a different door. No root, no repository.
+    if root.as_os_str().is_empty() {
+        return None;
+    }
     let dot = root.join(".git");
     if dot.is_dir() {
         return Some(dot);
@@ -90,6 +100,15 @@ mod tests {
         let git = dir.join(".git");
         std::fs::create_dir_all(&git).unwrap();
         std::fs::write(git.join(HEAD), text).unwrap();
+    }
+
+    /// A first run has no folder, so the tree's root is empty — and an empty
+    /// root must name no repository. This only fails if the guard is gone *and*
+    /// the tests are run from inside a checkout, which is exactly the situation
+    /// that produced the wrong branch name in the status bar.
+    #[test]
+    fn an_empty_root_names_no_repository() {
+        assert!(branch(Path::new("")).is_none());
     }
 
     #[test]

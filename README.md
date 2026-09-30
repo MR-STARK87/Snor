@@ -77,10 +77,10 @@ without constantly switching tools.
   Closing a tab, or the window, with unsaved work asks first.
 - File tree with create/rename/delete, auto-refresh via a filesystem watcher,
   and a resizable, collapsible explorer (`Ctrl+B`).
-- It remembers the folder you opened and reopens it on the next launch. The
-  working directory is a property of how the app was started — a build tree, an
-  install folder, wherever you double-clicked from — and it is not an answer to
-  "what are you working on".
+- It remembers the folder you opened and reopens it next launch, and on a first
+  run it asks for one instead of guessing. The working directory is a property
+  of how the app was started — a build tree, an install folder, wherever you
+  double-clicked from — and it is not an answer to "what are you working on".
 
 **Deliberately lean**
 - No git integration — use your own client. The status bar reads `.git/HEAD`
@@ -119,6 +119,9 @@ cargo run --release
 Debug builds keep a console window for logs; release builds hide it. Open a
 folder from the top bar, open a terminal with `Ctrl+Tab`, and run your agent
 of choice inside (the author drives it with `opencode`).
+
+The first launch asks which folder to open and remembers it from then on, so
+the second one is already in your project.
 
 ## Building the installer
 

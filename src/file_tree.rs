@@ -310,6 +310,10 @@ pub struct FileTree {
     pub show_hidden: bool,
     expanded: HashSet<PathBuf>,
     _watcher: Option<notify::RecommendedWatcher>,
+    /// Kept so a watcher can be built *after* construction — see
+    /// [`FileTree::start_watching`], which is what makes a folder opened from
+    /// the first-run screen watched rather than merely listed.
+    tx: Sender<notify::Result<notify::Event>>,
     rx: Option<Receiver<notify::Result<notify::Event>>>,
     last_event: Option<Instant>,
     needs_refresh: bool,
@@ -340,38 +344,49 @@ pub struct FileTree {
 }
 
 impl FileTree {
+    /// A tree rooted at a folder: listed, and watched.
     pub fn new(root: PathBuf) -> Self {
+        Self::build(Some(root))
+    }
+
+    /// A tree with no folder open.
+    ///
+    /// Nothing listed, and — the part that matters — **nothing watched**. The
+    /// watcher is recursive from the root, so a tree built with a placeholder
+    /// root would be watching a directory the app is not even showing: a first
+    /// run watching the install folder (or, for a developer, a whole build
+    /// tree) and paying a wake-up for every file in it. Until a folder is
+    /// opened with [`FileTree::set_root`], there is no root to watch.
+    pub fn empty() -> Self {
+        Self::build(None)
+    }
+
+    fn build(root: Option<PathBuf>) -> Self {
         let (tx, rx): (
             Sender<notify::Result<notify::Event>>,
             Receiver<notify::Result<notify::Event>>,
         ) = std::sync::mpsc::channel();
-        let watcher = match notify::recommended_watcher(move |ev| {
-            let _ = tx.send(ev);
-        }) {
-            Ok(mut w) => {
-                if w.watch(&root, RecursiveMode::Recursive).is_ok() {
-                    Some(w)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-        let nodes = build_nodes(&root, 0, false);
+        let nodes = root
+            .as_ref()
+            .map(|root| build_nodes(root, 0, false))
+            .unwrap_or_default();
         let mut expanded = HashSet::new();
-        expanded.insert(root.clone());
-        Self {
-            root: root.clone(),
+        if let Some(root) = &root {
+            expanded.insert(root.clone());
+        }
+        let mut tree = Self {
+            root: root.clone().unwrap_or_default(),
             nodes,
             show_hidden: false,
             selected: None,
             expanded,
-            _watcher: watcher,
+            _watcher: None,
+            tx,
             rx: Some(rx),
             last_event: None,
             needs_refresh: false,
             create_mode: None,
-            create_parent: root,
+            create_parent: root.unwrap_or_default(),
             create_name: String::new(),
             inline_focus_pending: false,
             rename_target: None,
@@ -381,6 +396,32 @@ impl FileTree {
             terminal_here: None,
             error: None,
             opened_file: None,
+        };
+        tree.start_watching();
+        tree
+    }
+
+    /// Start watching `self.root`, unless something already is.
+    ///
+    /// A method rather than a constructor detail because there are two ways to
+    /// reach a root that needs a watcher: the constructor, and `set_root` on a
+    /// tree that began with no folder at all. The second is the one that is easy
+    /// to miss and was missed — the first-run screen's tree has no watcher by
+    /// design, so a `set_root` that only *moves* an existing watch would list the
+    /// folder the user just opened and then never notice a file changing in it.
+    /// `set_root` therefore re-watches when it has a watcher and calls this when
+    /// it does not, and the no-op early return is what keeps the two paths from
+    /// stacking two watchers on one root.
+    fn start_watching(&mut self) {
+        if self._watcher.is_some() || self.root.as_os_str().is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        if let Ok(mut watcher) = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        }) {
+            let _ = watcher.watch(&self.root, RecursiveMode::Recursive);
+            self._watcher = Some(watcher);
         }
     }
 
@@ -409,7 +450,12 @@ impl FileTree {
         }
     }
 
+    /// Point the tree at a folder: watch it, list it, and drop every
+    /// interaction that belonged to the old one.
     pub fn set_root(&mut self, root: PathBuf) {
+        // Move the watch when there is one. Unwatching alone would leave the new
+        // root unwatched — the tree would go quiet on a folder the user can see,
+        // and the first external edit would never arrive.
         if let Some(w) = self._watcher.as_mut() {
             let _ = w.unwatch(&self.root);
             let _ = w.watch(&root, RecursiveMode::Recursive);
@@ -425,6 +471,9 @@ impl FileTree {
         self.delete_target = None;
         self.error = None;
         self.opened_file = None;
+        // And build one when there was none — the first-run screen's tree, whose
+        // folder arrives here. A no-op when the watch was moved above.
+        self.start_watching();
         self.refresh();
     }
 
@@ -585,10 +634,20 @@ impl FileTree {
     /// entirely when it is collapsed.
     fn render_root_row(&mut self, ui: &mut egui::Ui) -> bool {
         let root = self.root.clone();
+        // The panel is hidden while no folder is open, so this normally has a
+        // real root — but an empty heading is the one thing that would look
+        // broken if a future path drew the panel anyway, so it says what it is.
         let name = root
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.display().to_string());
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                if root.as_os_str().is_empty() {
+                    "no folder open".to_string()
+                } else {
+                    root.display().to_string()
+                }
+            });
         let base = ui.cursor().left();
         let row_w = ui.available_width().max(80.0);
         let (row, resp) = ui.allocate_exact_size(egui::vec2(row_w, ROW_H), egui::Sense::click());
@@ -1001,6 +1060,40 @@ impl FileTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first-run screen depends on this: no folder means no listing, and —
+    /// the part that costs something every frame — no recursive watch on a
+    /// directory the app is not even showing.
+    #[test]
+    fn a_tree_with_no_folder_lists_nothing_and_watches_nothing() {
+        let tree = FileTree::empty();
+        assert!(tree.root.as_os_str().is_empty(), "an empty tree has no root");
+        assert!(tree.nodes.is_empty(), "nothing to list");
+        assert!(tree.expanded.is_empty(), "nothing expanded");
+        assert!(tree._watcher.is_none(), "no folder means no recursive watch");
+    }
+
+    /// The first-run screen's tree has no watcher, so this is the path that has
+    /// to *build* one. A folder opened from there must be watched, not merely
+    /// listed — otherwise the first agent that edits a file in it is invisible,
+    /// and the tree quietly stops being the thing that notices.
+    #[test]
+    fn opening_a_folder_from_the_first_run_screen_starts_a_watch() {
+        let dir = std::env::temp_dir().join(format!("snor-tree-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("a.txt"), "hi").expect("write a file");
+
+        let mut tree = FileTree::empty();
+        assert!(tree._watcher.is_none(), "a first run watches nothing");
+        tree.set_root(dir.clone());
+        assert!(
+            tree._watcher.is_some(),
+            "the folder it was just given must be watched"
+        );
+        assert!(!tree.nodes.is_empty(), "and listed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Regression: files used to skip the chevron column in the wrong place, so
     /// a child row's badge landed *left* of its parent's folder glyph.
