@@ -16,3 +16,5 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: cargo clippy -p snor-installer --all-targets -- -D warnings
+      - run: cargo test -p snor-installer

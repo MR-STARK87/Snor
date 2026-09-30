@@ -1,0 +1,22 @@
+[package]
+name = "snor-installer"
+version = "0.1.0"
+edition = "2024"
+description = "Snor Setup: the install and uninstall wizard, in the app's own design language"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# `snor-setup` is the wizard; `snor-pack` appends the app to it so the shipped
+# artifact is one file. See installer/README.md for the whole flow.
+[[bin]]
+name = "snor-setup"
+path = "src/main.rs"
+
+[[bin]]
+name = "snor-pack"
+path = "src/bin/snor-pack.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+rfd = "0.17.2"

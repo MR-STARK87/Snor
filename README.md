@@ -82,8 +82,8 @@ without constantly switching tools.
 - No git integration — use your own client. The status bar reads `.git/HEAD`
   for the branch name, which is one 40-byte file and not a client. No
   telemetry, no accounts, no cloud. No plugin system to feed.
-- ~11 MB release binary (strip + thin LTO). 106 tests, clippy clean on every
-  commit, CI on `main` and `dev`.
+- ~11 MB release binary (strip + thin LTO). 106 app tests plus 19 installer
+  tests, clippy clean on every commit, CI on `main` and `dev`.
 
 ## Screenshots
 
@@ -115,6 +115,24 @@ cargo run --release
 Debug builds keep a console window for logs; release builds hide it. Open a
 folder from the top bar, open a terminal with `Ctrl+Tab`, and run your agent
 of choice inside (the author drives it with `opencode`).
+
+## Building the installer
+
+The setup wizard lives in `installer/` — a second crate in the same workspace,
+wearing the app's own palette and window chrome (it compiles `theme.rs`,
+`fonts.rs` and `icons.rs` straight out of `src/`, so the two can never drift).
+It packs to a single distributable file:
+
+```powershell
+cargo build --release                        # the app
+cargo build --release -p snor-installer      # the wizard and the packer
+target/release/snor-pack.exe target/release/snor-setup.exe target/release/snor.exe dist/SnorSetup.exe
+```
+
+`dist\SnorSetup.exe` installs per-user (no administrator prompt), adds
+optional Start Menu and desktop shortcuts, and registers an uninstaller that
+runs the same wizard. See `installer/README.md` for the bundle format and the
+whole flow.
 
 ## Shortcuts
 

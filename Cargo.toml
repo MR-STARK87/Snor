@@ -8,6 +8,15 @@ repository = "https://github.com/MR-STARK87/Snor"
 readme = "README.md"
 keywords = ["ide", "editor", "egui"]
 
+[workspace]
+# The app is the root package; `installer/` is the second member. It is kept
+# out of the default members so `cargo build`, `cargo test` and `cargo clippy`
+# at the repo root keep operating on the app alone, exactly as they did before
+# the workspace existed; the installer is built with `-p snor-installer` (or
+# `--workspace` for both).
+members = ["installer"]
+default-members = ["."]
+
 [dependencies]
 anyhow = "1.0.104"
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }

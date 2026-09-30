@@ -1,4 +1,5 @@
 /target
+/dist
 /session.json
 *.orig
 *.bk

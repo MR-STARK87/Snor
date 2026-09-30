@@ -17,6 +17,8 @@ cargo run              # debug build (keeps console window)
 cargo run --release    # release build (no console, strip + thin LTO)
 cargo test             # all unit + integration tests (includes a live pty test, ~20s max)
 cargo clippy --all-targets -- -D warnings   # must be clean before commit
+cargo test -p snor-installer                # the installer crate, same rules
+cargo clippy -p snor-installer --all-targets -- -D warnings
 Get-Process Snor | Select-Object Name, @{N='MB';E={[math]::Round($_.WorkingSet64/1MB,1)}}
 ```
 
@@ -47,6 +49,78 @@ otherwise `cargo build` fails with `os error 5`.
 | `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
 | `settings.rs` | The user's eight scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a ninth or wiring one.
 | `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
+
+## The installer (`installer/`)
+
+A second crate in the same workspace (`members = ["installer"]`,
+`default-members = ["."]`, so root `cargo build` / `test` / `clippy` keep
+targeting the app alone). `snor-setup.exe` is the wizard and `snor-pack.exe`
+wraps it into one file; both build with `-p snor-installer`.
+`installer/README.md` is the user-facing story — this is the contributor one.
+
+**The design language is compiled in, not copied.** `installer/src/lib.rs`
+includes the app's `theme.rs`, `fonts.rs` and `icons.rs` through `#[path]`
+includes. Three consequences are load-bearing:
+
+- A palette or chrome change lands in both windows or in neither. Do not
+  "fix" a colour in the installer — there is nothing there to fix; change
+  `src/theme.rs`.
+- The include is why `theme::medium()`'s reference to `crate::fonts` resolves
+  in both crates, and why those two files must be included as a pair.
+- `#[allow(dead_code)]` on the includes is correct, not sloppy: each file is
+  the app's *whole* module and the installer draws a subset of it. Trimming
+  the shared files to that subset is exactly the drift the include exists to
+  prevent. The crate is `publish = false` for the same reason — the include
+  reaches outside the package directory.
+
+**The bundle is one file, read from its end.** `snor-pack` appends `snor.exe`
+plus a 28-byte footer (magic `SNORPKG1`, format version, payload length,
+FNV-1a). The setup locates its payload by reading back from EOF — no PE
+parsing — and verifies the checksum before writing anything. Packing strips
+any previous bundle first, so it is idempotent; `snor-pack --verify <file>`
+checks a bundle without running it.
+
+**`Launch::detect` decides the mode before the window exists, and its priority
+order is the design:**
+
+1. `--uninstall` on the command line.
+2. An appended payload → install.
+3. A `uninstall.info` beside the binary → uninstall. This is what identifies
+   the copied uninstaller, and it must come before the sidecar check, because
+   an installed directory contains an `snor.exe` too.
+4. An `snor.exe` sidecar → install, so `cargo run -p snor-installer --bin
+   snor-setup` works beside a release build without a repack.
+5. Anything else → the styled "this file does not contain Snor" screen.
+
+**An install is per-user and reversible, and every reversible step is
+recorded.** Files go to `%LOCALAPPDATA%\Programs\Snor` — writable without
+elevation, so no UAC can interrupt the wizard mid-run. Shortcuts are made
+through PowerShell's `[Environment]::GetFolderPath`, which resolves a
+redirected Desktop where `%USERPROFILE%\Desktop` would not, and exactly the
+paths that were created are written into `uninstall.info`; uninstall removes
+the *recorded* paths, never a re-derived guess. `uninstall.exe` is the setup
+binary's own prefix — copied before the payload starts — so the uninstaller
+does not carry an 11 MB app around. The Settings > Apps entry is one `HKCU`
+key, and the folder's own removal (including the running uninstaller) is
+handed to a detached `cmd` — via a **batch file in `%TEMP%`**, not a `cmd /C
+"<script>"` argument, because Rust re-quotes such an argument with `\"` that
+`cmd.exe` does not understand, and the first live run left the folder behind
+for exactly that reason. The batch waits (`ping`) and **retries** the `rmdir`
+thirty times, because the uninstaller's own image stays locked for a beat
+after it exits. It runs from every close path — `close_requested` and our own
+cross — exactly once, and deletes itself either way.
+
+**The window is the app's chrome on a fixed dialog.** Same constants for the
+bar, same `window_edge` frame, same first-frame placement
+(`centred_on_monitor` is the app's `fit_to_monitor` minus the resizing case,
+tested the same three ways, taskbar reserve included), and deliberately no
+maximise and no resize bands — there is nothing to resize.
+`ui::primary_button` pairs `accent` with `on_accent` (the tab badges' pair)
+and keys its cursor off `contains_pointer` for the same long-press reason as
+`widgets::clickable_label`.
+
+The wizard's own behaviour — pixels, the folder dialog, PowerShell's real
+output — needs a human look after a rebuild, like everything else GUI here.
 
 ## Clickable labels — read this before making anything clickable
 
@@ -645,6 +719,11 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
   `a_level_outside_what_wmi_accepts_is_clamped`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
+- `cargo test -p snor-installer` must stay green (19 tests): the bundle round
+  trip, corruption and truncation refusal, idempotent repacking, the manifest
+  round trip, PowerShell quoting, the cleanup command, UTF-16 console
+  decoding, the window-placement trio, and pasted-path cleanup — plus the
+  shared `theme` tests, which run in both crates.
 - Hermetic twins for the newer behaviour, none of which needs a pty because
   `Session::ingest` is the same call `poll` makes:
   `wheel_history_holds_what_has_scrolled_off_the_screen`,
