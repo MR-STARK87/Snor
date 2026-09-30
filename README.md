@@ -82,7 +82,7 @@ without constantly switching tools.
 - No git integration — use your own client. The status bar reads `.git/HEAD`
   for the branch name, which is one 40-byte file and not a client. No
   telemetry, no accounts, no cloud. No plugin system to feed.
-- ~11 MB release binary (strip + thin LTO). 117 tests, clippy clean on every
+- ~11 MB release binary (strip + thin LTO). 106 tests, clippy clean on every
   commit, CI on `main` and `dev`.
 
 ## Screenshots

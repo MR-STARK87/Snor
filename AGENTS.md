@@ -44,8 +44,7 @@ otherwise `cargo build` fails with `os error 5`.
 | `terminal.rs` | Multi-session ConPTY. `Terminal` owns `Vec<Session>` + `active_tab`; each `Session` owns its own pty, reader thread, `vt100::Parser` scrollback, selection, attention flag, shell and query-responder buffer. Tab strip spawns/switches/closes/renames shells; scrollback, copy, find, zoom and shell choice; `collapsed`/`fullscreen`/`hidden` + drag height. |
 | `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
-| `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). `mascot_fur()` is the one tone added for the footer creature. |
-| `mascot.rs` | Snorri, the footer sloth. `parts()` is the whole creature as data (normalised `Ellipse`/`Rounded`/`Arc` shapes in paint order); `paint` and `snorri` are the only things that touch a painter. See the module doc and the mascot section below before moving any number. |
+| `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
 | `settings.rs` | The user's eight scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a ninth or wiring one.
 | `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
 
@@ -205,43 +204,6 @@ history length, so the offset is set and then read back (`apply_scroll`).
   menu. `powershell.exe` is reported present whatever the lookup says, so a
   trimmed `PATH` cannot leave the menu empty. A window with no shell to start is
   a dead end, which is why the fallback is unconditional.
-
-## The footer mascot (`mascot.rs`)
-
-Snorri is a sloth, drawn from scratch, and the shape list *is* the design: a
-pale face mask, two dark eye smudges with closed sleeping eyes inside them, a
-small nose over a content mouth, and three long claws on each of four paws.
-Five rules are load-bearing:
-
-- **The pose was chosen by looking at it, not by writing it down.**
-  `tools/mascot_design.py` holds three poses rasterised at the real footer size
-  — curled up, sitting hugging its knees (the shipped one), and hanging from a
-  branch. The rejected two are why the current one is shaped as it is: the ball
-  ran the face mask and the belly into one pale panel and lost the face
-  (hence `the_face_and_the_belly_stay_apart`), and the branch spent the top
-  third of the block on branch.
-- **The claws are the signifier.** Twelve of them, three per paw, all built by
-  one `claw_row` helper so the count and their geometry cannot drift apart
-  (`four_paws_carry_three_claws_each`). Take them away and it is a teddy bear;
-  take the eye smudges away and it is a mouse.
-- **The fur is the palette's green-grey, not a sloth's brown.** A warm brown
-  would be the only warm mass in a cool green window. `mascot_fur()` keeps the
-  value a sloth's fur reads at and drops the hue; the eye smudges are the only
-  new use of `pane_edge`.
-- **Every face feature has to land on the cream**
-  (`the_face_features_land_on_the_cream_not_the_fur`) — two smudges, two closed
-  eyes, a nose, two mouth strokes and two cheeks — and the closed eyes have to
-  sit inside their smudges, or the smudges read as holes.
-- **Cream must also stay on fur** (`the_cream_never_leaves_the_fur`). A patch
-  that misses paints a pale blob on the explorer panel, which a test that only
-  checks the block would not notice.
-
-Preview a change with `tools/mascot_design.py` (same shape list in Python, no
-rebuild) and check a real render with `tools/mascot_check.py` over a
-`win_shot.py` capture. That checker finds the ink as *enclosed holes* rather
-than by colour, because the ink is `surface_recessed` — the same tone as the
-panel it is painted on. A screenshot cannot tell you whether twelve claws drew;
-the region counts can.
 
 ## The branch readout (`git.rs`)
 
@@ -662,21 +624,14 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
 
 ## Tests
 
-- `cargo test` must stay green (117 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (106 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
   `closing_an_earlier_tab_keeps_the_same_shell_selected`,
   `tab_numbers_take_the_lowest_free_slot`,
   `the_chosen_shell_reaches_the_startup_tab`,
-  `changing_the_shell_never_touches_a_started_tab`), the eight mascot geometry
-  tests
-  (`every_shape_stays_inside_the_block`, `the_creature_is_mirror_symmetric`,
-  `four_paws_carry_three_claws_each`,
-  `the_face_features_land_on_the_cream_not_the_fur`,
-  `the_sleeping_eyes_sit_inside_their_patches`,
-  `the_cream_never_leaves_the_fur`, `the_face_and_the_belly_stay_apart`,
-  `the_block_is_the_poses_footprint`), the grid-padding pair
+  `changing_the_shell_never_touches_a_started_tab`), the grid-padding pair
   (`flow_pane_sizing_reserves_its_header` and its side-gap twin
   `flow_pane_sizing_reserves_its_side_gaps`),
   `closing_the_last_tab_empties_the_list_without_underflow`, the three

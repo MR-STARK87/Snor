@@ -15,18 +15,6 @@ use eframe::egui::{
 /// the ~14pt sizes used here without measurable cost.
 const CURVE_STEPS: usize = 24;
 
-/// Points of an ellipse, closed. `rot` is in radians.
-pub fn ellipse_points(center: Pos2, rx: f32, ry: f32, rot: f32) -> Vec<Pos2> {
-    let (sn, cs) = rot.sin_cos();
-    (0..CURVE_STEPS)
-        .map(|i| {
-            let a = i as f32 / CURVE_STEPS as f32 * std::f32::consts::TAU;
-            let (x, y) = (a.cos() * rx, a.sin() * ry);
-            pos2(center.x + x * cs - y * sn, center.y + x * sn + y * cs)
-        })
-        .collect()
-}
-
 /// A closed polygon whose corners are rounded by `radius` (quadratic arcs).
 /// Used for the folder, document and Snorlax's ears, which are all
 /// rounded-corner outlines rather than true ellipses.
@@ -54,31 +42,6 @@ pub fn rounded_poly(points: &[Pos2], radius: f32) -> Vec<Pos2> {
         }
     }
     out
-}
-
-fn fill_stroke(painter: &Painter, points: Vec<Pos2>, fill: Color32, stroke: Stroke) {
-    painter.add(Shape::convex_polygon(points, fill, stroke));
-}
-
-/// Filled ellipse with an outline.
-///
-/// Snorri's parts overlap, and filled shapes occlude each other the way
-/// painted art does — bare strokes would leave every hidden contour visible.
-pub fn blob(
-    painter: &Painter,
-    center: Pos2,
-    rx: f32,
-    ry: f32,
-    rot: f32,
-    fill: Color32,
-    stroke: Stroke,
-) {
-    fill_stroke(painter, ellipse_points(center, rx, ry, rot), fill, stroke);
-}
-
-/// Filled rounded polygon with an outline. See [`blob`].
-pub fn blob_poly(painter: &Painter, points: &[Pos2], radius: f32, fill: Color32, stroke: Stroke) {
-    fill_stroke(painter, rounded_poly(points, radius), fill, stroke);
 }
 
 /// Disclosure chevron. `openness` 0.0 points right (collapsed), 1.0 points down.

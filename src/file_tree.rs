@@ -105,32 +105,6 @@ const HEADER_RIGHT_PAD: f32 = 9.6;
 /// would leave it, with no rule in between to account for the difference.
 const TREE_TOP_GAP: f32 = 4.8;
 
-// --- Footer geometry ---------------------------------------------------
-//
-// Expressed as fractions of the explorer's width, measured off the reference
-// mock, so the block keeps the same proportions whether the panel is at its
-// 260pt default or dragged out to 520. In the reference the mascot's ink is
-// inset 50/332 of the panel and spans 124/332 of it, the caption shares the
-// mascot's left edge, and the caption's baseline sits 20/332 above the
-// status bar.
-//
-// The fractions were then calibrated against a screenshot of this app: the
-// reference is a raster mock, so its figures are ink extents, while ours are
-// layout boxes, and the two differ by the mascot's empty bottom band and the
-// caption font's descender space.
-/// Left inset of both the mascot and its caption.
-const FOOTER_PAD: f32 = 0.150;
-/// Width of the mascot block (the glyph fills it edge to edge).
-const FOOTER_MASCOT: f32 = 0.400;
-/// Gap below the caption, before the status bar. Larger than the reference's
-/// 6% because it is measured from the caption's *row* bottom rather than its
-/// ink, and the row carries the font's descender space.
-const FOOTER_BOTTOM_GAP: f32 = 0.094;
-/// Caption text size in points. Deliberately fixed rather than proportional:
-/// scaling it with the panel would look shouty, and at the default width this
-/// reproduces the reference's caption width almost exactly.
-const FOOTER_CAPTION_SIZE: f32 = 11.0;
-
 /// What the user did with an inline name field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineOutcome {
@@ -213,20 +187,6 @@ fn inline_name_field(
         }
     }
     InlineOutcome::Open
-}
-
-/// Height the footer will claim at the bottom of the panel.
-///
-/// The caller needs this *before* the footer is laid out, because the
-/// scrolling tree above it is sized against the remaining space and the
-/// footer is pinned to the bottom. The caption's row height comes from the
-/// live font metrics rather than a guessed multiplier, so the reservation
-/// stays exact if the font ever changes.
-fn footer_height(ui: &egui::Ui, panel_w: f32) -> f32 {
-    let caption = ui
-        .ctx()
-        .fonts_mut(|f| f.row_height(&egui::FontId::proportional(FOOTER_CAPTION_SIZE)));
-    FOOTER_BOTTOM_GAP * panel_w + caption + crate::mascot::height_for(FOOTER_MASCOT * panel_w)
 }
 
 /// Left edge of a node's chevron slot, relative to the row's left edge.
@@ -995,10 +955,9 @@ impl FileTree {
         // back explicitly.
         ui.add_space(TREE_TOP_GAP);
 
-        // The footer is pinned to the bottom of the panel, so reserve its
-        // height before sizing the scrolling tree above it.
-        let panel_w = ui.available_width();
-        let tree_h = (ui.available_height() - footer_height(ui, panel_w)).max(60.0);
+        // The tree fills the panel down to the status bar; the floor only
+        // guards a pathologically short panel.
+        let tree_h = ui.available_height().max(60.0);
         egui::ScrollArea::vertical()
             .id_salt("snor_tree_scroll")
             .max_height(tree_h)
@@ -1018,31 +977,6 @@ impl FileTree {
                     }
                 }
             });
-
-        // Footer, matched to the reference: left-aligned rather than centred,
-        // sized as a fraction of the panel, caption under the mascot, and a
-        // gap before the status bar. No rule above it — in the reference the
-        // only lines down here are the status bar's own top edge.
-        //
-        // There is no space added between the mascot and the caption: the
-        // creature's shapes stop short of the bottom of the block they are
-        // given, and that empty band *is* the gap the reference shows between
-        // the feet and the text. Adding more on top of it doubled the gap.
-        ui.horizontal(|ui| {
-            ui.add_space(FOOTER_PAD * panel_w);
-            crate::mascot::snorri(ui, FOOTER_MASCOT * panel_w)
-                .on_hover_text("Shhh… Snorri is compiling dreams.");
-        });
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(FOOTER_PAD * panel_w);
-            ui.label(
-                egui::RichText::new("Rest. Then build again.")
-                    .size(FOOTER_CAPTION_SIZE)
-                    .color(theme::moss()),
-            );
-        });
-        ui.add_space(FOOTER_BOTTOM_GAP * panel_w);
 
         // Delete confirm modal
         if let Some(target) = self.delete_target.clone() {

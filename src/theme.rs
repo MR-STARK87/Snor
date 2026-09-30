@@ -117,46 +117,17 @@ pub fn tagline() -> egui::Color32 {
     egui::Color32::from_rgb(0x6C, 0x71, 0x6A)
 }
 
-/// Explorer footer caption. The reference's green (`#6E8670`) sits between
-/// [`faint`] and [`dim_text`], and is greener than either — it is the one
-/// place in the chrome where the accent leaks into text.
-pub fn moss() -> egui::Color32 {
-    egui::Color32::from_rgb(0x6E, 0x86, 0x70)
-}
-
 /// Ink for the explorer tree's glyphs — the folder, document and badge
-/// outlines, the disclosure chevrons — and the cream of Snorri, the footer
-/// creature.
+/// outlines, the disclosure chevrons.
 ///
 /// Sampled from the reference at (208, 203, 189) on the folder's horizontal
 /// top edge, which is fully covered and therefore reports the true stroke
 /// colour. Diagonal strokes read ~16% dimmer than this in the mock
 /// ((175, 178, 171) on a chevron, (175, 171, 166) on a badge corner) — that
 /// is antialiasing spread over two pixels, not a second, darker ink, so
-/// everything in the tree uses this one colour. Snorri shares it so the
-/// creature reads as part of the chrome rather than a sticker pasted on: it
-/// is the plush's cream on his face, belly and paws, and his fur is the one
-/// tone of his own below.
+/// everything in the tree uses this one colour.
 pub fn glyph() -> egui::Color32 {
     egui::Color32::from_rgb(0xD0, 0xCB, 0xBD)
-}
-
-/// Snorri's fur: a sloth's brown, held to this palette's hue and value.
-///
-/// A sloth is brown, and a warm brown here would be the only warm mass in a
-/// cool green window — the footer would stop being chrome and start being a
-/// sticker. So the hue is the palette's green-grey and only the *value* is a
-/// sloth's: luma 82, which is what a sloth's fur measures once it is not
-/// sunlit, and what makes the creature sit in the panel rather than on it.
-///
-/// The value is also what fixes it between its neighbours. `surface_recessed`
-/// is 22, so the body reads as a solid mass above the panel; `pane_edge` at 59
-/// is the darker tone the eye patches use, and it has to out-read the fur by
-/// the margin below or the patches vanish; `glyph` is 202, so the cream face
-/// and belly read on top of it without a rim. Any of those three used as the
-/// fur would lose one of those steps.
-pub fn mascot_fur() -> egui::Color32 {
-    egui::Color32::from_rgb(0x4A, 0x56, 0x52)
 }
 
 /// Fill of the explorer's letter badges.
@@ -271,37 +242,6 @@ pub fn file_letter(filename: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
-    /// The fur has to sit in the one gap the palette leaves for it: clear of
-    /// the panel it is painted on, clear of the seam tone the eye patches use,
-    /// and well under the cream that covers its face and belly. Losing a step
-    /// on either side is what turns the creature into a silhouette or into a
-    /// sticker.
-    #[test]
-    fn mascot_fur_sits_between_the_panel_and_the_cream() {
-        let lum =
-            |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
-        assert!(
-            lum(mascot_fur()) > lum(surface_recessed()) + 40.0,
-            "the body would not read against the panel"
-        );
-        assert!(
-            lum(mascot_fur()) > lum(pane_edge()) + 15.0,
-            "the inner-ear shade would not read against the body"
-        );
-        assert!(
-            lum(mascot_fur()) < lum(glyph()) - 60.0,
-            "the cream would not read against the body"
-        );
-    }
-
-    /// The reference's blue is saturated; this palette is not. If the fur ever
-    /// gains more blue than green it has stopped being a tone of the app.
-    #[test]
-    fn mascot_fur_stays_green_tinted() {
-        let c = mascot_fur();
-        assert!(c.g() > c.b(), "the fur went blue again");
-    }
-
     #[test]
     fn only_source_files_get_letter_badges() {
         assert_eq!(file_letter("main.rs"), Some("R"));
@@ -321,20 +261,6 @@ mod tests {
             lum(accent()) > lum(on_accent()) + 80.0,
             "tab badge letter would not read"
         );
-    }
-
-    /// The footer caption is the one text colour that is greener than it is
-    /// grey. If that tilt is lost it stops reading as the accent's echo.
-    #[test]
-    fn footer_caption_keeps_its_green_tilt() {
-        let tilt = |c: egui::Color32| c.g() as i32 - c.r() as i32;
-        assert!(tilt(moss()) > tilt(dim_text()));
-        assert!(tilt(moss()) > tilt(faint()));
-        // ...but it still has to be dimmer than body text, or it shouts.
-        let lum =
-            |c: egui::Color32| 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
-        assert!(lum(moss()) < lum(text()));
-        assert!(lum(moss()) > lum(faint()));
     }
 
     /// The pane seam has to out-read the ordinary hairline — that was the
