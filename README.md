@@ -77,6 +77,10 @@ without constantly switching tools.
   Closing a tab, or the window, with unsaved work asks first.
 - File tree with create/rename/delete, auto-refresh via a filesystem watcher,
   and a resizable, collapsible explorer (`Ctrl+B`).
+- It remembers the folder you opened and reopens it on the next launch. The
+  working directory is a property of how the app was started — a build tree, an
+  install folder, wherever you double-clicked from — and it is not an answer to
+  "what are you working on".
 
 **Deliberately lean**
 - No git integration — use your own client. The status bar reads `.git/HEAD`

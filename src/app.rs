@@ -55,6 +55,37 @@ fn fit_to_monitor(monitor: egui::Vec2, want: egui::Vec2) -> (egui::Vec2, egui::P
     (size, pos)
 }
 
+/// What the app should do about a folder at startup.
+#[derive(Clone, PartialEq, Debug)]
+enum Startup {
+    /// The remembered folder is still a directory: reopen it.
+    Folder(PathBuf),
+    /// A folder was remembered but is not there any more — moved, deleted,
+    /// renamed, or on a drive that is not mounted.
+    Missing(PathBuf),
+    /// Nothing has ever been opened, or the key was cleared by hand.
+    FirstRun,
+}
+
+/// Resolve the remembered folder into a startup decision.
+///
+/// This used to be `std::env::current_dir()`, and replacing it *is* the fix.
+/// The working directory is a property of how the process happened to be
+/// started, not of the user's work: a developer double-clicking `snor.exe` out
+/// of a build tree got that tree as their workspace, and an installed user
+/// launched by the installer got the install folder. The remembered folder is
+/// the only answer available that is about the user.
+///
+/// Pure, so every branch is testable without a window, a settings file, or a
+/// directory that has to exist beforehand.
+fn resolve_workspace(saved: Option<&std::path::Path>) -> Startup {
+    match saved {
+        Some(path) if path.is_dir() => Startup::Folder(path.to_path_buf()),
+        Some(path) => Startup::Missing(path.to_path_buf()),
+        None => Startup::FirstRun,
+    }
+}
+
 // --- Chrome heights ----------------------------------------------------
 //
 // Measured off the reference mock (which renders at 125%) and converted to
@@ -220,8 +251,16 @@ impl SnorApp {
         // grid that resized under the first prompt would look like a bug.
         let settings = Settings::load();
         cc.egui_ctx.set_zoom_factor(settings.ui_scale);
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut tree = FileTree::new(root);
+        // Reopen the folder from last time when there is one. With nothing
+        // remembered this is the launch directory, which is what this app has
+        // always done — the point of `last_folder` is that the guess stops
+        // mattering from the second launch onwards.
+        let start_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let folder = match resolve_workspace(settings.last_folder.as_deref()) {
+            Startup::Folder(path) => Some(path),
+            Startup::Missing(_) | Startup::FirstRun => None,
+        };
+        let mut tree = FileTree::new(folder.clone().unwrap_or_else(|| start_cwd.clone()));
         tree.set_show_hidden(settings.show_hidden);
         let mut editor = Editor::new();
         editor.set_font_size(settings.editor_font);
@@ -268,6 +307,36 @@ impl SnorApp {
     /// folder dialog, or auto context switching onto a terminal opened
     /// elsewhere — has to re-read immediately, or the bar spends a moment
     /// claiming the previous project's branch.
+    /// Adopt a folder the user picked: point the tree at it, show the panel,
+    /// and remember it for next launch.
+    fn set_folder(&mut self, dir: PathBuf) {
+        self.tree.set_root(dir.clone());
+        // A user who has just chosen a folder wants to see it. This is also why
+        // the flag is not merely left alone: `Ctrl+B` hides the explorer, and
+        // opening a folder has to bring it back or the choice looks like it did
+        // nothing.
+        self.show_explorer = true;
+        // Written by the existing flush rather than here: a folder is a discrete
+        // event, and `settings_dirty` is cleared once the pointer is off
+        // whatever moved — which a folder dialog is, by the time this returns.
+        self.settings.last_folder = Some(dir);
+        self.settings_dirty = true;
+    }
+
+    /// Ask for a folder. The one funnel for every entry point — the explorer's
+    /// header button and anything added later — so that "opening a folder" means
+    /// the same thing everywhere: the tree moves, the panel appears, and the
+    /// choice is remembered for next time. A second path that forgets the last
+    /// step is the bug this shape exists to prevent.
+    fn open_folder(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_directory(self.tree.root.clone())
+            .pick_folder()
+        {
+            self.set_folder(dir);
+        }
+    }
+
     fn poll_branch(&mut self) {
         const POLL: std::time::Duration = std::time::Duration::from_secs(2);
         let due = self.branch_root != self.tree.root
@@ -1563,12 +1632,11 @@ impl eframe::App for SnorApp {
         // explorer, which is what the divider crossing it would look like.
         self.status_bar(ui);
 
-        if self.tree.take_open_request()
-            && let Some(dir) = rfd::FileDialog::new()
-                .set_directory(&self.tree.root)
-                .pick_folder()
-        {
-            self.tree.set_root(dir);
+        // The header's folder button, through the one funnel — so a folder
+        // opened from here is remembered exactly like one opened anywhere else,
+        // and there is no second path that can forget.
+        if self.tree.take_open_request() {
+            self.open_folder();
         }
 
         let mut panel_rect = None;
@@ -1670,6 +1738,27 @@ impl Drop for SnorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real directory for a test that needs one to exist, named after the
+    /// process so two runs (or two crates) cannot collide on it.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("snor-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// The whole point of the change, in one assertion: a folder the user
+    /// picked comes back on the next launch.
+    #[test]
+    fn a_folder_that_is_still_there_is_reopened() {
+        let dir = temp_dir("resolve-present");
+        assert_eq!(
+            resolve_workspace(Some(&dir)),
+            Startup::Folder(dir.clone())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The live numbers this was written against: a 1920x1080 monitor at 125%
     /// is 1536x864 points, and the requested 1280x800 window lands at y=96

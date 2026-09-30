@@ -47,7 +47,7 @@ otherwise `cargo build` fails with `os error 5`.
 | `git.rs` | The branch name, read from `.git/HEAD`. One file read — deliberately not git integration. |
 | `syntax.rs` | Tree-sitter highlight to `LayoutJob` (rust/json/js/toml, 100KB cap), `None` on unsupported/over-limit so the caller falls back. |
 | `theme.rs` | Calm dark-green palette, three surface tones (`surface_title` / `surface_body` / `surface_recessed`), `file_badge()` (letter + colors per extension). |
-| `settings.rs` | The user's eight scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a ninth or wiring one.
+| `settings.rs` | The user's nine scalars in `%APPDATA%\Snor\settings.toml`: a hand-rolled `key = value` format with a *total* parser (a bad value keeps its default, an unknown key is ignored) and clamping on both load and save. See "Settings" below before adding a tenth or wiring one. `last_folder` is the ninth, and the only one the app writes itself.
 | `widgets.rs` | `clickable_label()` — the one correct way to make a text label behave like a button. See "Clickable labels" below; a bare `Label` + `on_hover_cursor` is wrong in two separate ways. |
 
 ## The installer (`installer/`)
@@ -639,14 +639,15 @@ Lowers the physical backlight so agents can keep running with the screen dark.
 
 ## Settings (`settings.rs`)
 
-One file, `%APPDATA%\Snor\settings.toml`, holding eight scalars: the shell a new
+One file, `%APPDATA%\Snor\settings.toml`, holding nine scalars: the shell a new
 terminal tab starts, the terminal and editor faces, scrollback rows, hidden
-files, the context-follow switch, the dim level and the UI scale. `eframe` is
-built without the `persistence` feature, so before this module every one of
-those was either a constant or forgotten on exit — the window re-centred itself
-every launch and `Ctrl+wheel`'s zoom died with the process.
+files, the context-follow switch, the dim level, the UI scale and the folder
+the user opened last. `eframe` is built without the `persistence` feature, so
+before this module every one of those was either a constant or forgotten on
+exit — the window re-centred itself every launch and `Ctrl+wheel`'s zoom died
+with the process.
 
-- **Hand-rolled `key = value`, not a TOML crate.** Eight scalars, and every
+- **Hand-rolled `key = value`, not a TOML crate.** Nine scalars, and every
   field is *total*: a missing key, an unparseable value and an unknown key all
   leave the default in place rather than failing the load. A parser dependency
   would earn its keep on nothing. The `.toml` extension stays because the file
@@ -660,6 +661,12 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
   `vt100` buffer size and a viewport command, and a settings file is a text file
   a user edits by hand, so `clamped()` runs on everything loaded and again on
   everything written.
+- **`last_folder` is written by the app, and is not clamped.** It is set when a
+  folder is opened rather than from a panel row, and the only question worth
+  asking of a path is answered where it is used — `is_dir`, in
+  `resolve_workspace`. It is written even when empty, because `render` writes
+  every key: "written as empty" is how the file says "none chosen" without a
+  second format, and the rendered header says clearing it starts over.
 - **The panel applies as it is touched; there is no Apply button.** Snor has no
   navigation and every knob is one scalar, so a half-applied state would be
   worse than no panel. `SnorApp::settings_changed` re-applies the whole set —
@@ -698,7 +705,7 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
 
 ## Tests
 
-- `cargo test` must stay green (106 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (110 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -711,9 +718,10 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
   `closing_the_last_tab_empties_the_list_without_underflow`, the three
   window-placement tests (`floating_window_is_placed_fully_on_screen`,
   `a_window_taller_than_the_monitor_is_shrunk_to_fit`,
-  `a_misreported_monitor_cannot_produce_a_negative_size`), the sixteen
+  `a_misreported_monitor_cannot_produce_a_negative_size`), the nineteen
   settings tests (round trip, missing/unknown/malformed keys, clamping,
-  the key list, a real save/reload), the three dim-level tests
+  the key list, a real save/reload, a remembered folder with spaces in it), the
+  three dim-level tests
   (`changing_the_level_while_dimmed_applies_it_without_losing_the_restore`,
   `changing_the_level_while_idle_touches_nothing`,
   `a_level_outside_what_wmi_accepts_is_clamped`), and
@@ -742,7 +750,8 @@ every launch and `Ctrl+wheel`'s zoom died with the process.
   HEAD, worktree `gitdir:` file, and every unreadable case) and the editor's
   `an_externally_rewritten_file_reloads_itself`,
   `a_dirty_buffer_reports_a_conflict_instead_of_reloading`,
-  `closing_a_tab_with_unsaved_edits_asks_first`.
+  `closing_a_tab_with_unsaved_edits_asks_first`. `a_folder_that_is_still_there_is_reopened`
+  is the same kind — a temp directory and a pure function.
 - **Scrollback, selection, find, attention, zoom and the shell menu are all GUI
   behaviour and cannot be verified headlessly.** The tests prove the state and
   the parsing; whether the wheel actually moves the view, whether the tint lands

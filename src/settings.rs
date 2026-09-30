@@ -12,13 +12,19 @@
 //!   settings.toml` holds the whole thing. Nothing here is project-scoped, so a
 //!   per-project file would be a second format, a second lookup and a second way
 //!   for the app to disagree with itself.
-//! * **Hand-rolled `key = value`, not a TOML crate.** The format is eight lines
+//! * **Hand-rolled `key = value`, not a TOML crate.** The format is nine lines
 //!   of scalar, and every field is total: a missing key falls back to the
 //!   default, an unparseable one falls back to the default, and an unknown key
 //!   is ignored. Pulling in a parser to read that would be a dependency earning
 //!   its keep on nothing. The `.toml` extension is kept because the file *is*
 //!   TOML-shaped and a reader can edit it as such; this reader is simply the
 //!   subset Snor writes.
+//!
+//! * **One key is written by the app, not by a panel row.** `last_folder` is
+//!   set when the user opens a folder and read at the next launch, so the
+//!   workspace comes back instead of being re-guessed. That is what makes this
+//!   file more than preferences: it is the only memory the app has of where it
+//!   was. See [`Settings::last_folder`].
 //!
 //! Every default is byte-identical to the constant it replaces, so the existing
 //! test suite proves the settings plumbing changed no behaviour. See the
@@ -60,7 +66,11 @@ pub const UI_SCALE_MAX: f32 = 1.6;
 /// them. One list drives the write and the tests walk it, so a key cannot be
 /// added to the file's shape without a renderer to match — see
 /// [`Settings::value_for`].
-const KEYS: [&str; 8] = [
+///
+/// `last_folder` is last because it is the one key that is not a preference: it
+/// is written when a folder is opened, and its position in the file is a
+/// promise to every file already on disk.
+const KEYS: [&str; 9] = [
     "shell",
     "terminal_font",
     "scrollback",
@@ -69,6 +79,7 @@ const KEYS: [&str; 8] = [
     "follow_terminal",
     "dim_level",
     "ui_scale",
+    "last_folder",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +106,20 @@ pub struct Settings {
     pub dim_level: u8,
     /// Multiplier on egui's point scale.
     pub ui_scale: f32,
+    /// The folder the user opened last, and the one the next launch reopens.
+    ///
+    /// `None` is a real state, not a missing value: it is what a first run
+    /// looks like, and it is what the app asks about rather than guessing a
+    /// directory — the guess being how a developer got their build tree, and an
+    /// installed user the install folder, on screen as "the workspace". See
+    /// `app::resolve_workspace` for the remembered path that has since been
+    /// moved or deleted.
+    ///
+    /// Not clamped, deliberately: the only questions worth asking of a path
+    /// are answered where it is used, and both of those are `is_dir`. A value
+    /// that fails it is a folder that is not there, which the first-run screen
+    /// reports by name.
+    pub last_folder: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -113,6 +138,7 @@ impl Default for Settings {
             follow_terminal: true,
             dim_level: crate::brightness::DEFAULT_DIM_LEVEL,
             ui_scale: UI_SCALE_DEFAULT,
+            last_folder: None,
         }
     }
 }
@@ -175,6 +201,13 @@ impl Settings {
                     }
                 }
                 "ui_scale" => assign_f32(&mut out.ui_scale, value),
+                // Empty means "no folder chosen", not "the empty path": the
+                // file writes an empty value for that state, so `None` has to
+                // read back as `None` or the key would be the one field in the
+                // file that cannot survive a save.
+                "last_folder" => {
+                    out.last_folder = (!value.is_empty()).then(|| PathBuf::from(value));
+                }
                 _ => {}
             }
         }
@@ -193,6 +226,14 @@ impl Settings {
             "follow_terminal" => self.follow_terminal.to_string(),
             "dim_level" => self.dim_level.to_string(),
             "ui_scale" => fmt_f32(self.ui_scale),
+            // Empty when there is none. `render` writes every key, and
+            // "written as empty" is how the file says `None` without needing a
+            // second format for it.
+            "last_folder" => self
+                .last_folder
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
             _ => return None,
         };
         Some(value)
@@ -206,6 +247,7 @@ impl Settings {
         out.push_str("# Snor settings. Edit freely; the app rewrites this file.\n");
         out.push_str("# Ranges: terminal_font 8-28, editor_font 9-28, ");
         out.push_str("scrollback 100-100000, ui_scale 0.8-1.6, dim_level 1-100.\n\n");
+        out.push_str("# last_folder is the folder Snor reopens; clear it to start over.\n\n");
         for key in KEYS {
             if let Some(value) = self.value_for(key) {
                 out.push_str(&format!("{key} = {value}\n"));
@@ -350,6 +392,9 @@ mod tests {
             follow_terminal: false,
             dim_level: 25,
             ui_scale: 1.25,
+            // A path with a space in it, because the round trip that matters
+            // most is the one the parser would break first.
+            last_folder: Some(PathBuf::from(r"C:\My work folder\Snor")),
         };
 
         let text = s.render();
@@ -493,6 +538,45 @@ terminal_font = 14
         let path = std::env::temp_dir().join("snor-settings-that-does-not-exist.toml");
         let _ = std::fs::remove_file(&path);
         assert_eq!(Settings::load_from(&path), Settings::default());
+    }
+
+    /// A remembered folder has to survive a save/load, not just the renderer.
+    #[test]
+    fn a_remembered_folder_with_spaces_survives_a_round_trip() {
+        // This repository's own path. A Windows path with a space in it is not
+        // a hypothetical case here, and a parser that split on whitespace
+        // would take the first half of it.
+        let path = PathBuf::from(r"C:\My work folder\Snor");
+        let s = Settings {
+            last_folder: Some(path.clone()),
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&s.render()).last_folder, Some(path));
+    }
+
+    #[test]
+    fn an_empty_remembered_folder_means_none_was_ever_chosen() {
+        assert_eq!(Settings::default().last_folder, None);
+        assert_eq!(Settings::parse("last_folder =").last_folder, None);
+        assert_eq!(Settings::parse("last_folder = \"\"").last_folder, None);
+        // The key is still written, so the file describes itself completely.
+        assert!(
+            Settings::default()
+                .render()
+                .lines()
+                .any(|line| line.trim_start().starts_with("last_folder")),
+            "the key must be present even when empty"
+        );
+    }
+
+    /// Hand-quoted, because a user copying a path out of Explorer gets a
+    /// quoted one, and the same tolerance every other value already has.
+    #[test]
+    fn a_quoted_folder_path_is_accepted() {
+        assert_eq!(
+            Settings::parse(r#"last_folder = "C:\My work folder\Snor""#).last_folder,
+            Some(PathBuf::from(r"C:\My work folder\Snor"))
+        );
     }
 
     #[test]
