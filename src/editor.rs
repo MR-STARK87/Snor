@@ -381,6 +381,34 @@ fn disk_stamp(path: &Path) -> Option<DiskStamp> {
     })
 }
 
+/// The one spelling of a path the editor will store for an open file.
+///
+/// Two spellings of one file — `src\main.rs` and `.\src\main.rs`, or a path
+/// that differs only in case — used to open two buffers, and whichever was
+/// saved last silently overwrote the other's work with no warning. Comparing
+/// against a canonical path collapses them to the one tab they always were.
+///
+/// Falls back to the path as given when the filesystem cannot canonicalise it
+/// (a file that does not exist yet is still openable), because a failure here
+/// must never be the reason a file will not open.
+fn canonical_for_open(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// A temp path beside `path` for an atomic save.
+///
+/// Same directory on purpose: a rename that stayed on one volume is a single
+/// filesystem operation, while a rename across volumes is a copy and therefore
+/// not atomic. Dot-prefixed so the explorer's hidden-file rule keeps it out of
+/// the tree for the moment it exists.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "snor".to_string());
+    path.with_file_name(format!(".{name}.snor-tmp"))
+}
+
 pub struct OpenBuffer {
     pub path: PathBuf,
     pub lang: String,
@@ -403,7 +431,25 @@ impl OpenBuffer {
     fn open(path: PathBuf) -> anyhow::Result<Self> {
         let meta = std::fs::metadata(&path)?;
         let too_large = meta.len() > LARGE_FILE_BYTES as u64;
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|_| String::from("<binary>"));
+        // A file that is not UTF-8 text is refused, not replaced with a
+        // placeholder.
+        //
+        // This used to fall back to the literal string `<binary>`, mark the
+        // buffer clean and leave it fully editable — so opening a PNG, an .exe
+        // or a Latin-1 file and typing a single character wrote nine ASCII bytes
+        // over the original on save. The failure was silent, irreversible, and
+        // one double-click away in the explorer. A file this editor cannot read
+        // as text is a file it must not offer to save.
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                anyhow::anyhow!(
+                    "{} is not UTF-8 text — binary files cannot be opened here",
+                    path.display()
+                )
+            } else {
+                anyhow::anyhow!("could not read {}: {e}", path.display())
+            }
+        })?;
         let lang = language_for(&path).to_string();
         let lines = ropey::Rope::from_str(&text).len_lines();
         Ok(Self {
@@ -418,8 +464,27 @@ impl OpenBuffer {
         })
     }
 
+    /// Write the buffer to disk, atomically.
+    ///
+    /// A plain `fs::write` truncates the target and then writes it, so a crash,
+    /// a full disk or a power cut between those two steps leaves the user's file
+    /// truncated rather than intact — and the editor is the thing holding the
+    /// only other copy. Writing a sibling temp file and renaming it over the
+    /// target makes the replacement a single filesystem operation: the file on
+    /// disk is either the old contents or the new ones, never half of each.
     fn save(&mut self) -> anyhow::Result<()> {
-        std::fs::write(&self.path, &self.text)?;
+        let tmp = temp_sibling(&self.path);
+        if let Err(e) = std::fs::write(&tmp, &self.text) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        // `rename` replaces an existing file on Windows as well as Unix, so the
+        // target is never absent. A failed rename leaves the original untouched
+        // and `dirty` still set, so the save can be retried.
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         self.dirty = false;
         // Re-stamp from disk rather than assuming: the write is what we now
         // believe is there, and reading the file back is what proves it. It
@@ -552,6 +617,11 @@ impl Editor {
     }
 
     pub fn open_file(&mut self, path: PathBuf) {
+        // One file, one tab. The comparison has to be made against a single
+        // spelling of the path, or two references to the same file open two
+        // buffers that then overwrite each other with no warning. See
+        // [`canonical_for_open`].
+        let path = canonical_for_open(path);
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
             self.active = idx;
             return;
@@ -1539,6 +1609,72 @@ mod tests {
         ed.pending_close = None;
         assert!(!ed.close_tab(0), "the last tab still reports the empty list");
         assert!(!ed.has_unsaved());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening a file that is not UTF-8 text must fail, not quietly become an
+    /// editable `<binary>` buffer. The old fallback wrote nine ASCII bytes over
+    /// the original on the first save, silently and irreversibly.
+    #[test]
+    fn a_binary_file_is_refused_rather_than_replaced() {
+        let dir = std::env::temp_dir().join("snor_editor_binary_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob.bin");
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0x01];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        assert!(ed.tabs.is_empty(), "a binary file must not open as a buffer");
+        assert!(ed.error.is_some(), "and the refusal must be reported");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "the original bytes must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save replaces the file in one step and leaves no temp file behind.
+    #[test]
+    fn saving_is_atomic_and_leaves_no_temp_behind() {
+        let dir = std::env::temp_dir().join("snor_editor_atomic_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("atomic.txt");
+        std::fs::write(&path, "before\n").unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        ed.tabs[0].text = "after\n".to_string();
+        ed.tabs[0].dirty = true;
+        ed.save_active();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(!ed.tabs[0].dirty);
+        let leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains("snor-tmp"));
+        assert!(!leftover, "the temp file must not outlive the save");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One file, one tab, however the path was written.
+    #[test]
+    fn one_file_opens_once_however_its_path_is_spelled() {
+        let dir = std::env::temp_dir().join("snor_editor_one_tab_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = dir.join("main.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut ed = Editor::new();
+        ed.open_file(path.clone());
+        // The same file reached through a detour that canonicalises away.
+        ed.open_file(sub.join("..").join("main.rs"));
+        assert_eq!(ed.tabs.len(), 1, "a second spelling is the same tab");
+        assert_eq!(ed.active, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
