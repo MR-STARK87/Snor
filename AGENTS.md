@@ -791,9 +791,9 @@ are the app's own prompt buttons, lifted from the editor's empty state into
   `a_level_outside_what_wmi_accepts_is_clamped`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
-- The regression tests for the `BUGS.html` audit — one per finding that was
-  fixed, plus one that locks in the guard the audit's only false positive
-  claimed was missing: `a_binary_file_is_refused_rather_than_replaced`,
+- The regression tests for the bug audit that produced these fixes — one per
+  finding that was fixed, plus one that locks in the guard the audit's only false
+  positive claimed was missing: `a_binary_file_is_refused_rather_than_replaced`,
   `saving_is_atomic_and_leaves_no_temp_behind`,
   `one_file_opens_once_however_its_path_is_spelled`,
   `a_git_file_pointing_outside_the_repository_names_no_repository`,
