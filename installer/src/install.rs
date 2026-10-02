@@ -103,6 +103,24 @@ pub fn install(
     report: &mut dyn FnMut(usize),
 ) -> Result<(), String> {
     let dir = &plan.dir;
+    // The folder has to be a real, absolute directory that is not a drive root.
+    //
+    // `create_dir_all("")` fails, so an empty path was never *writable* — but an
+    // absolute path was taken at face value, and this is the directory the
+    // uninstaller later hands to `rmdir /S /Q`. A drive root is not an install
+    // location: `rmdir /S /Q C:\` is the whole disk.
+    if dir.as_os_str().is_empty() || !dir.is_absolute() {
+        return Err(format!(
+            "the install folder must be an absolute path — \"{}\" is not one",
+            dir.display()
+        ));
+    }
+    if dir.parent().is_none() {
+        return Err(format!(
+            "refusing to install into {}, which is a drive root — choose a folder",
+            dir.display()
+        ));
+    }
 
     report(0);
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
@@ -134,6 +152,19 @@ pub fn install(
 /// Uninstall Snor. The installed `uninstall.exe` is running from inside `dir`,
 /// which is why the directory's own removal is handed off rather than done.
 pub fn uninstall(dir: &Path, report: &mut dyn FnMut(usize)) -> Result<(), String> {
+    // Only an actual installation may be removed.
+    //
+    // The last step of an uninstall hands this whole directory to
+    // `rmdir /S /Q`, so a wrong `dir` is not one wrong shortcut removed — it is
+    // a directory tree. The manifest is what makes a folder an install, and it
+    // is the same check `Launch::detect` makes; this is the layer that holds if
+    // anything ever calls `uninstall` by another route.
+    if !dir.join(MANIFEST).is_file() {
+        return Err(format!(
+            "{} is not a Snor installation (no {MANIFEST}) — nothing was removed",
+            dir.display()
+        ));
+    }
     report(0);
     for shortcut in read_manifest(dir).shortcuts {
         // Best effort: a shortcut the user already deleted is the outcome we
@@ -177,6 +208,11 @@ pub fn uninstall(dir: &Path, report: &mut dyn FnMut(usize)) -> Result<(), String
 /// The working directory moves off the folder first, or the handle this
 /// process holds on it would keep `rmdir` from succeeding.
 pub fn schedule_cleanup(dir: &Path) {
+    // Never hand a drive root (or an empty path) to the batch file: it runs
+    // `rmdir /S /Q` on whatever it is given, and `C:\` is the whole disk.
+    if dir.as_os_str().is_empty() || dir.parent().is_none() {
+        return;
+    }
     let batch = std::env::temp_dir().join(format!("snor-uninstall-{}.cmd", std::process::id()));
     if std::fs::write(&batch, cleanup_script(dir)).is_err() {
         return;
@@ -397,10 +433,49 @@ fn read_manifest(dir: &Path) -> Manifest {
             continue;
         };
         if key.trim() == "shortcut" {
-            manifest.shortcuts.push(PathBuf::from(value.trim()));
+            let path = PathBuf::from(value.trim());
+            // Only a path that could be one of the shortcuts this installer
+            // creates. The manifest is plain text a user can edit, and uninstall
+            // deletes every path it reads back — so `shortcut=C:\...\thesis.docx`
+            // used to delete that document during an ordinary uninstall. Failing
+            // closed on one bad line beats deleting a file we never created.
+            if looks_like_a_shortcut(&path) {
+                manifest.shortcuts.push(path);
+            }
         }
     }
     manifest
+}
+
+/// Whether `path` could be one of the shortcuts this installer creates.
+///
+/// Install writes `Snor.lnk` into the Desktop and the Start Menu's programs
+/// folder — both resolved through PowerShell's known-folder call, which is what
+/// makes a redirected Desktop work — and records the full paths. Uninstall then
+/// deletes exactly what was recorded, so the reader has to be suspicious of its
+/// own file.
+///
+/// The test is structural rather than a re-derived path: the recorded path is
+/// still what gets deleted, never a guess. A `.lnk` inside a Desktop or a Start
+/// Menu tree passes, including a redirected `…\OneDrive\Desktop\Snor.lnk`; a
+/// `.lnk` anywhere else, and every non-link, is skipped. Leaving one stale
+/// shortcut behind is a nuisance; deleting a file the installer never created is
+/// not, so this fails closed.
+fn looks_like_a_shortcut(path: &Path) -> bool {
+    let is_lnk = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"));
+    if !is_lnk || !path.is_absolute() {
+        return false;
+    }
+    path.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.eq_ignore_ascii_case("Desktop")
+                || name.eq_ignore_ascii_case("Programs")
+                || name.eq_ignore_ascii_case("Start Menu")
+        })
+    })
 }
 
 #[derive(Default)]
@@ -507,5 +582,102 @@ mod tests {
             .collect();
         assert_eq!(decode_console(&utf16), "ERROR: access denied");
         assert_eq!(decode_console(b"plain utf-8"), "plain utf-8");
+    }
+
+    /// A manifest line naming something other than one of our shortcuts is
+    /// skipped, because uninstall deletes whatever the manifest names.
+    #[test]
+    fn a_manifest_line_outside_a_shortcut_folder_is_ignored() {
+        let dir = temp_dir("manifest-guard");
+        let good_desktop = PathBuf::from(r"C:\Users\someone\Desktop\Snor.lnk");
+        let good_start = PathBuf::from(r"C:\Users\someone\Start Menu\Programs\Snor.lnk");
+        let redirected = PathBuf::from(r"C:\Users\someone\OneDrive\Desktop\Snor.lnk");
+        let text = format!(
+            "version=1\n\
+             shortcut={}\n\
+             shortcut={}\n\
+             shortcut={}\n\
+             shortcut=C:\\Users\\someone\\Documents\\thesis.docx\n\
+             shortcut=C:\\Users\\someone\\Desktop\\notalink.txt\n\
+             shortcut=relative\\Snor.lnk\n",
+            good_desktop.display(),
+            good_start.display(),
+            redirected.display()
+        );
+        std::fs::write(dir.join(MANIFEST), text).expect("write manifest");
+
+        let found = read_manifest(&dir).shortcuts;
+        assert_eq!(
+            found,
+            vec![good_desktop, good_start, redirected],
+            "only .lnk files inside a Desktop or Start Menu tree may be removed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The structural shortcut test, in isolation.
+    #[test]
+    fn only_links_in_known_trees_look_like_shortcuts() {
+        assert!(looks_like_a_shortcut(Path::new(
+            r"C:\Users\me\Desktop\Snor.lnk"
+        )));
+        assert!(looks_like_a_shortcut(Path::new(
+            r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Snor.lnk"
+        )));
+        assert!(looks_like_a_shortcut(Path::new(
+            r"C:\Users\me\OneDrive\Desktop\Snor.LNK"
+        )));
+        assert!(!looks_like_a_shortcut(Path::new(
+            r"C:\Users\me\Documents\thesis.docx"
+        )));
+        assert!(!looks_like_a_shortcut(Path::new(
+            r"C:\Users\me\Documents\thesis.lnk"
+        )));
+        assert!(!looks_like_a_shortcut(Path::new(r"Desktop\Snor.lnk")));
+    }
+
+    /// Installing into a drive root is refused: uninstall hands that directory
+    /// to `rmdir /S /Q`, which at a root is the whole disk.
+    #[test]
+    fn installing_into_a_drive_root_is_refused() {
+        let bundle = Bundle {
+            exe: b"app".to_vec(),
+            prefix_len: 0,
+        };
+        let mut report = |_| {};
+        let root = Plan {
+            dir: PathBuf::from(r"C:\"),
+            start_menu: false,
+            desktop: false,
+        };
+        let error = install(&root, &bundle, Path::new("nope.exe"), &mut report)
+            .expect_err("a drive root is not an install location");
+        assert!(error.contains("drive root"), "unexpected message: {error}");
+
+        // An empty path is refused for the same reason, before anything is made.
+        let empty = Plan {
+            dir: PathBuf::new(),
+            start_menu: false,
+            desktop: false,
+        };
+        let error = install(&empty, &bundle, Path::new("nope.exe"), &mut report)
+            .expect_err("an empty path is not an install location");
+        assert!(error.contains("absolute"), "unexpected message: {error}");
+    }
+
+    /// Uninstall refuses a folder that is not an install, so no call path can
+    /// hand `rmdir /S /Q` a directory tree it did not create.
+    #[test]
+    fn uninstalling_a_folder_that_is_not_an_install_is_refused() {
+        let dir = temp_dir("not-an-install");
+        std::fs::write(dir.join("important.txt"), "keep me").expect("write");
+        let mut report = |_| {};
+        let error = uninstall(&dir, &mut report).expect_err("no manifest, no uninstall");
+        assert!(error.contains(MANIFEST), "unexpected message: {error}");
+        assert!(
+            dir.join("important.txt").exists(),
+            "nothing may be removed from a folder that is not an install"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

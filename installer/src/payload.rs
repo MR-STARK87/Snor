@@ -85,8 +85,13 @@ pub fn parse(file: &[u8]) -> Result<Option<Bundle>, String> {
     }
     let payload_len = u64::from_le_bytes(tail[12..20].try_into().expect("8 bytes"));
     let fnv = u64::from_le_bytes(tail[20..28].try_into().expect("8 bytes"));
-    let payload_start = len
-        .checked_sub(FOOTER_LEN + payload_len)
+    // `FOOTER_LEN + payload_len` can overflow on its own. `payload_len` is read
+    // from the file, so a crafted footer can carry `u64::MAX` and the addition
+    // panics in a debug build (and silently wraps in a release one) before
+    // `checked_sub` is ever reached. Both steps are checked, in order.
+    let payload_start = FOOTER_LEN
+        .checked_add(payload_len)
+        .and_then(|end| len.checked_sub(end))
         .ok_or_else(|| "this setup file is truncated — download a fresh copy".to_string())?;
     let payload = &file[payload_start as usize..(len - FOOTER_LEN) as usize];
     if fnv1a(payload) != fnv {
@@ -191,6 +196,21 @@ mod tests {
         file.extend_from_slice(app);
         file.extend_from_slice(&footer(app.len() as u64 + 100, fnv1a(app)));
         let error = parse(&file).expect_err("truncation must be an error");
+        assert!(error.contains("truncated"), "unexpected message: {error}");
+    }
+
+    /// A footer claiming an impossible payload length is refused, not added.
+    ///
+    /// `FOOTER_LEN + payload_len` used to overflow here: `payload_len` comes from
+    /// the file, so `u64::MAX` is a value the file controls, and the addition
+    /// panicked in a debug build before the length check could refuse it.
+    #[test]
+    fn a_footer_claiming_an_impossible_length_is_refused() {
+        let app = b"the app";
+        let mut file = b"setup".to_vec();
+        file.extend_from_slice(app);
+        file.extend_from_slice(&footer(u64::MAX, fnv1a(app)));
+        let error = parse(&file).expect_err("an impossible length must be an error");
         assert!(error.contains("truncated"), "unexpected message: {error}");
     }
 

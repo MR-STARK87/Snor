@@ -6,7 +6,7 @@
 //! deliberately absent relative to the app: maximise and the resize bands, and
 //! the F11 path — this is a fixed dialog, and there is no workspace behind it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
@@ -51,10 +51,36 @@ pub enum Launch {
 
 impl Launch {
     pub fn detect() -> Self {
-        let exe = std::env::current_exe().unwrap_or_default();
+        // `current_exe` failing used to fall back to an empty path, which then
+        // made `dir` the empty directory — and the uninstaller's whole job is to
+        // delete *the directory it is in*. Refusing is the only safe answer.
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                return Launch::MissingPayload(format!(
+                    "could not locate this program's own file ({e}) — run setup from a \
+                     folder it can read"
+                ));
+            }
+        };
         let dir = exe.parent().map(PathBuf::from).unwrap_or_default();
-        if std::env::args().any(|arg| arg == "--uninstall") {
-            return Launch::Uninstall(dir);
+        // `args_os`, not `args`: `args()` panics on an argument that is not valid
+        // Unicode, so a path carrying an unpaired surrogate would take the
+        // installer down before its window ever opened.
+        if std::env::args_os().any(|arg| arg.to_string_lossy() == "--uninstall") {
+            // `--uninstall` is honoured only beside an actual installation. It
+            // used to name *whichever* directory held this binary, and a
+            // finished uninstall hands that whole directory to `rmdir /S /Q` —
+            // so `target\release\snor-setup.exe --uninstall`, or a copy dropped
+            // on the Desktop, erased the build tree or the Desktop itself.
+            if dir.join(install::MANIFEST).is_file() {
+                return Launch::Uninstall(dir);
+            }
+            return Launch::MissingPayload(
+                "there is no Snor installation beside this file, so there is nothing to \
+                 remove. Run the uninstaller from the folder Snor was installed into."
+                    .into(),
+            );
         }
         match crate::payload::parse_file(&exe) {
             Ok(Some(bundle)) => Launch::Install(bundle),
@@ -68,16 +94,14 @@ impl Launch {
                     return Launch::Uninstall(dir);
                 }
                 match crate::payload::sidecar(&exe) {
-                    Some(sidecar) => match std::fs::read(&sidecar) {
+                    Some(sidecar) => match read_sidecar(&sidecar) {
                         Ok(app) => Launch::Install(Bundle {
                             exe: app,
                             prefix_len: std::fs::metadata(&exe)
                                 .map(|meta| meta.len())
                                 .unwrap_or(0),
                         }),
-                        Err(e) => {
-                            Launch::MissingPayload(format!("could not read {}: {e}", sidecar.display()))
-                        }
+                        Err(message) => Launch::MissingPayload(message),
                     },
                     None => Launch::MissingPayload(
                         "This copy of Snor Setup does not contain Snor. \
@@ -96,6 +120,34 @@ impl Launch {
         }
     }
 }
+/// The largest file this installer will accept as a sidecar payload.
+///
+/// The sidecar path has neither a length nor a checksum to check — it is just a
+/// file named `snor.exe` sitting beside the setup binary — so an unbounded
+/// `fs::read` would pull a multi-gigabyte file fully into memory (and then write
+/// a second copy of it) before anything looked at the contents. A cap is not
+/// verification; it is the one sanity check this path can make, and it fails
+/// closed rather than writing whatever was found.
+const MAX_SIDECAR_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read the sidecar `snor.exe`, refusing anything that is not a plausible app.
+///
+/// Used only by `Launch::detect`'s development fallback. A release install comes
+/// from a bundle, whose payload is length-checked and checksummed; this path
+/// exists so `cargo run -p snor-installer --bin snor-setup` works beside a build.
+fn read_sidecar(path: &Path) -> Result<Vec<u8>, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_SIDECAR_BYTES {
+        return Err(format!(
+            "{} is not a usable Snor payload ({} bytes)",
+            path.display(),
+            meta.len()
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Install,
@@ -382,7 +434,12 @@ impl SetupApp {
         let editing = ui.memory(|m| m.focused().is_some());
         let enter =
             !editing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // Escape closes from anywhere except a running install — but not while a
+        // text field owns the keyboard. `enter` above was already guarded this
+        // way; `escape` was not, so pressing Escape to dismiss a path field closed
+        // the whole wizard mid-edit instead of just the field.
+        let escape = !editing
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if escape && self.screen != Screen::Progress {
             self.close(ui.ctx());
             return;

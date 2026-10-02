@@ -15,10 +15,12 @@ use std::path::Path;
 use snor_installer::payload;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os`, not `args`: `args()` panics on an argument that is not valid
+    // Unicode, and a Windows path can carry code units that are not.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
-        [flag, file] if flag == "--verify" => verify(Path::new(file)),
-        [flag] if flag == "--help" || flag == "-h" => {
+        [flag, file] if flag.to_string_lossy() == "--verify" => verify(Path::new(file)),
+        [flag] if matches!(flag.to_string_lossy().as_ref(), "--help" | "-h") => {
             println!("{}", usage());
             Ok(())
         }
