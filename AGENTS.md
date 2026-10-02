@@ -768,7 +768,7 @@ are the app's own prompt buttons, lifted from the editor's empty state into
 
 ## Tests
 
-- `cargo test` must stay green (115 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (125 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -781,20 +781,37 @@ are the app's own prompt buttons, lifted from the editor's empty state into
   `closing_the_last_tab_empties_the_list_without_underflow`, the three
   window-placement tests (`floating_window_is_placed_fully_on_screen`,
   `a_window_taller_than_the_monitor_is_shrunk_to_fit`,
-  `a_misreported_monitor_cannot_produce_a_negative_size`), the nineteen
+  `a_misreported_monitor_cannot_produce_a_negative_size`), the twenty
   settings tests (round trip, missing/unknown/malformed keys, clamping,
-  the key list, a real save/reload, a remembered folder with spaces in it), the
+  the key list, a real save/reload, a remembered folder with spaces in it, an
+  unknown `shell =` being named rather than silently ignored), the
   three dim-level tests
   (`changing_the_level_while_dimmed_applies_it_without_losing_the_restore`,
   `changing_the_level_while_idle_touches_nothing`,
   `a_level_outside_what_wmi_accepts_is_clamped`), and
   `pty_powershell_echo_roundtrip` (Windows-only, spawns a real shell;
   bounded ~20s; proves spawn/write/poll/responder end to end).
-- `cargo test -p snor-installer` must stay green (19 tests): the bundle round
+- The regression tests for the `BUGS.html` audit — one per finding that was
+  fixed, plus one that locks in the guard the audit's only false positive
+  claimed was missing: `a_binary_file_is_refused_rather_than_replaced`,
+  `saving_is_atomic_and_leaves_no_temp_behind`,
+  `one_file_opens_once_however_its_path_is_spelled`,
+  `a_git_file_pointing_outside_the_repository_names_no_repository`,
+  `deleting_a_directory_symlink_leaves_its_target_alone`,
+  `create_and_rename_refuse_a_path_in_a_name`, `find_prefers_the_newest_matches`,
+  `find_results_do_not_survive_a_tab_switch`,
+  `a_tail_trimmed_to_the_cap_lands_on_a_character_boundary`, and the
+  sub-minimum pair case added to `flow_divider_drag_trades_neighbours`.
+- `cargo test -p snor-installer` must stay green (25 tests): the bundle round
   trip, corruption and truncation refusal, idempotent repacking, the manifest
   round trip, PowerShell quoting, the cleanup command, UTF-16 console
   decoding, the window-placement trio, and pasted-path cleanup — plus the
-  shared `theme` tests, which run in both crates.
+  shared `theme` tests, which run in both crates — and the audit's own:
+  `a_footer_claiming_an_impossible_length_is_refused`,
+  `a_manifest_line_outside_a_shortcut_folder_is_ignored`,
+  `only_links_in_known_trees_look_like_shortcuts`,
+  `installing_into_a_drive_root_is_refused`,
+  `uninstalling_a_folder_that_is_not_an_install_is_refused`.
 - Hermetic twins for the newer behaviour, none of which needs a pty because
   `Session::ingest` is the same call `poll` makes:
   `wheel_history_holds_what_has_scrolled_off_the_screen`,
