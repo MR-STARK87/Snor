@@ -50,11 +50,37 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(target);
-    Some(if path.is_absolute() {
+    let resolved = if path.is_absolute() {
         path
     } else {
         root.join(path)
-    })
+    };
+    // The indirection is only followed to somewhere a repository can plausibly
+    // keep its git directory.
+    //
+    // A `.git` *file* is a pointer the workspace itself controls, so a careless
+    // or hostile one could name `C:\Windows\System32` or climb out with
+    // `..\..\..` — and this app would read a `HEAD` from there every two seconds
+    // and print the result in the status bar. Requiring the resolved directory to
+    // sit inside the workspace, or in the directory that holds it, keeps the two
+    // real shapes working and treats a pointer past the repository as no
+    // repository at all.
+    //
+    // `root.parent()` rather than just `root` is load-bearing, not lax: a linked
+    // worktree's git directory is a *sibling* of the worktree (`<repo>\wt` ->
+    // `<repo>\main-git`) and a submodule's lives in `<repo>\.git\modules\…`, so a
+    // strict "inside the root" test would refuse exactly the case this whole
+    // branch exists to support. See `a_worktree_git_file_is_followed`.
+    let root = std::fs::canonicalize(root).ok()?;
+    let resolved = std::fs::canonicalize(&resolved).ok()?;
+    let inside = resolved.starts_with(&root)
+        || root
+            .parent()
+            .is_some_and(|up| resolved.starts_with(up));
+    if !resolved.is_dir() || !inside {
+        return None;
+    }
+    Some(resolved)
 }
 
 /// The branch checked out in the repository at `root`, if there is one.
@@ -150,6 +176,31 @@ mod tests {
         std::fs::write(wt.join(".git"), "gitdir: ../main-git\n").unwrap();
         assert_eq!(branch(&wt).as_deref(), Some("agent-2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.git` file that points outside the repository names no repository.
+    ///
+    /// The workspace controls its own `.git` pointer, so without a containment
+    /// check a checkout could aim the status bar's branch read anywhere on disk.
+    /// The target here is outside the workspace *and* outside the directory
+    /// holding it — which is the furthest the worktree case ever needs to reach.
+    #[test]
+    fn a_git_file_pointing_outside_the_repository_names_no_repository() {
+        let base = temp("snor_git_escape_test");
+        let wt = base.join("project");
+        std::fs::create_dir_all(&wt).unwrap();
+        let outside = std::env::temp_dir().join("snor_git_escape_landing");
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(HEAD), "ref: refs/heads/leaked\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", outside.display())).unwrap();
+        assert_eq!(
+            branch(&wt),
+            None,
+            "a gitdir outside the repository must be refused"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
