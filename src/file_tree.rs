@@ -268,9 +268,23 @@ fn build_nodes(dir: &Path, depth: usize, show_hidden: bool) -> Vec<FileNode> {
             continue;
         }
         let path = entry.path();
+        // `is_dir` follows the link so the row still reads as a folder, but the
+        // recursion must not: a directory symlink pointing at an ancestor (or at
+        // a sibling tree) walks the same directory twice, and a cyclic pair would
+        // spend the whole 2000-entry budget re-expanding folders the user never
+        // opened. The link is listed; only its contents are skipped.
         let is_dir = path.is_dir();
+        let is_link_dir = is_dir
+            && entry
+                .file_type()
+                .map(|t| t.is_symlink())
+                .unwrap_or(false);
         if is_dir {
-            let children = build_nodes(&path, depth + 1, show_hidden);
+            let children = if is_link_dir {
+                Vec::new()
+            } else {
+                build_nodes(&path, depth + 1, show_hidden)
+            };
             dirs.push(FileNode {
                 path,
                 name,
@@ -607,7 +621,36 @@ impl FileTree {
             Some(p) => p,
             None => return,
         };
-        let res = if target.is_dir() {
+        // Remove the entry itself, never what it points at.
+        //
+        // `is_dir()` follows symlinks, so a link to a directory used to be
+        // deleted *as* a directory: `remove_dir_all` emptied the link's target,
+        // which can be a tree outside the workspace the user never meant to
+        // touch, while the confirm modal named only the link. `symlink_metadata`
+        // describes the entry rather than its target, so a link — to a file or a
+        // directory — is unlinked with `remove_file` and the target is left
+        // alone.
+        let meta = match std::fs::symlink_metadata(&target) {
+            Ok(meta) => meta,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
+        let is_link = meta.file_type().is_symlink();
+        let res = if is_link {
+            // A link is unlinked, never followed. Which call does the unlinking
+            // depends on what the link points at — a directory symlink or a
+            // junction needs `remove_dir`, because Windows' `DeleteFile` refuses
+            // a directory reparse point, while a file link needs `remove_file`.
+            // `is_dir()` is consulted only to choose the call; nothing is ever
+            // deleted *through* it.
+            if target.is_dir() {
+                std::fs::remove_dir(&target)
+            } else {
+                std::fs::remove_file(&target)
+            }
+        } else if meta.is_dir() {
             std::fs::remove_dir_all(&target)
         } else {
             std::fs::remove_file(&target)
@@ -1185,5 +1228,82 @@ mod tests {
         assert!(!tree.is_expanded(&inner), "folder did not close");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file name is one path segment.
+    ///
+    /// This is the guard the audit's finding 23 claimed was missing; it was
+    /// already in `do_create`/`do_rename`, and this is the test that keeps it
+    /// there — a name carrying a separator must be refused rather than joined
+    /// onto the parent and written outside it.
+    #[test]
+    fn create_and_rename_refuse_a_path_in_a_name() {
+        let dir = std::env::temp_dir().join("snor_tree_name_guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), "keep").unwrap();
+
+        let mut tree = FileTree::new(dir.clone());
+        for bad in ["sub\\evil.rs", "../sibling.txt", "a/b.rs", ".."] {
+            tree.begin_create_at_root(false);
+            tree.create_name = bad.to_string();
+            tree.do_create();
+            assert!(tree.error.is_some(), "{bad} must be refused");
+        }
+        assert!(
+            !dir.parent().unwrap().join("sibling.txt").exists(),
+            "nothing may be written outside the folder"
+        );
+        assert!(!dir.join("sub").exists());
+
+        tree.rename_target = Some(dir.join("keep.txt"));
+        tree.rename_buf = "..\\escaped.txt".to_string();
+        tree.do_rename();
+        assert!(tree.error.is_some(), "a rename must refuse a path too");
+        assert!(dir.join("keep.txt").exists(), "the file must be untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a symlink removes the link, never the tree behind it.
+    ///
+    /// `is_dir()` follows the link, so the old delete path called
+    /// `remove_dir_all` on the link and emptied whatever it pointed at — which
+    /// can be a directory outside the workspace, named in the confirm modal only
+    /// as the link.
+    #[test]
+    fn deleting_a_directory_symlink_leaves_its_target_alone() {
+        let base = std::env::temp_dir().join("snor_tree_symlink_delete");
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "important").unwrap();
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("link");
+
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        #[cfg(not(windows))]
+        let created = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if !created {
+            // Creating a symlink needs Developer Mode or elevation on Windows.
+            // When the machine will not allow it there is nothing to assert.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let mut tree = FileTree::new(root.clone());
+        tree.delete_target = Some(link.clone());
+        tree.do_delete();
+
+        assert!(
+            link.symlink_metadata().is_err(),
+            "the link itself must be gone"
+        );
+        assert!(
+            outside.join("keep.txt").exists(),
+            "the link's target must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
