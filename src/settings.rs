@@ -270,21 +270,24 @@ impl Settings {
         }
     }
 
-    /// Read the settings file, or the defaults if there is not one.
+    /// Read the settings file, plus the one reading complaint there is to make.
     ///
     /// Never fails: an unreadable or malformed file is treated as "no
-    /// preferences yet" rather than as a reason not to start. The user can
-    /// still open the app and fix it from the panel.
-    pub fn load() -> Self {
-        Self::load_from(&Self::path())
-    }
-
-    /// Split out so the load path can be tested against a temp file instead of
-    /// the real profile.
-    pub fn load_from(path: &std::path::Path) -> Self {
+    /// preferences yet" rather than as a reason not to start. The user can still
+    /// open the app and fix it from the panel. The path is a parameter so this
+    /// can be tested against a temp file instead of the real profile.
+    ///
+    /// `parse` is total and silent on purpose — a bad value keeps its default
+    /// rather than blocking startup — but an unrecognised `shell = …` is worth
+    /// naming once: the file says `shell = nu`, every launch starts PowerShell
+    /// instead, and nothing anywhere says why. Every other key is either clamped
+    /// into range (and so visibly wrong on screen) or ignored without a
+    /// consequence the user could notice. Returns the settings and, when it
+    /// applies, the complaint.
+    pub fn load_from_with_warning(path: &std::path::Path) -> (Self, Option<String>) {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text),
-            Err(_) => Self::default(),
+            Ok(text) => (Self::parse(&text), unknown_shell(&text)),
+            Err(_) => (Self::default(), None),
         }
     }
 
@@ -351,6 +354,36 @@ fn shell_from_key(key: &str) -> Option<ShellKind> {
         "wsl" => Some(ShellKind::Wsl),
         _ => None,
     }
+}
+
+/// The `shell = …` value in `text` that names no shell this version knows.
+///
+/// [`Settings::parse`] ignores it silently, which is the right default for this
+/// format and wrong for this one key: a shell is a deliberate choice, and one
+/// that quietly reverts to PowerShell on every launch reads as the app being
+/// broken rather than as a typo. Returns the offending value so the settings
+/// panel can name it. Total: anything that is not a `shell` line is skipped.
+fn unknown_shell(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "shell" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim();
+        if !value.is_empty() && shell_from_key(value).is_none() {
+            return Some(format!(
+                "settings: `shell = {value}` names no shell this version knows — starting {} instead",
+                ShellKind::default().label()
+            ));
+        }
+    }
+    None
 }
 
 /// Render an `f32` without an exponent or a trailing `.0`.
@@ -529,7 +562,7 @@ terminal_font = 14
         };
         s.save_to(&path).expect("save must create the directory and write");
 
-        assert_eq!(Settings::load_from(&path), s);
+        assert_eq!(Settings::load_from_with_warning(&path).0, s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -537,7 +570,7 @@ terminal_font = 14
     fn a_missing_file_loads_the_defaults_instead_of_failing() {
         let path = std::env::temp_dir().join("snor-settings-that-does-not-exist.toml");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(Settings::load_from(&path), Settings::default());
+        assert_eq!(Settings::load_from_with_warning(&path).0, Settings::default());
     }
 
     /// A remembered folder has to survive a save/load, not just the renderer.
@@ -592,5 +625,24 @@ terminal_font = 14
         assert_eq!(fmt_f32(13.0), "13");
         assert_eq!(fmt_f32(1.0), "1");
         assert_eq!(fmt_f32(0.0), "0");
+    }
+
+    /// A shell name nobody recognises is the one value the reader reports.
+    ///
+    /// `parse` keeps the default either way; the difference is that the user is
+    /// told, rather than left wondering why `shell = nu` starts PowerShell every
+    /// launch.
+    #[test]
+    fn an_unknown_shell_is_named_rather_than_silently_ignored() {
+        let bad = "shell = nu\nscrollback = 500\n";
+        assert_eq!(Settings::parse(bad).shell, ShellKind::PowerShell);
+        let warning = unknown_shell(bad).expect("an unknown shell must be reported");
+        assert!(warning.contains("nu"), "the warning must name the value: {warning}");
+
+        // A known shell, an empty value and a commented line are all silent.
+        assert!(unknown_shell("shell = wsl\n").is_none());
+        assert!(unknown_shell("shell =\n").is_none());
+        assert!(unknown_shell("# shell = nu\n").is_none());
+        assert!(unknown_shell("").is_none());
     }
 }

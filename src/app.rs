@@ -272,7 +272,7 @@ impl SnorApp {
         // Load before anything is built, so each component is born at the size
         // or shell the user chose rather than being corrected on frame one — a
         // grid that resized under the first prompt would look like a bug.
-        let settings = Settings::load();
+        let (settings, settings_warning) = Settings::load_from_with_warning(&Settings::path());
         cc.egui_ctx.set_zoom_factor(settings.ui_scale);
         let start_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // The remembered folder, or the invitation to pick one. See
@@ -310,7 +310,7 @@ impl SnorApp {
             settings_open: false,
             settings_dirty: false,
             refit_pending: false,
-            settings_error: None,
+            settings_error: settings_warning,
             flow: false,
             show_explorer: true,
             tree_w: TREE_DEFAULT_W,
@@ -638,7 +638,14 @@ impl SnorApp {
                     .changed();
                 hint(
                     ui,
-                    "scrollback applies to the next shell; a live session keeps the history it was built with.",
+                    &if self.terminal.session_count() == 0 {
+                        "scrollback applies to the next shell.".to_string()
+                    } else {
+                        format!(
+                            "scrollback applies to the next shell — the {} already open keep the history they were built with.",
+                            self.terminal.session_count()
+                        )
+                    },
                 );
 
                 ui.add_space(8.0);

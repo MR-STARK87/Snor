@@ -239,11 +239,21 @@ fn scan_notifications(tail: &mut Vec<u8>, chunk: &[u8]) -> Notifications {
     // Either the incomplete sequence, or nothing at all.
     let keep_from = if i < buf.len() { i } else { buf.len() };
     let kept = &buf[keep_from..];
-    let kept = if kept.len() > NOTIF_TAIL_MAX {
-        &kept[kept.len() - NOTIF_TAIL_MAX..]
-    } else {
-        kept
-    };
+    // Trim on a character boundary, not at a byte offset. Slicing mid-character
+    // is a panic, and an OSC body is free to hold multi-byte text (a UTF-8 pane
+    // title is the ordinary case). Walk forward at most three bytes to the next
+    // boundary; the cost is nothing and the alternative is a crash.
+    let mut kept = kept;
+    if kept.len() > NOTIF_TAIL_MAX {
+        let mut start = kept.len() - NOTIF_TAIL_MAX;
+        // Walk forward to a byte that is not a UTF-8 continuation byte
+        // (`0b10xxxxxx`), which is where a character begins. `[u8]`'s own
+        // `is_char_boundary` is not stable, and this is the same test.
+        while start < kept.len() && (kept[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+        kept = &kept[start..];
+    }
     *tail = kept.to_vec();
     out
 }
@@ -456,18 +466,31 @@ struct FindHit {
 /// is already beyond what anyone scrolls through by hand.
 const FIND_CAP: usize = 200;
 
-/// Find `query` in the visible screen and the whole scrollback.
+/// Most history offsets the walk will examine for one query, on top of the live
+/// screen.
+///
+/// The scrollback can be a hundred thousand rows, and walking all of it on the
+/// draw thread for every keystroke is a stall with no upside: the newest hits are
+/// the ones anyone steps through by hand. The walk stops when it has `cap`
+/// matches *or* has looked at this many rows, whichever comes first.
+const FIND_SCAN_CAP: usize = 4_000;
+
+/// Find `query` in the visible screen and the scrollback behind it.
 ///
 /// vt100 has no search and no history-length getter, so this walks the offsets
 /// it can reach: asking for the oldest line and reading back where the grid put
 /// the view is how the size of the history is learned (the request is clamped),
-/// and then each screenful is read in turn. The walk is one pass per frame of
-/// history, which is why the caller only runs it when the query changes — not
-/// every frame — and why the result count is capped.
+/// and then each screenful is read in turn. The walk is why the caller only runs
+/// it when the query changes — not every frame — and why both the rows examined
+/// and the results kept are capped.
 ///
 /// Leaves the screen at `at`, the offset the user was already looking at.
-/// Matches are non-overlapping and returned oldest first, so the last element is
-/// the most recent match — the one worth landing on by default.
+///
+/// Matches are non-overlapping and returned **newest first**: the live screen,
+/// row by row, then history one row at a time going back. The order is the point
+/// of the cap. Scanning oldest-first and stopping at `cap` kept the two hundred
+/// *oldest* matches in the buffer and could skip the live screen entirely — so a
+/// traceback that had just scrolled past was the one thing find would not show.
 fn find_hits(screen: &mut vt100::Screen, query: &str, at: usize, cap: usize) -> Vec<FindHit> {
     let needle: Vec<char> = query.trim().to_lowercase().chars().collect();
     if needle.is_empty() {
@@ -477,7 +500,16 @@ fn find_hits(screen: &mut vt100::Screen, query: &str, at: usize, cap: usize) -> 
     screen.set_scrollback(usize::MAX);
     let oldest = screen.scrollback();
     let mut hits: Vec<FindHit> = Vec::new();
-    // One row per history offset, not a whole screenful.
+    // The live screen first, and whole: it is the newest output and the only part
+    // of the grid the user is looking at.
+    screen.set_scrollback(0);
+    for row in 0..rows {
+        scan_row(screen, row, cols, &needle, 0, &mut hits);
+        if hits.len() >= cap {
+            break;
+        }
+    }
+    // Then history, one row per offset, newest offset first.
     //
     // Every line of history is visible in `rows` different windows, at a
     // different row in each, so scanning a full window per offset would report
@@ -485,19 +517,12 @@ fn find_hits(screen: &mut vt100::Screen, query: &str, at: usize, cap: usize) -> 
     // times before moving on. Each offset adds exactly one line that the offset
     // below it did not show, and that line is its row 0: the window at offset o
     // covers the `rows` lines ending `o` above the bottom, so increasing the
-    // offset by one reveals the top row and drops the bottom one. The live
-    // screen is the final window, and is scanned whole at offset 0.
-    for offset in (1..=oldest).rev() {
-        screen.set_scrollback(offset);
-        scan_row(screen, 0, cols, &needle, offset, &mut hits);
-        if hits.len() >= cap {
-            break;
-        }
-    }
+    // offset by one reveals the top row and drops the bottom one. The live screen
+    // is the final window, and was scanned whole above.
     if hits.len() < cap {
-        screen.set_scrollback(0);
-        for row in 0..rows {
-            scan_row(screen, row, cols, &needle, 0, &mut hits);
+        for offset in 1..=oldest.min(FIND_SCAN_CAP) {
+            screen.set_scrollback(offset);
+            scan_row(screen, 0, cols, &needle, offset, &mut hits);
             if hits.len() >= cap {
                 break;
             }
@@ -653,28 +678,30 @@ fn term_job(screen: &vt100::Screen, markup: Markup) -> eframe::egui::text::Layou
     // `vt100::Color` space and converting afterwards meant the cursor had to be
     // smuggled in as a fake RGB cell colour.
     for row in 0..rows {
-        let mut run = String::new();
+        // One row is `cols` cells wide, so the buffer is sized once instead of
+        // reallocating every few cells as the run grows.
+        let mut run = String::with_capacity(cols as usize);
         let mut run_fg = Color32::TRANSPARENT;
         let mut run_bg = Color32::TRANSPARENT;
         let mut started = false;
         for col in 0..cols {
-            let (fg, bg, bold, mut text) = match screen.cell(row, col) {
-                Some(cell) => (
-                    cell.fgcolor(),
-                    cell.bgcolor(),
-                    cell.bold(),
-                    cell.contents().to_string(),
-                ),
-                None => (
-                    vt100::Color::Default,
-                    vt100::Color::Default,
-                    false,
-                    " ".to_string(),
-                ),
+            // Borrowed text, not an owned `String` per cell: `contents().to_string()`
+            // allocated one string for every cell of every row — ~80k allocations
+            // per frame for a full-screen repaint — for text that is copied into
+            // `run` immediately afterwards. The cell outlives the borrow, so the
+            // `&str` is enough.
+            let (fg, bg, bold, text) = match screen.cell(row, col) {
+                Some(cell) => {
+                    let contents = cell.contents();
+                    (
+                        cell.fgcolor(),
+                        cell.bgcolor(),
+                        cell.bold(),
+                        if contents.is_empty() { " " } else { contents },
+                    )
+                }
+                None => (vt100::Color::Default, vt100::Color::Default, false, " "),
             };
-            if text.is_empty() {
-                text = " ".to_string();
-            }
             let mut fg32 = vt_color(fg, false);
             let mut bg32 = vt_color(bg, true);
             // Bold on a plain or dim colour is how a shell asks for "bright".
@@ -719,7 +746,7 @@ fn term_job(screen: &vt100::Screen, markup: Markup) -> eframe::egui::text::Layou
                 run_fg = fg32;
                 run_bg = bg32;
             }
-            run.push_str(&text);
+            run.push_str(text);
         }
         if !run.is_empty() {
             job.append(
@@ -1144,6 +1171,16 @@ impl Terminal {
         self.shell
     }
 
+    /// How many shells are live right now.
+    ///
+    /// Used by the settings panel to say how many sessions a scrollback change
+    /// will *not* reach: a parser's history depth is fixed when it is built, so
+    /// the row applies to the next shell and every open one keeps what it has.
+    /// Naming the number makes that scope visible instead of inferred.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// Clear a session's attention flag: its bell or its title was noticed.
     ///
     /// Called wherever focus lands on a session, and only there. Clearing it on
@@ -1207,6 +1244,8 @@ impl Terminal {
         self.sessions.push(session);
         self.active_tab = self.sessions.len() - 1;
         self.active = true;
+        // A new shell has no matches, and the old shell's are not its.
+        self.clear_find();
         // A new shell you cannot see is not a new shell.
         self.collapsed = false;
         self.reveal_active_tab = true;
@@ -1246,6 +1285,9 @@ impl Terminal {
         self.active = true;
         self.collapsed = false;
         self.reveal_active_tab = true;
+        // Same as `new_tab`: a new shell has no matches, and the old shell's are
+        // not its. Kept in step deliberately — this is the test twin of that path.
+        self.clear_find();
         Some(id)
     }
 
@@ -1259,7 +1301,14 @@ impl Terminal {
         if index >= self.sessions.len() {
             return;
         }
-        self.sessions.remove(index);
+        // Kill the shell before dropping it. Dropping a `portable_pty` child does
+        // not terminate the process, so closing a tab used to leave a live
+        // `powershell.exe` behind — one per close, each holding whatever its own
+        // working directory had in it, and each keeping its reader thread alive.
+        // Ten tabs opened and closed left ten shells running.
+        let mut gone = self.sessions.remove(index);
+        gone.shutdown();
+        self.clear_find();
         if self.sessions.is_empty() {
             self.active_tab = 0;
             self.active = false;
@@ -1327,6 +1376,9 @@ impl Terminal {
             self.active_tab = i;
             self.active = true;
             self.reveal_active_tab = true;
+            // Focus moved, so the find results belong to a shell that is no
+            // longer in front of the user.
+            self.clear_find();
         }
     }
 
@@ -1343,6 +1395,24 @@ impl Terminal {
 }
 
 impl Session {
+    /// Kill the shell process and drop every handle to it.
+    ///
+    /// `Drop`ping a `portable_pty` child does **not** terminate it: the child
+    /// keeps running and keeps its reader thread alive, so a closed tab or a
+    /// restart used to leak one live `powershell.exe` each time, holding files in
+    /// whatever directory it was started in. `kill` is the only thing that ends
+    /// it. The handles are dropped here too so `spawn` can rebuild them.
+    fn shutdown(&mut self) {
+        if let Some(child) = self._child.as_mut() {
+            let _ = child.kill();
+        }
+        self._child = None;
+        self._master = None;
+        self.writer = None;
+        self.rx = None;
+        self.running = false;
+    }
+
     fn spawn(&mut self, cwd: &PathBuf) {
         let pty_system = native_pty_system();
         let pair = match pty_system.openpty(PtySize {
@@ -1412,6 +1482,8 @@ impl Session {
             && let Err(e) = w.write_all(bytes).and_then(|_| w.flush())
         {
             self.error = Some(format!("pty write failed: {e}"));
+            // A failed write is how a dead shell announces itself.
+            self.running = false;
         }
     }
 }
@@ -1435,15 +1507,12 @@ impl Terminal {
     /// Send a full shell line (used by the editor Run button).
     ///
     /// Goes to the active shell: that is the one whose output the user is
-    /// watching, and the one the Run button's result should land in. Spawns a
-    /// shell first if the panel was emptied, so Run always has somewhere to go.
+    /// watching, and the one the Run button's result should land in. Goes through
+    /// [`Terminal::reveal`], which un-hides the section and spawns a shell if the
+    /// panel was emptied — so Run always has somewhere the user can see, rather
+    /// than a shell hidden behind a closed panel.
     pub fn send_line(&mut self, line: &str, cwd: &PathBuf) {
-        if self.sessions.is_empty() {
-            self.new_tab(cwd);
-        }
-        if self.collapsed {
-            self.collapsed = false;
-        }
+        self.reveal(cwd);
         self.active = true;
         let mut s = line.to_string();
         if !s.ends_with('\r') && !s.ends_with('\n') {
@@ -1573,21 +1642,42 @@ impl Session {
         }
     }
 
+    /// Most chunks drained from one shell in a single frame.
+    ///
+    /// A process writing as fast as it can hands us chunks faster than the window
+    /// draws, so an uncapped `while let Ok(_) = try_recv()` loop is a frame that
+    /// never ends — one runaway build and the whole app stops responding. What is
+    /// left over is not dropped, only deferred: it is still in the channel and is
+    /// taken on the next frame.
+    const MAX_CHUNKS_PER_POLL: usize = 512;
+
     /// Take whatever this shell's reader thread has produced.
     fn poll(&mut self) {
-        let chunks: Vec<Vec<u8>> = if let Some(rx) = &self.rx {
-            let mut out = Vec::new();
-            while let Ok(chunk) = rx.try_recv() {
-                out.push(chunk);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.rx {
+            while out.len() < Self::MAX_CHUNKS_PER_POLL {
+                match rx.try_recv() {
+                    Ok(chunk) => out.push(chunk),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // The reader thread has ended, which means the shell exited or
+                    // the master went away. Record it rather than leaving the
+                    // session looking alive forever — a closed shell that still
+                    // reads as running is a shell the user will type into.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
-            out
-        } else {
-            Vec::new()
-        };
-        if chunks.is_empty() {
+        }
+        if disconnected && self.running {
+            self.running = false;
+        }
+        if out.is_empty() {
             return;
         }
-        for chunk in &chunks {
+        for chunk in &out {
             self.ingest(chunk);
         }
     }
@@ -1810,6 +1900,8 @@ impl Terminal {
                 self.active_tab = i;
                 self.active = true;
                 self.reveal_active_tab = true;
+                // The hit list described the shell we just left.
+                self.clear_find();
             }
             if let Some(i) = close_tab {
                 self.close_tab(i);
@@ -1915,11 +2007,11 @@ impl Terminal {
                         // Restart this shell only. The other tabs keep their
                         // own ptys and their own scrollback.
                         if let Some(session) = self.session_mut() {
+                            // `shutdown` kills the process as well as dropping the
+                            // handles. Dropping alone left the old shell running and
+                            // orphaned one more on every restart.
+                            session.shutdown();
                             session.started = false;
-                            session.rx = None;
-                            session.writer = None;
-                            session._child = None;
-                            session._master = None;
                             let (rows, cols) = (session.rows, session.cols);
                             session.parser = vt100::Parser::new(rows, cols, scrollback);
                             session.error = None;
@@ -2164,33 +2256,34 @@ impl Terminal {
         // convention is the one everyone already has in their fingers, and it is
         // the only way to keep Ctrl+C as SIGINT without a collision;
         // `key_to_bytes` refuses the shifted form so it never reaches the shell.
-        let copy_key = ui.input_mut(|i| {
-            i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
-                eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
-                eframe::egui::Key::C,
-            ))
-        });
-        if copy_clicked || copy_key {
-            let text = self
-                .session()
-                .and_then(|s| s.selection.map(|sel| selection_text(s.parser.screen(), sel)));
-            if let Some(text) = text
-                && !text.is_empty()
-            {
-                ui.ctx().copy_text(text);
-            }
+        //
+        // The chord is consumed only when there is a selection to copy. Consuming
+        // it unconditionally made Ctrl+Shift+C dead for the whole app while
+        // nothing was selected — a shortcut that silently ate keystrokes for no
+        // benefit at all.
+        let copy_text_now = self
+            .session()
+            .and_then(|s| s.selection.map(|sel| selection_text(s.parser.screen(), sel)))
+            .filter(|text| !text.is_empty());
+        let copy_key = copy_text_now.is_some()
+            && ui.input_mut(|i| {
+                i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
+                    eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
+                    eframe::egui::Key::C,
+                ))
+            });
+        if (copy_clicked || copy_key)
+            && let Some(text) = copy_text_now
+        {
+            ui.ctx().copy_text(text);
         }
-        let paste_key = ui.input_mut(|i| {
-            i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
-                eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
-                eframe::egui::Key::V,
-            ))
-        });
-        if paste_clicked || paste_key {
+        if paste_clicked {
             // Asking the backend for the clipboard, which arrives as
             // `Event::Paste` and is forwarded to the pty by `forward_events`
             // like any other paste — egui has no direct clipboard read, and this
-            // is the path the shell already understands.
+            // is the path the shell already understands. The Ctrl+Shift+V chord
+            // itself lives in `forward_events` so Flow Mode panes get it too;
+            // this button is the tabbed layout's own.
             self.active = true;
             ui.ctx()
                 .send_viewport_cmd(eframe::egui::ViewportCommand::RequestPaste);
@@ -2204,11 +2297,23 @@ impl Terminal {
 }
 
 impl Terminal {
+    /// Forget the current find results.
+    ///
+    /// The hit list and the cursor into it belong to one shell's output, and both
+    /// live on `Terminal` rather than `Session` — so switching tabs used to leave
+    /// `3/12` in the bar and then scroll the *new* shell to the old shell's
+    /// offsets, which is a search pointing at text it never found. Clearing on
+    /// every focus change is enough: the query text stays put, and the next
+    /// keystroke re-runs it against the shell now in front of the user.
+    fn clear_find(&mut self) {
+        self.find_hits.clear();
+        self.find_pos = 0;
+    }
+
     /// Run the search again, and land on a hit.
     ///
-    /// `newest` decides which end to land on. When the query changes the newest
-    /// match is the interesting one — the traceback that just scrolled past —
-    /// and a step from there behaves like a step from anywhere else.
+    /// A fresh search always lands on the newest match — the traceback that just
+    /// scrolled past — because [`find_hits`] returns them newest first.
     fn recompute_find(&mut self, newest: bool) {
         let query = self.find_query.clone();
         let mut hits = Vec::new();
@@ -2217,10 +2322,14 @@ impl Terminal {
             hits = find_hits(session.parser.screen_mut(), &query, at, FIND_CAP);
         }
         self.find_hits = hits;
-        self.find_pos = if newest && !self.find_hits.is_empty() {
-            self.find_hits.len() - 1
-        } else {
+        // Hits come back newest first, so the newest match is index 0 and the
+        // oldest is the last one. A fresh search lands on the newest — the
+        // traceback that just scrolled past — and `find_step` walks back from
+        // there with "next".
+        self.find_pos = if newest || self.find_hits.is_empty() {
             0
+        } else {
+            self.find_hits.len() - 1
         };
         self.jump_to_hit();
     }
@@ -2397,6 +2506,25 @@ impl Terminal {
         let events = ui.input(|i| i.events.clone());
         let pointer_busy = ui.input(|i| i.pointer.any_click());
         let focused_none = ui.memory(|m| m.focused().is_none());
+
+        // Ctrl+Shift+V pastes into the shell. Handled here rather than in `ui`
+        // so Flow Mode panes get it too: it used to live only in the tabbed
+        // layout, and the same chord was silently dead in every pane.
+        //
+        // Asking the backend for the clipboard, which arrives as `Event::Paste`
+        // and is forwarded to the pty like any other paste — egui has no direct
+        // clipboard read, and this is the path the shell already understands.
+        let paste_key = ui.input_mut(|i| {
+            i.consume_shortcut(&eframe::egui::KeyboardShortcut::new(
+                eframe::egui::Modifiers::CTRL | eframe::egui::Modifiers::SHIFT,
+                eframe::egui::Key::V,
+            ))
+        });
+        if paste_key {
+            self.active = true;
+            ui.ctx()
+                .send_viewport_cmd(eframe::egui::ViewportCommand::RequestPaste);
+        }
 
         // Tab/Shift+Tab from an unfocused state is grabbed by the first
         // widget that wants focus (`Memory::interested_in_focus`), which
@@ -2592,8 +2720,18 @@ impl FlowGrid {
             return;
         }
         let pair = self.col_w[i] + self.col_w[i + 1];
-        let a = (self.col_w[i] + dx / total_w).clamp(FLOW_FRAC_MIN, pair - FLOW_FRAC_MIN);
-        if a < FLOW_FRAC_MIN || a > pair - FLOW_FRAC_MIN {
+        // `clamp` panics when its low bound is above its high bound, and that is
+        // exactly the case for two panes narrower than twice the minimum — a
+        // narrow window holding several panes. Splitting what there is evenly is
+        // the only answer that keeps the pair's sum, so that is what happens
+        // instead of a panic on a drag.
+        let (lo, hi) = (FLOW_FRAC_MIN, pair - FLOW_FRAC_MIN);
+        let a = if hi < lo {
+            pair * 0.5
+        } else {
+            (self.col_w[i] + dx / total_w).clamp(lo, hi)
+        };
+        if a <= 0.0 || a >= pair {
             return;
         }
         self.col_w[i] = a;
@@ -2607,8 +2745,15 @@ impl FlowGrid {
             return;
         }
         let pair = self.row_h[r] + self.row_h[r + 1];
-        let a = (self.row_h[r] + dy / total_h).clamp(FLOW_FRAC_MIN, pair - FLOW_FRAC_MIN);
-        if a < FLOW_FRAC_MIN || a > pair - FLOW_FRAC_MIN {
+        // Same guard as `drag_col`: a pair of rows narrower than twice the
+        // minimum has no legal split, and `clamp` would panic rather than say so.
+        let (lo, hi) = (FLOW_FRAC_MIN, pair - FLOW_FRAC_MIN);
+        let a = if hi < lo {
+            pair * 0.5
+        } else {
+            (self.row_h[r] + dy / total_h).clamp(lo, hi)
+        };
+        if a <= 0.0 || a >= pair {
             return;
         }
         self.row_h[r] = a;
@@ -3468,9 +3613,9 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        FIND_CAP, Notifications, Selection, Session, ShellKind, Terminal, cell_at_pos, find_hits,
-        PANE_ACTIVE_SECS, flow_shape, installed_from, scan_notifications, selection_text,
-        shell_title, short_idle, term_size_for_pixels,
+        FIND_CAP, NOTIF_TAIL_MAX, Notifications, Selection, Session, ShellKind, Terminal,
+        cell_at_pos, find_hits, PANE_ACTIVE_SECS, flow_shape, installed_from, scan_notifications,
+        selection_text, shell_title, short_idle, term_size_for_pixels,
     };
     use eframe::egui::{Key, Modifiers};
 
@@ -3903,6 +4048,91 @@ mod tests {
         assert_eq!(s(&t).scroll, t.find_hits[0].offset);
     }
 
+    /// Find keeps the *newest* matches, and prefers the live screen.
+    ///
+    /// The walk used to run oldest-first and stop at the cap, so a long
+    /// scrollback answered with two hundred matches from the top of history and
+    /// could skip the live screen entirely — meaning the traceback that had just
+    /// scrolled past was the one line find would not show.
+    #[test]
+    fn find_prefers_the_newest_matches() {
+        let mut t = Terminal::new();
+        for i in 0..300 {
+            sm(&mut t).ingest(format!("needle {i}\r\n").as_bytes());
+        }
+        // Room for exactly one hit: the live screen must win over history.
+        let one = find_hits(sm(&mut t).parser.screen_mut(), "needle", 0, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            one[0].offset, 0,
+            "the newest match is on the live screen, not in the scrollback"
+        );
+
+        // And with room for several, they come back newest first.
+        let many = find_hits(sm(&mut t).parser.screen_mut(), "needle", 0, 5);
+        assert_eq!(many.len(), 5, "the cap is honoured");
+        assert!(
+            many.windows(2).all(|w| w[0].offset <= w[1].offset),
+            "hits must come back newest first: {many:?}"
+        );
+    }
+
+    /// Find results belong to one shell, so a tab switch forgets them.
+    ///
+    /// They live on `Terminal` rather than `Session`, so switching used to leave
+    /// `3/12` in the bar and then scroll the new shell to the old shell's
+    /// offsets. The query text deliberately survives; only the results go.
+    #[test]
+    fn find_results_do_not_survive_a_tab_switch() {
+        let mut t = Terminal::new();
+        t.find_query = "beta".to_string();
+        sm(&mut t).ingest(b"alpha beta\r\n");
+        t.recompute_find(true);
+        assert!(!t.find_hits.is_empty(), "there is a match to find");
+
+        // A new tab starts clean.
+        t.open_stub_tab();
+        assert!(
+            t.find_hits.is_empty() && t.find_pos == 0,
+            "a new tab must start with no results"
+        );
+
+        // And moving focus back clears them again rather than resurrecting them.
+        sm(&mut t).ingest(b"gamma beta\r\n");
+        t.recompute_find(true);
+        assert!(!t.find_hits.is_empty());
+        let first = t.id_at(0).expect("the first tab still exists");
+        t.focus_session(first);
+        assert!(
+            t.find_hits.is_empty(),
+            "focus moved, so the previous shell's hits are stale"
+        );
+    }
+
+    /// A tail trimmed to its byte cap must not be sliced mid-character.
+    ///
+    /// An OSC body is free to hold multi-byte text (a UTF-8 pane title), and the
+    /// old trim sliced at a raw byte offset, which panics on a boundary inside a
+    /// character.
+    #[test]
+    fn a_tail_trimmed_to_the_cap_lands_on_a_character_boundary() {
+        let mut tail = Vec::new();
+        let mut chunk = b"\x1b]0;".to_vec();
+        for _ in 0..200 {
+            // Three bytes each, so the byte cap lands inside one.
+            chunk.extend_from_slice("\u{20ac}".as_bytes());
+        }
+        assert!(chunk.len() > NOTIF_TAIL_MAX);
+        // No terminator, so the whole thing is kept as a tail and trimmed.
+        let notes = scan_notifications(&mut tail, &chunk);
+        assert_eq!(notes.title, None);
+        assert!(
+            std::str::from_utf8(&tail).is_ok(),
+            "the kept tail must stay valid UTF-8"
+        );
+        assert!(!tail.is_empty(), "something must be kept for the next read");
+    }
+
     /// The rule that makes the flag worth having: a shell announcing its own name
     /// at startup is not news, a shell retitling itself later is, and a bell
     /// always is.
@@ -4268,6 +4498,16 @@ mod tests {
         // Out-of-range dividers are no-ops, not panics.
         t.flow_grid.drag_col(9, 50.0, 1000.0);
         t.flow_grid.drag_row(9, 50.0, 800.0);
+        // A pair narrower than twice the minimum has no legal split. `clamp`
+        // panics when its low bound is above its high bound, so this used to take
+        // the app down on a drag in a narrow window; it must share the pair
+        // evenly instead.
+        t.flow_grid.col_w = vec![0.05, 0.05];
+        t.flow_grid.drag_col(0, 10.0, 1000.0);
+        assert!((t.flow_grid.col_w[0] - 0.05).abs() < 1e-6);
+        t.flow_grid.row_h = vec![0.05, 0.05];
+        t.flow_grid.drag_row(0, 10.0, 800.0);
+        assert!((t.flow_grid.row_h[0] - 0.05).abs() < 1e-6);
     }
 
     /// Focus cycles through panes in grid order and wraps both ways.
