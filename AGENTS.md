@@ -768,7 +768,7 @@ are the app's own prompt buttons, lifted from the editor's empty state into
 
 ## Tests
 
-- `cargo test` must stay green (125 tests): editor roundtrip, find, unicode
+- `cargo test` must stay green (127 tests): editor roundtrip, find, unicode
   highlight, key mapping, query responder, file listing, both focus-mechanism
   tests,  the six terminal-tab tests (`tabs_spawn_and_switch`,
   `closing_the_last_tab_hides_the_panel_and_reveal_restores_it`,
@@ -800,8 +800,17 @@ are the app's own prompt buttons, lifted from the editor's empty state into
   `deleting_a_directory_symlink_leaves_its_target_alone`,
   `create_and_rename_refuse_a_path_in_a_name`, `find_prefers_the_newest_matches`,
   `find_results_do_not_survive_a_tab_switch`,
-  `a_tail_trimmed_to_the_cap_lands_on_a_character_boundary`, and the
-  sub-minimum pair case added to `flow_divider_drag_trades_neighbours`.
+  `a_tail_trimmed_to_the_cap_lands_on_a_character_boundary`, the
+  sub-minimum pair case added to `flow_divider_drag_trades_neighbours`, and the
+  two live-shell tests that pin the process guarantee:
+  `shutdown_releases_every_handle_to_the_shell` (load-bearing: fails if the
+  handles are not released) and `closing_a_tab_leaves_no_shell_behind` (spawns a
+  real shell and asks the OS whether its pid survived the close).
+- **The audit's leaked-process claim does not reproduce on Windows.** Dropping the
+  ConPTY master ends the child on its own, so the original `close_tab` left no
+  `powershell.exe` behind either. `Session::shutdown` is kept for determinism and
+  for `spawn` needing the handles released — it is not the repair of a process
+  that was staying alive, and the comment on it now says so.
 - `cargo test -p snor-installer` must stay green (25 tests): the bundle round
   trip, corruption and truncation refusal, idempotent repacking, the manifest
   round trip, PowerShell quoting, the cleanup command, UTF-16 console

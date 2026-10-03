@@ -1395,13 +1395,18 @@ impl Terminal {
 }
 
 impl Session {
-    /// Kill the shell process and drop every handle to it.
+    /// Kill the shell process and release every handle to it.
     ///
-    /// `Drop`ping a `portable_pty` child does **not** terminate it: the child
-    /// keeps running and keeps its reader thread alive, so a closed tab or a
-    /// restart used to leak one live `powershell.exe` each time, holding files in
-    /// whatever directory it was started in. `kill` is the only thing that ends
-    /// it. The handles are dropped here too so `spawn` can rebuild them.
+    /// The handles are the load-bearing part: `spawn` cannot rebuild a session
+    /// while the old master, writer and reader channel are still held, and that
+    /// is what `close_tab` and the restart button both need. `kill` makes the
+    /// termination immediate rather than a side effect of the ConPTY teardown.
+    ///
+    /// The teardown does end the child on Windows — dropping the master is
+    /// enough, which the audit's leaked-process claim missed, and which
+    /// `closing_a_tab_leaves_no_shell_behind` measures rather than assumes. So
+    /// the explicit kill is determinism and portability, not the repair of a
+    /// process that was staying alive.
     fn shutdown(&mut self) {
         if let Some(child) = self._child.as_mut() {
             let _ = child.kill();
@@ -3903,6 +3908,83 @@ mod tests {
             seen,
             "typed line never echoed — shell not responding to pty input"
         );
+    }
+
+    /// Whether `pid` is still a live process.
+    ///
+    /// `tasklist`, not a handle check: a handle we still held would report a dead
+    /// process as open, and the point of these tests is that the session no longer
+    /// holds one.
+    #[cfg(windows)]
+    fn shell_is_running(pid: u32) -> bool {
+        let Ok(out) = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        else {
+            return true; // Cannot tell: do not claim the shell died.
+        };
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if text.contains("no tasks") || text.contains("no running") {
+            return false;
+        }
+        text.split_whitespace().any(|field| field == pid.to_string())
+    }
+
+    /// `shutdown` must release every handle to the shell and say it is no longer
+    /// running.
+    ///
+    /// This is the part that is ours to guarantee, and the audit's claim that a
+    /// closed tab left a `powershell.exe` behind does not survive measurement on
+    /// Windows: dropping the ConPTY master tears the child down on its own, so
+    /// the original code left no process behind either. What `shutdown` adds is
+    /// determinism — the kill is explicit and immediate rather than a side effect
+    /// of the teardown — and these assertions are what would catch it being
+    /// dropped again, which is the part a teardown side effect cannot catch.
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_releases_every_handle_to_the_shell() {
+        let mut t = Terminal::new();
+        t.ensure_started();
+        assert!(sm(&mut t)._child.is_some(), "the shell should have spawned");
+
+        sm(&mut t).shutdown();
+
+        assert!(sm(&mut t)._child.is_none(), "the child handle is released");
+        assert!(sm(&mut t)._master.is_none(), "the pty master is released");
+        assert!(sm(&mut t).writer.is_none(), "the writer is released");
+        assert!(sm(&mut t).rx.is_none(), "the reader channel is released");
+        assert!(!sm(&mut t).running, "and the shell is no longer running");
+    }
+
+    /// Closing a tab must leave no shell behind. That is the guarantee a user can
+    /// see in Task Manager, and it is what these tests pin: the process is gone
+    /// once the tab is closed, whichever path ended it.
+    #[cfg(windows)]
+    #[test]
+    fn closing_a_tab_leaves_no_shell_behind() {
+        use std::time::{Duration, Instant};
+
+        let mut t = Terminal::new();
+        t.ensure_started();
+        let pid = s(&t)
+            ._child
+            .as_ref()
+            .and_then(|c| c.process_id())
+            .expect("a spawned shell has a process id");
+        assert!(shell_is_running(pid), "the shell should be running");
+
+        t.close_tab(0);
+
+        // Termination is asynchronous, so give the OS a moment before failing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shell_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !shell_is_running(pid),
+            "closing a tab must not leave a shell behind (pid {pid})"
+        );
+        assert!(t.sessions.is_empty(), "and the tab itself is gone");
     }
 
     // --- Scrollback, selection, search, attention, shells ----------------
